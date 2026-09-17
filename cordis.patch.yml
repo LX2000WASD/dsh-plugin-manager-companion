@@ -1,0 +1,9 @@
+# dsh-plugin-manager-companion: 官方插件管理器的伴生补强。
+#
+# 行 id 用包名，绝不用 'plugin-manager'——官方 0.1.6-alpha.2 的 dsh-base
+# 已插入同名行（packages/bundle/base/cordis.patch.yml:20），patch 是数组追加
+# 语义，同 id 不覆盖而是并存，loader 会抛 duplicate loader entry id 让整个
+# profile 起不来。旧仓库正是踩了这个坑（实测复现）。
+- insert:
+    - id: dsh-plugin-manager-companion
+      name: 'dsh-plugin-manager-companion'

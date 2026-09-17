@@ -1,0 +1,20 @@
+/* PmSelect：只负责锚点按钮内部的排版；按钮本体样式全部来自官方 Button。 */
+
+.trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 120px;
+  justify-content: space-between;
+}
+
+.value {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.caret {
+  flex: none;
+  color: var(--dsw-alias-label-tertiary);
+}

@@ -1,0 +1,21 @@
+/* 官方插件页内的注册面：只补自己需要的排版，控件一律来自官方 primitives。 */
+
+.summary {
+  margin: 0;
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.page {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  color: var(--dsw-alias-label-primary);
+}
+
+.hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--dsw-alias-label-tertiary);
+}
