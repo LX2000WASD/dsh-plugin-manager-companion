@@ -19,6 +19,7 @@ import { buildInstalledIndex, cachedMarketplace, invalidateInstalledIndex, regis
 import { probeOfficialCapabilities, requireManager, type OfficialCapabilities } from "./official.ts"
 import { environmentDir as pathEnvironmentDir, OUR_PACKAGE_NAME } from "./paths.ts"
 import { inspectPackage } from "./qualityGate.ts"
+import { applyFix } from "./fix.ts"
 import { loadRegistryIndex } from "./registry.ts"
 import { findPluginMatches } from "./match.ts"
 import { registerGuard } from "./guard.ts"
@@ -307,6 +308,16 @@ async function dispatch(op: string, body: Record<string, unknown>, deps: OpDepen
         await removeKindRecord(repo)
         return { ok: true, output: `已卸载 ${record.kind} ${repo}` } as EnvironmentResult
       })
+
+    case "fix": {
+      const action = requireString(body, "action")
+      const target = typeof body["target"] === "string" ? body["target"] : undefined
+      return await deps.jobs.start(async () => await applyFix(action, target, {
+        ctx: deps.ctx,
+        environmentName: () => deps.capabilities().environmentName,
+        install: async (spec) => await gatedInstall(deps.ctx, config, spec),
+      }))
+    }
 
     case "job":
       return deps.jobs.status(requireString(body, "id"))

@@ -9,6 +9,7 @@
 |---|---|---|---|
 | `capabilities` | `{}` | `{ capabilities, config }` | |
 | `diagnose` | `{ layers?: DiagnosticLayer[] }` | `DiagnosticReport` | job |
+| `fix` | `{ action: string, target?: string }` | `FixOutcome` | job |
 | `install` | `{ spec: string, enable?: boolean, answers?: Record<string,string> }` | `GatedInstallResult` | job |
 | `listEnvironments` | `{}` | `EnvironmentInfo[]` | |
 | `scanRuns` | `{ refresh?: boolean }` | `Record<string, EnvironmentRun[]>` | |
@@ -18,9 +19,9 @@
 | `renameEnvironment` | `{ from: string, to: string }` | `EnvironmentResult` | |
 | `removeEnvironment` | `{ name: string }` | `EnvironmentResult` | |
 | `copyPlugins` | `{ from: string, to: string, names: string[] }` | `EnvironmentResult` | job |
-| `backupExport` | `{ name: string }` | `BackupFile` | |
-| `backupDiff` | `{ backup: BackupFile, target: string }` | `BackupDiffResult` | |
-| `backupRestore` | `{ backup: BackupFile, target: string }` | `EnvironmentResult` | job |
+| `backupExport` | `{ name: string }` | `EnvironmentBackup` | |
+| `backupDiff` | `{ backup: EnvironmentBackup, target: string }` | `EnvironmentBackupDiff` | |
+| `backupRestore` | `{ backup: EnvironmentBackup, target: string }` | `EnvironmentResult` | job |
 | `marketplace` | `{ refresh?: boolean }` | `MarketplaceResult` | |
 | `listKinds` | `{}` | `KindListResult` | |
 | `uninstallKind` | `{ repo: string }` | `EnvironmentResult` | job |
@@ -49,3 +50,27 @@
 - 加载类请求可带 `AbortSignal`（切换环境/卸载时中止）；**变更类请求不要带**——
   中止只应杀传输，而中止一个已经在跑的变更会留下"改了但没反馈"的状态。
 - 变更类请求必须等 `job` 落定再更新 UI；不要用乐观更新。
+## 备份类型的形状（与早先草案的差别）
+
+`EnvironmentBackup` 刻意**只含重装所需的事实**：`format` / `version` / `exportedAt` /
+`environment` / `bundles` / `dependencies`（包名 → 安装来源 spec）。
+node_modules 实体、凭据、缓存都不进来——备份的价值是可重放，不是复制数据。
+**用户的 `cordis.patch.yml` 也不进来**：那是用户亲手写的状态，盲目覆盖比不备份更危险。
+
+`EnvironmentBackupDiff` 分五类：`missing`（需重装）/ `already`（已装无需动）/
+`missingProfiles`（目标环境不存在）/ `unrestorable`（来源已消失，重装也不可能成功）/
+`bundlesMissing`（备份里有、目标层栈没有的 bundle）。
+
+## `fix` 的三种结局
+
+`FixOutcome.status` 是三值，客户端必须分开呈现：
+
+| status | 含义 | 客户端该做什么 |
+|---|---|---|
+| `executed` | 已执行（可能带"需重启"补充说明）| 重新跑一次诊断，让用户看到问题消失 |
+| `needs-manual` | **没有官方通道，我们拒绝自己写 profile 组合** | 展示 `output` 里的精确步骤，不要报成失败 |
+| `failed` | 执行失败（`output` 是原始诊断）| 展示原因，可重试 |
+
+`needs-manual` 目前覆盖两条：`remove-duplicate-row` 与 `remove-row`。它们要求改
+`cordis.patch.yml` 的**结构**（删行），而官方只有行级 `setPluginEnabled`，没有删行能力。
+我们自己写这个文件会引入"两个写者并发改同一份组合"——那正是本仓库要消除的事故形态。

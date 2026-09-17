@@ -231,6 +231,7 @@
 }
 
 .evidenceBlock,
+.capabilities,
 .skipped,
 .diff {
   display: flex;

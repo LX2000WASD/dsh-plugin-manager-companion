@@ -172,6 +172,7 @@ function HealthPanel({ t, useHealth, diagnose, fix }: HealthPanelProps) {
   const error = useHealth(state => state.error)
   const fixingId = useHealth(state => state.fixingId)
   const notice = useHealth(state => state.notice)
+  const capabilities = useHealth(state => state.capabilities)
   const [openIds, setOpenIds] = useState<ReadonlySet<string>>(() => new Set())
   const [confirmingId, setConfirmingId] = useState<string>()
   const [toast, setToast] = useState<{ text: string; seq: number }>()
@@ -199,6 +200,14 @@ function HealthPanel({ t, useHealth, diagnose, fix }: HealthPanelProps) {
       </div>
       <p className={css.hint}>{t('health.intro')}</p>
       {error === undefined ? null : <p className={css.error} role="status">{t('health.failed', { message: error })}</p>}
+      {capabilities === undefined || capabilities.missing.length === 0 ? null : (
+        <div className={css.capabilities} role="status">
+          <span className={css.metaLabel}>{t('health.capabilities')}</span>
+          <ul className={css.diffList}>
+            {capabilities.missing.map(reason => <li key={reason} className={css.warn}>{reason}</li>)}
+          </ul>
+        </div>
+      )}
       {report === undefined
         ? (running ? <p className={css.hint}>{t('health.refreshing')}</p> : <p className={css.hint}>{t('health.needRun')}</p>)
         : (

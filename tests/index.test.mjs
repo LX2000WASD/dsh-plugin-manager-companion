@@ -159,6 +159,31 @@ test('诊断在官方能力缺失时如实记 skipped，不假装健康', async 
   assert.ok(report.skipped.some(entry => /运行时|Loader/i.test(entry.reason) || entry.check.includes("runtime")))
 })
 
+test('fix op 走 job，并把 needs-manual 如实透出（不报成失败）', async () => {
+  const deps = makeDeps()
+  const started = await handleOp("fix", { action: "remove-duplicate-row", target: "row-a" }, deps)
+  assert.equal(started.ok, true)
+  assert.equal(typeof started.value, "string")
+  const settled = await settle(deps, started.value)
+  assert.equal(settled.error, undefined)
+  assert.equal(settled.result.status, "needs-manual")
+  assert.equal(settled.result.action, "remove-duplicate-row")
+  assert.equal(settled.result.target, "row-a")
+})
+
+test('fix op 缺 action 时报错并指出字段名', async () => {
+  const result = await handleOp("fix", {}, makeDeps())
+  assert.equal(result.ok, false)
+  assert.match(result.error.message, /action/)
+})
+
+test('fix op 对未知动作返回 failed 而不是静默成功', async () => {
+  const deps = makeDeps()
+  const started = await handleOp("fix", { action: "no-such-action" }, deps)
+  const settled = await settle(deps, started.value)
+  assert.equal(settled.result.status, "failed")
+})
+
 test('未知 op 报错而不是返回空成功', async () => {
   const result = await handleOp("nope", {}, makeDeps())
   assert.equal(result.ok, false)

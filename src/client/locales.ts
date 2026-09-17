@@ -24,11 +24,7 @@ export const zh = {
   'common.cancel': '取消',
   'common.close': '关闭',
   'common.confirm': '确认',
-  'common.retry': '重试',
   'common.loading': '加载中…',
-  'common.none': '无',
-  'common.download': '下载',
-  'common.unknown': '未知',
 
   'console.title': '环境控制台',
   'console.intro': '诊断、多环境管理与本插件配置都在这一个入口里；写操作一律走官方通道。',
@@ -61,9 +57,8 @@ export const zh = {
   'health.fixConfirm': '确认修复',
   'health.reportOnly': '仅报告',
   'health.fixing': '修复中…',
-  'health.fixed': '修复已执行：{output}',
   'health.skipped': '因能力缺失而跳过的检查',
-  'health.count': '{count} 项',
+  'health.capabilities': '官方能力缺口',
 
   'severity.safe-fix': '可自动修复',
   'severity.confirm-fix': '需确认',
@@ -224,7 +219,6 @@ export const zh = {
   'kinds.commit': '提交',
   'kinds.dir': '目录',
   'kinds.failed': '读取失败：{message}',
-  'kinds.uninstalled': '已卸载 {repo}',
   'kinds.acknowledge': '我明白这会删除该目录且不可撤销',
 
   'time.now': '刚刚',
@@ -276,11 +270,7 @@ export const en: Record<CompanionLocaleKey, string> = {
   'common.cancel': 'Cancel',
   'common.close': 'Close',
   'common.confirm': 'Confirm',
-  'common.retry': 'Retry',
   'common.loading': 'Loading…',
-  'common.none': 'None',
-  'common.download': 'Download',
-  'common.unknown': 'Unknown',
 
   'console.title': 'Environment console',
   'console.intro': "Diagnosis, multi-environment management, and this plugin's configuration in one entry; every write goes through the official channel.",
@@ -313,9 +303,8 @@ export const en: Record<CompanionLocaleKey, string> = {
   'health.fixConfirm': 'Confirm fix',
   'health.reportOnly': 'Report only',
   'health.fixing': 'Fixing…',
-  'health.fixed': 'Fix applied: {output}',
   'health.skipped': 'Checks skipped for missing capabilities',
-  'health.count': '{count}',
+  'health.capabilities': 'Missing official capabilities',
 
   'severity.safe-fix': 'Auto-fixable',
   'severity.confirm-fix': 'Needs confirmation',
@@ -476,7 +465,6 @@ export const en: Record<CompanionLocaleKey, string> = {
   'kinds.commit': 'Commit',
   'kinds.dir': 'Directory',
   'kinds.failed': 'Reading failed: {message}',
-  'kinds.uninstalled': 'Uninstalled {repo}',
   'kinds.acknowledge': 'I understand this deletes the directory and cannot be undone',
 
   'time.now': 'just now',

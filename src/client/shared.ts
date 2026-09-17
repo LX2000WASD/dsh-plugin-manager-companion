@@ -147,11 +147,17 @@ export const sleep = (ms: number, signal?: AbortSignal): Promise<void> =>
  * @throws {CompanionError} job 失败、结果丢失或轮询被中止时。
  */
 export async function runJob<T>(op: string, body: unknown = {}, signal?: AbortSignal): Promise<T> {
-  const started = await callOp<{ jobId: string }>(op, body, signal)
+  const started = await callOp<{ jobId?: string } | T>(op, body, signal)
+  // 契约把长操作 job 化，但也容忍 host 把它实现成同步返回：拿到 jobId 才轮询，
+  // 否则该值就是结果。这样"host 先同步实现、以后改 job"不需要客户端改代码。
+  if (started === null || typeof started !== 'object' || typeof (started as { jobId?: unknown }).jobId !== 'string') {
+    return started as T
+  }
+  const jobId = (started as { jobId: string }).jobId
   const startedAt = Date.now()
   for (;;) {
-    const status = await callOp<JobStatus<T>>('job', { id: started.jobId }, signal)
-    if (status.missing === true) throw new CompanionError('job-missing', `job ${started.jobId} expired before it settled`)
+    const status = await callOp<JobStatus<T>>('job', { id: jobId }, signal)
+    if (status.missing === true) throw new CompanionError('job-missing', `job ${jobId} expired before it settled`)
     if (status.done) {
       if (status.error !== undefined) throw new CompanionError('operation-failed', status.error)
       return status.result as T
@@ -354,15 +360,6 @@ export const EVIDENCE_KIND: Readonly<Record<'file' | 'runtime' | 'official', str
   official: 'official',
 }
 
-/** 去掉末尾斜杠，避免路径拼接出现双斜杠。 */
-export const trimSlash = (path: string): string => path.endsWith('/') ? path.slice(0, -1) : path
-
-/** 备用：把任意值渲染成一行短文本（徽标、标签用）。 */
-export function shortText(value: string | number | null | undefined): string {
-  if (value === null || value === undefined) return ''
-  return String(value)
-}
-
 // ── 状态控制器 ───────────────────────────────────────────────────────────
 
 /**
@@ -378,6 +375,8 @@ export interface HealthState {
   fixingId: string | undefined
   /** 最近一次修复的输出。 */
   notice: string | undefined
+  /** 官方能力探针：哪里能力缺失要如实告诉用户，而不是把缺失伪装成健康。 */
+  capabilities: OfficialCapabilities | undefined
 }
 
 /** 体检子页的注入面：hooks 隔间合成 useHealth 选择器 Hook。 */
@@ -396,6 +395,7 @@ export class HealthController {
   constructor() {
     this.store = createSnapshotStore<HealthState>({
       report: undefined, running: false, error: undefined, fixingId: undefined, notice: undefined,
+      capabilities: undefined,
     })
   }
 
@@ -417,6 +417,14 @@ export class HealthController {
     try {
       const report = await runJob<DiagnosticReport>('diagnose', layers === undefined ? {} : { layers })
       this.store.update((draft) => { draft.report = report; draft.running = false })
+      // 顺带读一次官方能力探针：报告里的 skipped 已说明缺口，这里给出更直接的一句话。
+      // 读不到就保持 undefined（不伪造"能力齐全"），失败原因由报告承担。
+      try {
+        const info = await callOp<CapabilityReport>('capabilities', {})
+        this.store.update((draft) => { draft.capabilities = info.capabilities })
+      } catch {
+        // 探针本身失败不是体检失败：报告已经生成了。
+      }
     } catch (error) {
       this.store.update((draft) => {
         draft.running = false
