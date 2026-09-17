@@ -325,6 +325,12 @@ async function runProtectedOperation(
     const report = existsSync(scanRoot)
       ? await scanRequirements(scanRoot)
       : undefined
+    if (report === undefined) {
+      // 远程 git 源在官方 pnpm 流程里才 clone，安装前没有可扫的目录。如实说明而不是假装扫过了：
+      // 漏报的变量会在 pnpm 输出里以失败的形式出现。
+      out.stdout('dshpmc: note: a remote git source cannot be pre-scanned before pnpm clones it. '
+        + 'If this plugin needs credentials during install or build, pass them now: --env KEY=value.')
+    }
     if (report !== undefined) {
       const provided = filterAnswers(report.requirements, options.env)
       const missing = formatMissingRequirements(report, provided)

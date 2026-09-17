@@ -169,6 +169,10 @@ describe('diagnostics · 五层诊断', () => {
     assert.deepEqual(Object.keys(report.counts).sort(),
       ['composition', 'consistency', 'dependency', 'ecosystem', 'runtime'])
     assert.ok(Array.isArray(report.skipped))
+    // 报告要跨 wire 传给客户端：必须 JSON-safe（不能带 undefined 值、Map、Set 或循环引用）
+    const roundTrip = JSON.parse(JSON.stringify(report))
+    assert.deepEqual(roundTrip, report)
+    assert.doesNotThrow(() => JSON.stringify(report.issues.map(issue => issue.fix ?? null)))
   })
 
   it('detects duplicate-row-id 并指向两处原始行号', async () => {

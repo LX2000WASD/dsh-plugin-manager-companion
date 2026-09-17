@@ -508,6 +508,13 @@ export interface InstallOptions {
   readonly occupied?: ReadonlySet<string>
   /** 覆盖落地根（测试用；默认是官方用户根）。 */
   readonly root?: string
+  /**
+   * 是否写入安装记录（默认 true）。
+   *
+   * 记录是「市场已安装标记」与「uninstall-kind 卸载」的唯一依据——安装不记账等于装完就找不到。
+   * 只有明确的例外场景（例如调用方已经把多个根聚合成一条记录）才关掉它。
+   */
+  readonly record?: boolean
 }
 
 /** 校验一个待落地目录，不通过即抛出可直接展示的原因。 */
@@ -556,7 +563,9 @@ export async function installSkill(repoRoot: string, repoName: string, options: 
     names.push(name)
     dirs.push(dest)
   }
-  return { name: summaryName(names, 'skills'), names, location: destRoot, dirs }
+  const outcome: InstallOutcome = { name: summaryName(names, 'skills'), names, location: destRoot, dirs }
+  if (options.record !== false) await saveKindRecord(repoName, kindRecordOf('skill', repoName, outcome))
+  return outcome
 }
 
 /**
@@ -598,7 +607,9 @@ export async function installPreset(repoRoot: string, repoName: string, options:
     names.push(id)
     dirs.push(dest)
   }
-  return { name: summaryName(names, 'presets'), names, location: destRoot, dirs }
+  const outcome: InstallOutcome = { name: summaryName(names, 'presets'), names, location: destRoot, dirs }
+  if (options.record !== false) await saveKindRecord(repoName, kindRecordOf('agent-preset', repoName, outcome))
+  return outcome
 }
 
 /** 单个落地时用名字，多个时用 N-kind 汇总名。 */

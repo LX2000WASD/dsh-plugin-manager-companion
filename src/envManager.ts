@@ -1270,18 +1270,371 @@ export async function copyPlugins(
   let runner: PluginCommandRunner
   try {
     // 先取 context 与 runner：能力缺失必须在动手之前失败。
-    context = operationContext(to, toDir, fromDir, options/**
+    context = operationContext(to, toDir, fromDir, options)
+    runner = await officialRunner(options)
+  } catch (error) {
+    return failure(error instanceof EnvironmentError ? error.code : 'official-unavailable', messageOf(error))
+  }
+  return enqueueMutation(async () => {
+    const outputs: string[] = []
+    let ok = true
+    for (const name of selected) {
+      const raw = recorded[name]
+      const source = typeof raw === 'string' && raw.length > 0 ? raw : name
+      const resolved = resolveInstallSpec(source, fromDir)
+      if (resolved === null) {
+        outputs.push('# ' + name + ' -> ' + to + '：跳过（本地来源已不存在：' + source + '）')
+        ok = false
+        continue
+      }
+      let result: PackageResult
+      try {
+        result = await runPackageOperation(runner, context, ['add', resolved.spec], options)
+      } catch (error) {
+        // 官方通道在 pnpm 成功之后的对账阶段也可能抛（例如依赖无法解析成 bundle）：
+        // 一个条目失败不能带走整批，如实记账并继续。
+        outputs.push('# ' + name + ' -> ' + to + '：失败\n' + messageOf(error))
+        ok = false
+        continue
+      }
+      outputs.push('# ' + name + ' -> ' + to + '：' + (result.exitCode === 0 ? 'ok' : '失败')
+        + '\n' + result.output.trim())
+      if (result.exitCode !== 0) ok = false
+    }
+    return ok
+      ? { ok: true, output: outputs.join('\n\n') }
+      : { ok: false, code: 'package-operation-failed' as const, output: outputs.join('\n\n') }
+  })
+}
+
+/**
+ * 读 manifest 里 包名到来源 spec 的记录。
+ *
+ * @param dir - 环境目录。
+ * @returns 原始 dependencies 对象；没有时为空对象。
+ */
+function recordedDependencies(dir: string): Record<string, unknown> {
+  const raw = readEnvironmentManifest(dir).raw
+  const dependencies = raw['dependencies']
+  return typeof dependencies === 'object' && dependencies !== null ? dependencies as Record<string, unknown> : {}
+}
+
+// ── 备份：导出 / 差异 / 恢复 ──────────────────────────────────────────────
+
+/**
  * 备份文档格式标识（运行期常量）。
  *
- * 类型在 types.ts 的 BackupFormat；这里断言两者一致——改一处漏另一处会编译失败。
+ * 类型声明在 types.ts 的 BackupFormat（单一事实来源）；这里用类型断言把运行期值
+ * 绑到那个字面量上 —— 改一处漏另一处会编译失败。
  */
 export const BACKUP_FORMAT: BackupFormat = 'dsh-plugin-manager-companion/environment-backup'
 
-/** 备份文档（契约见 types.ts）。 */
-export type { EnvironmentBackup, BackupMissingEntry, EnvironmentBackupDiff }
+/** 备份契约的再导出：类型唯一事实来源是 types.ts，本模块不重复定义。 */
+export type { BackupMissingEntry, EnvironmentBackup, EnvironmentBackupDiff }
 
+/**
+ * 导出环境备份。
+ *
+ * @param name - 环境名。
+ * @returns 备份文档。
+ * @throws {EnvironmentError} 名称不合法或环境不存在时（code 为 invalid-name / not-found）。
+ */
+export function backupExport(name: string): EnvironmentBackup {
+  const problem = environmentNameProblem(name)
+  if (problem !== null) throw new EnvironmentError('invalid-name', problem)
+  const dir = environmentDir(name)
+  if (!existsSync(join(dir, 'package.json'))) throw new EnvironmentError('not-found', '环境不存在：' + name)
+  const manifest = readEnvironmentManifest(dir)
+  const dependencies: Record<string, string> = {}
+  for (const [key, value] of Object.entries(recordedDependencies(dir))) {
+    if (typeof value === 'string' && value.length > 0) dependencies[key] = value
+  }
+  return {
+    format: BACKUP_FORMAT,
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    environment: name,
+    bundles: [...manifest.bundles],
+    dependencies,
+  }
+}
 
-/** 一条需要重装的依赖的别名（实现内部用短名）。 */
-type BackupMissing = BackupMissingEntry
+/**
+ * 校验一份来自外部的备份文档。
+ *
+ * 备份经文件或网络进入本进程，是持久化边界：形状必须在这里挡住，而不是让后面的
+ * 循环抛 TypeError。
+ *
+ * @param value - 待校验的文档。
+ * @returns 通过时为 null，否则为原因。
+ */
+function backupProblem(value: unknown): string | null {
+  if (typeof value !== 'object' || value === null) return '备份不是对象'
+  const backup = value as Partial<EnvironmentBackup>
+  if (backup.format !== BACKUP_FORMAT) return '备份格式标识不匹配（期望 ' + BACKUP_FORMAT + '）'
+  if (backup.version !== 1) return '备份版本不支持：' + String(backup.version)
+  if (typeof backup.environment !== 'string' || !isSafeEnvironmentName(backup.environment)) {
+    return '备份里的环境名不合法：' + JSON.stringify(backup.environment)
+  }
+  if (!Array.isArray(backup.bundles) || backup.bundles.some((item) => typeof item !== 'string')) {
+    return '备份的 bundles 不是字符串数组'
+  }
+  if (typeof backup.dependencies !== 'object' || backup.dependencies === null) return '备份的 dependencies 不是对象'
+  for (const [key, spec] of Object.entries(backup.dependencies)) {
+    if (/[\\/:]/.test(key)) return '依赖名不合法：' + JSON.stringify(key)
+    if (typeof spec !== 'string') return '依赖 ' + key + ' 的来源不是字符串'
+  }
+  return null
+}
 
-)
+/**
+ * 对比备份与目标环境，分四类：缺失、已装、目标环境不存在、不可恢复。
+ *
+ * 恢复前必须先跑这一遍：差异既是用户确认的依据，也是恢复的输入（只装 missing）。
+ *
+ * @param backup - 备份文档。
+ * @param target - 目标环境名。
+ * @returns 差异。
+ * @throws {EnvironmentError} 备份结构不合法（code 为 unsafe-backup）或目标名不合法时。
+ */
+export function backupDiff(backup: EnvironmentBackup, target: string): EnvironmentBackupDiff {
+  const unsafe = backupProblem(backup)
+  if (unsafe !== null) throw new EnvironmentError('unsafe-backup', unsafe)
+  const problem = environmentNameProblem(target)
+  if (problem !== null) throw new EnvironmentError('invalid-name', problem)
+  const targetDir = environmentDir(target)
+  if (!existsSync(join(targetDir, 'package.json'))) {
+    return { ok: false, missing: [], already: [], missingProfiles: [target], unrestorable: [], bundlesMissing: [] }
+  }
+  const current = readEnvironmentManifest(targetDir)
+  // readEnvironmentManifest 的 dependencies 已经是名字数组（不是对象）。
+  const installed = new Set(current.dependencies)
+  // 本地来源的相对路径记录在源环境目录里；源环境已不在时退到目标目录，免得把
+  // 「环境被删了」误判成「本地包还在」。
+  const backupDir = environmentDir(backup.environment)
+  const baseDir = existsSync(backupDir) ? backupDir : targetDir
+  const missing: BackupMissingEntry[] = []
+  const already: string[] = []
+  const unrestorable: string[] = []
+  for (const [name, spec] of Object.entries(backup.dependencies)) {
+    if (installed.has(name)) {
+      already.push(name)
+      continue
+    }
+    const resolved = resolveInstallSpec(spec, baseDir)
+    if (resolved === null) {
+      unrestorable.push(name + '（本地来源已不存在：' + spec + '）')
+      continue
+    }
+    missing.push({ name, source: resolved.spec })
+  }
+  const bundlesMissing = backup.bundles.filter((bundle) => !current.bundles.includes(bundle))
+  return { ok: unrestorable.length === 0, missing, already, missingProfiles: [], unrestorable, bundlesMissing }
+}
+
+/** backupRestore 的选项。 */
+export interface RestoreEnvironmentOptions extends CrossEnvironmentOptions {
+  /** 只算差异、不写入。 */
+  readonly dryRun?: boolean
+}
+
+/**
+ * 按备份恢复一个环境。
+ *
+ * 三步：先算差异（缺失/已装/目标不存在/不可恢复），再用官方 operations 逐条重装
+ * 缺失依赖，最后在官方文件锁下补回备份的 bundle 层栈。整批只占一次进程内互斥。
+ *
+ * 锁的用法按官方意图：装包由 runPluginCommand 自己持锁（我们再套一层会自锁 —— 同一
+ * 把 package.json.lock）；bundle 层栈的读-改-写由我们用 withFileLock 独占，避免与
+ * 并发的安装互相覆盖。
+ *
+ * @param backup - 备份文档。
+ * @param target - 目标环境名。
+ * @param options - 恢复选项。
+ * @returns 操作结果。
+ */
+export async function backupRestore(
+  backup: EnvironmentBackup, target: string, options: RestoreEnvironmentOptions = {},
+): Promise<EnvironmentResult> {
+  let diff: EnvironmentBackupDiff
+  try {
+    diff = backupDiff(backup, target)
+  } catch (error) {
+    return failure(error instanceof EnvironmentError ? error.code : 'unsafe-backup', messageOf(error))
+  }
+  if (diff.missingProfiles.length > 0) {
+    return failure('not-found', '目标环境不存在：' + diff.missingProfiles.join(', ')
+      + '（本模块不代建环境，请先在环境列表里创建）')
+  }
+  const plan = describeDiff(diff)
+  if (diff.missing.length === 0 && diff.bundlesMissing.length === 0) {
+    return diff.unrestorable.length === 0
+      ? success('没有需要恢复的内容\n' + plan)
+      : failure('unrestorable', '没有需要恢复的内容，但存在不可恢复条目\n' + plan)
+  }
+  if (options.dryRun === true) return success('（演练）将执行：\n' + plan)
+  const targetDir = environmentDir(target)
+  let context: PackageOperationContext
+  let runner: PluginCommandRunner
+  try {
+    context = operationContext(target, targetDir, targetDir, options)
+    runner = await officialRunner(options)
+  } catch (error) {
+    return failure(error instanceof EnvironmentError ? error.code : 'official-unavailable', messageOf(error))
+  }
+  return enqueueMutation(async () => {
+    const outputs: string[] = []
+    let ok = diff.unrestorable.length === 0
+    for (const entry of diff.missing) {
+      let result: PackageResult
+      try {
+        result = await runPackageOperation(runner, context, ['add', entry.source], options)
+      } catch (error) {
+        // 同 copyPlugins：单个条目失败不带走整批。
+        outputs.push('# ' + entry.name + '：失败\n' + messageOf(error))
+        ok = false
+        continue
+      }
+      outputs.push('# ' + entry.name + '：' + (result.exitCode === 0 ? '已恢复' : '失败')
+        + '\n' + result.output.trim())
+      if (result.exitCode !== 0) ok = false
+    }
+    let skippedBundles: readonly string[] = []
+    if (diff.bundlesMissing.length > 0) {
+      try {
+        const restored = await restoreBundles(targetDir, backup.bundles, context.installAnchor)
+        skippedBundles = restored.skipped
+        outputs.push(restored.written === null
+          ? '# bundle 层栈：没有可补回的层'
+          : '# bundle 层栈：已补回 -> ' + restored.written)
+        if (skippedBundles.length > 0) {
+          outputs.push('# bundle 层栈：未补回 ' + skippedBundles.join(', ')
+            + '（目标环境既解析不到、也不声明 dsh.bundle，照写会让 profile 下次启动失败）')
+        }
+      } catch (error) {
+        outputs.push('# bundle 层栈：失败 ' + messageOf(error))
+        ok = false
+      }
+    }
+    if (skippedBundles.length > 0) ok = false
+    if (diff.unrestorable.length > 0) outputs.push('不可恢复：\n  ' + diff.unrestorable.join('\n  '))
+    if (ok) return { ok: true, output: outputs.join('\n\n') }
+    return {
+      ok: false,
+      code: skippedBundles.length > 0 ? 'unrestorable' as const : 'package-operation-failed' as const,
+      output: outputs.join('\n\n'),
+    }
+  })
+}
+
+/**
+ * 把差异渲染成给用户看的计划文本。
+ *
+ * @param diff - 差异。
+ * @returns 多行说明。
+ */
+function describeDiff(diff: EnvironmentBackupDiff): string {
+  const lines = ['待重装 ' + String(diff.missing.length) + ' 项：'
+    + (diff.missing.length === 0 ? '（无）' : '\n  ' + diff.missing.map((entry) => entry.name + ' <- ' + entry.source).join('\n  '))]
+  lines.push('已装 ' + String(diff.already.length) + ' 项'
+    + (diff.already.length > 0 ? '：' + diff.already.join(', ') : ''))
+  if (diff.bundlesMissing.length > 0) lines.push('待补回 bundle：' + diff.bundlesMissing.join(', '))
+  if (diff.unrestorable.length > 0) lines.push('不可恢复：\n  ' + diff.unrestorable.join('\n  '))
+  return lines.join('\n')
+}
+
+/** 一次 bundle 层栈补回的结果。 */
+interface BundleRestore {
+  /** 写回后的层栈；无需改动时 null。 */
+  readonly written: string | null
+  /** 备份里有、但目标环境现在无法作为层启用的 bundle。 */
+  readonly skipped: readonly string[]
+}
+
+/**
+ * 把备份的 bundle 层栈并回目标环境（官方 writeProfileBundles，全程持文件锁）。
+ *
+ * 顺序以备份为准（层栈顺序决定 patch 应用顺序），目标环境多出来的 bundle 追加在
+ * 末尾 —— 恢复是补回，不是裁剪用户现在的组合。
+ *
+ * 只写回「现在确实能启用」的层：用官方 bundleManifest 判定（能从安装锚点或环境
+ * 目录解析出来，且声明了 dsh.bundle.patch）。备份里那些已经解析不到的层如果照写，
+ * profile 下次启动会直接失败（官方 loadProfile 对「列了 bundle 却没有 dsh.bundle」
+ * 是 fail loud），所以宁可少写并如实报告。
+ *
+ * 这里不用官方 sanitizeProfile：那是给「profile 起不来」的急救路径，会把用户的
+ * cordis.patch.yml 移走；日常恢复不该动用户的补丁层。
+ *
+ * @param dir - 目标环境目录。
+ * @param wanted - 备份里的 bundle 层栈。
+ * @param installAnchor - 官方安装锚点（官方 bundle 解析的第一锚点）。
+ * @returns 写回的层栈与跳过的 bundle。
+ */
+async function restoreBundles(dir: string, wanted: readonly string[], installAnchor: string): Promise<BundleRestore> {
+  const installable = await officialBundlePredicate(installAnchor)
+  return withFileLock(join(dir, 'package.json'), async () => {
+    const manifest = readProfileManifest(OUR_PACKAGE_NAME, dir)
+    const current = manifest.dsh?.profile?.bundles ?? []
+    const skipped: string[] = []
+    const additions: string[] = []
+    for (const name of wanted) {
+      if (current.includes(name) || additions.includes(name)) continue
+      if (installable !== null && installable(name, dir)) additions.push(name)
+      else skipped.push(name)
+    }
+    const desired = [...wanted.filter((name) => current.includes(name) || additions.includes(name)),
+      ...current.filter((name) => !wanted.includes(name))]
+    if (additions.length === 0) {
+      return { written: null, skipped }
+    }
+    writeProfileBundles(dir, manifest, desired)
+    return { written: desired.join(' -> '), skipped }
+  }, { waitMs: OPERATION_LOCK_WAIT_MS })
+}
+
+/** 判定「某个包名现在能不能作为这个环境的 bundle 层启用」。 */
+type BundlePredicate = (name: string, dir: string) => boolean
+
+/**
+ * 取官方 bundle 判定器。
+ *
+ * @param installAnchor - 官方安装锚点。
+ * @returns 判定器；官方子路径不可用时 null（此时不写回任何新层，只报告）。
+ */
+async function officialBundlePredicate(installAnchor: string): Promise<BundlePredicate | null> {
+  try {
+    const module = await import('@deepseek-ai/dsh-plugin-manager/operations')
+    return (name, dir) => {
+      try {
+        return module.bundleManifest(name, dir, installAnchor) !== undefined
+      } catch {
+        // 解析不出来：这个层现在启用会让 profile 起不来。
+        return false
+      }
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 目录类文件操作的重试。
+ *
+ * @param operation - 要执行的文件操作。
+ * @param attempts - 尝试次数上限。
+ */
+async function retryFs(operation: () => void, attempts = 5): Promise<void> {
+  const sleep = (ms: number): Promise<void> => new Promise((done) => { setTimeout(done, ms) })
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      operation()
+      return
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code ?? ''
+      // Windows 上杀毒/索引会短暂占用目录，这几类错误重试有意义。
+      const retryable = code === 'EBUSY' || code === 'EPERM' || code === 'EACCES' || code === 'ENOTEMPTY'
+      if (!retryable || attempt >= attempts - 1) throw error
+      await sleep(50 * (attempt + 1))
+    }
+  }
+}

@@ -124,6 +124,16 @@ export interface ConfigHandle {
   current(): CompanionConfig
   /** 观察配置提交；返回取消订阅函数。 */
   watch(listener: (next: CompanionConfig) => void): () => void
+  /**
+   * 合并写入一个局部配置，由官方 settings 服务负责校验与落盘。
+   *
+   * 不提供"重置为默认"以外的整段替换：局部合并足以表达界面上所有开关，
+   * 而整段替换会让界面漏掉一个字段就把它打回默认值。
+   *
+   * @param patch - 局部配置。
+   * @returns 写入完成后的生效配置。
+   */
+  update(patch: Partial<CompanionConfig>): Promise<CompanionConfig>
 }
 
 /**
@@ -143,11 +153,19 @@ export function registerConfig(ctx: Context): ConfigHandle {
     // 无 settings 服务（例如极简宿主）：用默认配置继续，功能可用性由各能力
     // 自己探测。这里绝不抛错——插件必须能在任何宿主上加载。
     ctx.logger?.info?.('plugin-manager-companion: settings service unavailable, using defaults')
-    return { current: () => DEFAULT_CONFIG, watch: () => () => {} }
+    return {
+      current: () => DEFAULT_CONFIG,
+      watch: () => () => {},
+      update: async () => DEFAULT_CONFIG,
+    }
   }
   const scope = settings.register(SETTINGS_NAMESPACE, ConfigSchema)
   return {
     current: () => scope.get() as CompanionConfig,
     watch: (listener) => scope.watch((next: unknown) => { listener(next as CompanionConfig) }),
+    update: async (patch) => {
+      await scope.update(patch as object)
+      return scope.get() as CompanionConfig
+    },
   }
 }

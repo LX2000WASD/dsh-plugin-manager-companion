@@ -46,6 +46,27 @@ function stubPrimitives() {
 }
 
 /**
+ * 符合官方 SnapshotStore 契约的桩件。
+ *
+ * 为什么不用真件：@deepseek-ai/dsh-client-store 的运行时入口 import zustand，
+ * 在 node 里直接 import 会失败。桩件按官方 lib/types/index.d.ts 的 SnapshotStore
+ * 契约实现（getSnapshot / subscribe / update / set 四个方法），足够让注册期代码运行。
+ * @param init - 初始状态。
+ * @returns 一个快照存储。
+ */
+function makeSnapshotStore(init) {
+  let snapshot = init
+  const listeners = new Set()
+  const notify = () => { for (const fn of [...listeners]) fn() }
+  return {
+    getSnapshot: () => snapshot,
+    subscribe(fn) { listeners.add(fn); return () => { listeners.delete(fn) } },
+    set(next) { snapshot = next; notify() },
+    update(mutator) { mutator(snapshot); notify() },
+  }
+}
+
+/**
  * 以模拟模块表启动产物。
  * @returns bundle 的导出对象。
  */
@@ -56,7 +77,7 @@ function bootBundle() {
     'react/jsx-runtime': require_('react/jsx-runtime'),
     'react-dom': {}, 'react-dom/client': {},
     '@deepseek-ai/cordis': { Context: class {} },
-    '@deepseek-ai/dsh-client-store': {},
+    '@deepseek-ai/dsh-client-store': { createSnapshotStore: makeSnapshotStore, shallowEqual: (a, b) => a === b },
     '@deepseek-ai/dsh-client-ui-slots': {},
     '@deepseek-ai/dsh-client-ui-primitives': stubPrimitives(),
     '@deepseek-ai/dsh-client-ui-dockkit': {},
@@ -121,6 +142,29 @@ function applyWithMocks(exported) {
       pluginInventory: {},
       $on: () => () => {},
       $mount: async () => () => {},
+    },
+    // 官方配置通道：客户端经它读写本插件的 settings 命名空间（不碰配置文件）。
+    //
+    // 桩件按**客户端** SettingsScope 契约（ui-settings 的 settings-contract.ts）：
+    // getSnapshot / subscribe / mutate / set / unset。
+    // 注意它与 host 侧的 SettingsScope 契约不同（host 是 get/watch/update/replace）——
+    // 客户端这一侧是「镜像 + 排队的字段写」，不是同步读写。
+    settingsScope: {
+      bind({ namespace }) {
+        const snapshot = {
+          status: 'ready', value: undefined, base: undefined, user: undefined,
+          revision: 1, writable: true, mode: 'host', namespace,
+        }
+        const listeners = new Set()
+        return {
+          getSnapshot: () => snapshot,
+          subscribe(fn) { listeners.add(fn); return () => { listeners.delete(fn) } },
+          mutate: async () => {},
+          set: async () => {},
+          unset: async () => {},
+        }
+      },
+      describe: () => ({ subscribe: () => () => {}, getSnapshot: () => ({ descriptors: [] }) }),
     },
   })
   exported.apply(mkCtx())
