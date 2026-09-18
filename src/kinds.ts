@@ -943,13 +943,29 @@ export async function findOrphanKindDirs(options: { readonly skillsRootDir?: str
   return orphans.sort()
 }
 
-/** 一条记录在磁盘上是否还有对应目录。 */
+/**
+ * 一条记录在磁盘上是否还有对应目录。
+ *
+ * 判定顺序（先精确后启发，宁少清不误清）：
+ *   1. 落盘形态的 `dirs` 里**任一目录**还在 → 存活。多目录安装必须走这一条：
+ *      它们的 `dir` 是根，用根去判会把活着的记录当幽灵删掉（真机实测过——
+ *      listKinds 先 pruneGhostRecords，记录一被删，随后的卸载就只能报"没有安装记录"）；
+ *   2. `dir` 是一个具体子目录（不是根）→ 看它还在不在；
+ *   3. 旧记录（没有 `dirs`）里 `dir` 等于根 → 用仓库末段 slug 猜一个主目录名。
+ *
+ * @param record - 安装记录。
+ * @returns 是否仍有对应目录。
+ */
 function recordAlive(record: InstalledKind): boolean {
+  const stored = record as StoredKindRecord
+  if (Array.isArray(stored.dirs) && stored.dirs.length > 0) {
+    return stored.dirs.some(dir => typeof dir === 'string' && dir !== '' && existsSync(dir))
+  }
   if (record.dir !== '' && record.dir !== skillsRoot() && record.dir !== presetsRoot()) {
     return existsSync(record.dir)
   }
   if (record.kind === 'cordis-plugin') return record.dir !== '' && existsSync(record.dir)
-  // 多目录安装记录的是根：至少得有一个由仓库名派生的子目录还在。
+  // 旧记录的多目录安装只记了根：至少得有一个由仓库名派生的子目录还在。
   const slug = slugDirName(lastSegment(record.repo))
   const root = record.kind === 'skill' ? skillsRoot() : presetsRoot()
   return existsSync(join(root, slug))

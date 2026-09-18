@@ -14,7 +14,7 @@
 import type { Context } from "@deepseek-ai/cordis"
 import { analyzeEnvironment } from "./diagnostics.ts"
 import { DEFAULT_ENVIRONMENT_TEMPLATE, backupDiff, backupExport, backupRestore, copyPlugins, createEnvironment, environmentTemplates, listEnvironments, removeEnvironment, renameEnvironment, repairDependencies, scanRuns, startEnvironment, stopEnvironment } from "./envManager.ts"
-import { loadKindRecords, presetsRoot, pruneGhostRecords, removeKindDir, removeKindRecord, skillsRoot } from "./kinds.ts"
+import { findOrphanKindDirs, kindDirsOf, loadKindRecords, presetsRoot, pruneGhostRecords, removeKindDir, removeKindRecord, skillsRoot } from "./kinds.ts"
 import { buildInstalledIndex, cachedMarketplace, invalidateInstalledIndex, registryItems } from "./marketplace.ts"
 import { probeOfficialCapabilities, requireManager, type OfficialCapabilities } from "./official.ts"
 import { environmentDir as pathEnvironmentDir, OUR_PACKAGE_NAME, readEnvironmentManifest } from "./paths.ts"
@@ -441,10 +441,8 @@ async function dispatch(op: string, body: Record<string, unknown>, deps: OpDepen
       const records = await loadKindRecords()
       const result: KindListResult = {
         records: [...records.values()],
-        orphans: [],
+        orphans: await findOrphanKindDirs(),
       }
-      void skillsRoot()
-      void presetsRoot()
       return result
     }
 
@@ -455,9 +453,9 @@ async function dispatch(op: string, body: Record<string, unknown>, deps: OpDepen
         const record = records.get(repo)
         if (record === undefined) return { ok: false, output: `没有安装记录：${repo}`, code: "not-found" }
         const root = record.kind === "skill" ? skillsRoot() : presetsRoot()
-        for (const dir of [record.dir]) {
-          if (dir.length > 0 && dir !== root) await removeKindDir(root, dir)
-        }
+        // 精确目录清单：多目录安装（记录体带 dirs）逐个清；旧记录退回 dir。越界目录由
+        // kindDirsOf 过滤掉，因此不会出现"dir 恰好等于根就静默跳过"的残留。
+        for (const dir of kindDirsOf(record, root)) await removeKindDir(root, dir)
         await removeKindRecord(repo)
         return { ok: true, output: `已卸载 ${record.kind} ${repo}` } as EnvironmentResult
       })

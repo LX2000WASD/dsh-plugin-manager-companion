@@ -181,6 +181,17 @@ export interface DiagnosticReport {
 export interface DiagnosticSkip {
   readonly check: string
   readonly reason: string
+  /**
+   * 这次跳过属于哪一层（仅当跳过的**就是这一整层**时给出）。
+   *
+   * 存在的理由：UI 要如实区分「这一层查过且没问题」与「这一层根本没查」，
+   * 而后者绝不能画成 0（把没查画成没问题）。层归属是引擎的事实，不能靠客户端
+   * 去猜 check 字符串的形状——那是约定耦合，改名就会静默退化成"显示 0"。
+   *
+   * 非层级检查（environment-dir / runtime-inventory / install-anchor / dependency-scan
+   * / composition-official 等）**不设**本字段：它们不代表整层没查，不能被映射到层计数。
+   */
+  readonly layer?: DiagnosticLayer
 }
 
 // ── 环境管理操作 ─────────────────────────────────────────────────────────

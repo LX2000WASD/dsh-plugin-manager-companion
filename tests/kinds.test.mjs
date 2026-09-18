@@ -547,3 +547,83 @@ describe('孤儿目录扫描（orphans 不再恒为空）', () => {
     assert.deepEqual(await findOrphanKindDirs(), [])
   })
 })
+describe('卸载目录清单 kindDirsOf：新记录精确、旧记录不回归', () => {
+  async function cleanWorld() {
+    __setHomeForTests(home)
+    for (const dir of [skillsRoot(), presetsRoot(), cacheRoot()]) {
+      await rm(dir, { recursive: true, force: true })
+    }
+    __resetKindCacheForTests()
+  }
+
+  it('旧记录（无 dirs，dir=具体子目录）与以前行为一致：仍然卸得干净', async () => {
+    await cleanWorld()
+    const dir = join(skillsRoot(), 'legacy-skill')
+    await mkdir(dir, { recursive: true })
+    await saveKindRecord('Owner/Legacy-Skill', {
+      kind: 'skill', repo: 'Owner/Legacy-Skill', dir, installedAt: new Date().toISOString(),
+    })
+    const record = (await loadKindRecords()).get('Owner/Legacy-Skill')
+    assert.deepEqual(kindDirsOf(record, skillsRoot()), [dir], '旧记录必须退回 dir 这一条')
+    // 与 index.ts 的卸载序列一致：清目录 → 删记录。
+    for (const target of kindDirsOf(record, skillsRoot())) await removeKindDir(skillsRoot(), target)
+    await removeKindRecord('Owner/Legacy-Skill')
+    assert.equal(await exists(dir), false)
+    assert.equal((await loadKindRecords()).size, 0)
+  })
+
+  it('多目录安装（dir=根、dirs 列出全部）逐个清干净，不留残留', async () => {
+    await cleanWorld()
+    const first = join(skillsRoot(), 'alpha')
+    const second = join(skillsRoot(), 'beta')
+    await mkdir(first, { recursive: true })
+    await mkdir(second, { recursive: true })
+    await saveKindRecord('owner/skill-set', {
+      kind: 'skill', repo: 'owner/skill-set', dir: skillsRoot(), installedAt: new Date().toISOString(),
+      dirs: [first, second], names: ['alpha', 'beta'],
+    })
+    const record = (await loadKindRecords()).get('owner/skill-set')
+    assert.deepEqual(kindDirsOf(record, skillsRoot()).sort(), [first, second].sort())
+    for (const target of kindDirsOf(record, skillsRoot())) await removeKindDir(skillsRoot(), target)
+    await removeKindRecord('owner/skill-set')
+    assert.equal(await exists(first), false)
+    assert.equal(await exists(second), false)
+    assert.deepEqual(await findOrphanKindDirs(), [], '清干净后不该再有孤儿')
+  })
+
+  it('多目录记录在 pruneGhostRecords 里存活（listKinds 先 prune 才能卸载）', async () => { 
+    await cleanWorld()
+    const first = join(skillsRoot(), 'alpha')
+    const second = join(skillsRoot(), 'beta')
+    await mkdir(first, { recursive: true })
+    await mkdir(second, { recursive: true })
+    const record = {
+      kind: 'skill', repo: 'owner/skill-set', dir: skillsRoot(), installedAt: new Date().toISOString(),
+      dirs: [first, second], names: ['alpha', 'beta'],
+    }
+    await saveKindRecord('owner/skill-set', record)
+    // 真机踩过：dir 是根、dirs 还在，旧判定却因为 <root>/skill-set 不存在把记录当幽灵删掉，
+    // 随后卸载只能报"没有安装记录"。
+    assert.deepEqual(await pruneGhostRecords(), [])
+    assert.notEqual((await loadKindRecords()).get('owner/skill-set'), undefined)
+    assert.deepEqual(kindDirsOf(record, skillsRoot()).sort(), [first, second].sort())
+    // 全部目录都没了才算幽灵。
+    await rm(first, { recursive: true, force: true })
+    assert.deepEqual(await pruneGhostRecords(), [])
+    await rm(second, { recursive: true, force: true })
+    assert.deepEqual(await pruneGhostRecords(), ['owner/skill-set'])
+  })
+
+  it('旧记录 dir 恰好等于根时仍不删根（保守），但会被孤儿扫描如实报出来', async () => {
+    await cleanWorld()
+    const dir = join(skillsRoot(), 'unknown-set')
+    await mkdir(dir, { recursive: true })
+    await saveKindRecord('owner/unknown-set', {
+      kind: 'skill', repo: 'owner/unknown-set', dir: skillsRoot(), installedAt: new Date().toISOString(),
+    })
+    const record = (await loadKindRecords()).get('owner/unknown-set')
+    assert.deepEqual(kindDirsOf(record, skillsRoot()), [], '绝不返回根本身（那是"删掉全部技能"）')
+    assert.equal(await exists(skillsRoot()), true)
+    assert.deepEqual(await findOrphanKindDirs(), [], '主目录名与仓库 slug 相同时按已认领处理（宁少报）')
+  })
+})

@@ -16,7 +16,9 @@ set -u
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 SRC=$HOME/.dsh/profiles/pm-test
 HOST_PROFILE=pm-life-$$
-HOST_PORT=$(( (RANDOM % 200) + 3500 ))
+# 端口落在**共享工具带 3300-3499**内：人手/临时实例用 3500+ 的按人号段（见 CODE-POLICY §7.7），
+# 两带不重叠，脚本不会打到某个人的实例上，人也不会把脚本的实例当自己的。
+HOST_PORT=$(( (RANDOM % 100) + 3350 ))
 ENV_A=pm-life-a-$$
 ENV_B=pm-life-b-$$
 LOG=/tmp/e2e-lifecycle-host.log
