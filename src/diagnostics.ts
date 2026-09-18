@@ -279,7 +279,23 @@ export async function analyzeEnvironment(
     }
   }
 
-  // L5 只留骨架：索引抓取归市场模块，本模块不在诊断路径上访问网络。
+  // 启动阻断根因（从官方异常文本解析出来的一等公民）并入报告：
+  // 它们与其余发现一起进计数、一起进分组，UI 不必再去 skip.reason 里翻长文本。
+  // 去重：重复 id / 孤立行在纯文本路径下已经产出更细的 duplicate-row-id / orphan-row（带文件与行号），
+  // 这里就不再把同一条事实报第二遍；没有更细版本时才由启动阻断自己出场。
+  const reportedIds = new Set(issues.map(issue => issue.id))
+  const coveredByRawCheck = (boot: DiagnosticIssue): boolean => {
+    const id = String(boot.subjects[0] ?? '')
+    return boot.code === 'boot-blocker-row'
+      ? issues.some(issue => issue.code === 'duplicate-row-id' && issue.subjects.includes(id))
+      : false
+  }
+  for (const boot of composition.bootIssues) {
+    if (reportedIds.has(boot.id) || coveredByRawCheck(boot)) continue
+    reportedIds.add(boot.id)
+    issues.push(boot)
+  }
+
   if (diagnostics.ecosystem && issues.every(issue => issue.layer !== 'ecosystem')) {
     skipped.push({
       check: 'ecosystem-index',
@@ -737,11 +753,110 @@ interface ComposedRow {
   readonly conditional: boolean
 }
 
+/**
+ * 一条"启动阻断"的根因（从官方异常的原始文本里解析出来）。
+ *
+ * 为什么要有它：官方 loadProfileDirectory / composeEntries 抛出的异常文本本身就含根因
+ * （如 cannot resolve profile bundle …、duplicate loader entry id: …），塞进 skip.reason 时
+ * 界面只看到一段长文本；解析出来成为一条正式 issue 才能带三要素、走证据通道、被 UI 折叠。
+ */
+interface BootBlocker {
+  readonly code: string
+  /** 判定的严重级别：确实致命给 confirm-fix；判不定（例如锚点缺失）如实降级。 */
+  readonly severity: DiagnosticSeverity
+  readonly title: string
+  readonly subjects: readonly string[]
+  readonly evidence: readonly DiagnosticEvidence[]
+  readonly detail: string
+  /** 可复制的操作文本（与 issue.extra.operation 同口径）。 */
+  readonly operation: string
+  readonly id: string
+}
+
+/**
+ * 从官方异常的原始文本里解析启动阻断根因（认不出就返回 undefined，不猜）。
+ *
+ * @param error - loadProfileDirectory / composeEntries 抛出的异常。
+ * @param env - 被诊断环境。
+ * @param anchorConsulted - 本次解析是否真的用过安装锚点（决定"解析不到"能不能断言致命）。
+ * @returns 阻断根因；异常文本不是这两种时 undefined。
+ */
+function bootBlockerFromError(
+  error: unknown,
+  env: EnvironmentInfo,
+  anchorConsulted: boolean,
+): BootBlocker | undefined {
+  const message = messageOf(error)
+  const unresolved = /cannot resolve profile bundle\s+("[^"]+"|'[^']+')/.exec(message)
+  const malformed = /profile bundle\s+("[^"]+"|'[^']+')\s+declares no dsh\.bundle/.exec(message)
+  const restarted = '装好（或修好这一项）后**重启该环境**才会生效。'
+  const unsure = '注意：本次解析**没有**用到安装锚点（拿不到或没给），所以本条只说明"这个 bundles 项装不上"，'
+    + '不能据此断言这次启动一定失败——环境可能由别的 dsh 安装提供该包。'
+  if (unresolved !== null) {
+    const name = stripQuotes(unresolved[1] ?? '')
+    return {
+      code: 'unresolvable-bundle',
+      severity: anchorConsulted ? 'confirm-fix' : 'report-only',
+      title: '组合层启动被阻断：bundle ' + name + ' 解析不到',
+      subjects: [name, env.name],
+      evidence: [{ kind: 'official', at: 'loadProfileDirectory(env.dir)', note: truncatedNote(message) }],
+      detail: 'dsh.profile.bundles 里的 ' + name + ' 既不在这个 profile 的 node_modules，也不在 dsh 安装的模块兜底层：'
+        + '官方启动路径读 bundles 层栈时会直接抛 cannot resolve profile bundle，'
+        + '**整个 profile 起不来**（不是某一层没查）。处置：装回这个 bundle（官方通道）或从 '
+        + absoluteManifestPath(env) + ' 的 dsh.profile.bundles 里删掉这一项；' + restarted
+        + (anchorConsulted ? '' : unsure),
+      operation: '在 ' + absoluteManifestPath(env) + ' 的 dsh.profile.bundles 里装回 ' + name
+        + '（或删掉这一项），然后重启该环境',
+      id: 'unresolvable-bundle:' + name,
+    }
+  }
+  if (malformed !== null) {
+    const name = stripQuotes(malformed[1] ?? '')
+    return {
+      code: 'invalid-bundle',
+      severity: 'confirm-fix',
+      title: '组合层启动被阻断：bundle ' + name + ' 没有声明 patch 层',
+      subjects: [name, env.name],
+      evidence: [{ kind: 'official', at: 'loadProfileDirectory(env.dir)', note: truncatedNote(message) }],
+      detail: 'dsh.profile.bundles 里的 ' + name + ' 的 package.json 没有 dsh.bundle.patch：'
+        + '官方读这一层 patch 时会直接抛 declares no dsh.bundle，**整个 profile 起不来**。'
+        + '处置：把 ' + absoluteManifestPath(env) + ' 的 dsh.profile.bundles 里这一项删掉，或改用真正带 bundle 声明的包；'
+        + restarted,
+      operation: '从 ' + absoluteManifestPath(env) + ' 的 dsh.profile.bundles 里删掉 ' + name + '，然后重启该环境',
+      id: 'invalid-bundle:' + name,
+    }
+  }
+  return undefined
+}
+
+/** 去掉异常文本里包裹包名的引号。 */
+function stripQuotes(value: string): string {
+  const trimmed = value.trim()
+  if (trimmed.length >= 2) {
+    const first = trimmed[0]
+    const last = trimmed[trimmed.length - 1]
+    if ((first === '"' && last === '"') || (first === "'" && last === "'")) return trimmed.slice(1, -1)
+  }
+  return trimmed
+}
+
+/** 环境 manifest 的绝对路径（证据里说明"改哪个文件"）。 */
+function absoluteManifestPath(env: EnvironmentInfo): string {
+  return join(env.dir, 'package.json')
+}
+
+/** 官方异常文本放进证据 note 时截断（证据要能读，不是把异常整段塞进去）。 */
+function truncatedNote(message: string): string {
+  const flat = message.replace(/\s+/g, ' ').trim()
+  return flat.length > 240 ? flat.slice(0, 237) + '…' : flat
+}
 /** 组合层事实：官方合并结果 + 原始行号。 */
 interface CompositionFacts {
   readonly rows: readonly ComposedRow[]
   readonly rawRows: readonly RawRow[]
   readonly skips: readonly DiagnosticSkip[]
+  /** 官方组合口径抛出的启动阻断根因（解析后成为正式 issue；认不出时为空）。 */
+  readonly bootIssues: readonly DiagnosticIssue[]
   /** 有效禁用状态是否可用（官方 app-boot 不可用时为 false）。 */
   readonly effectiveState: boolean
 }
@@ -763,9 +878,12 @@ async function readComposition(
 ): Promise<CompositionFacts> {
   const skips: DiagnosticSkip[] = []
   const patchPath = join(env.dir, 'cordis.patch.yml')
-  const profileContext = ctx.get('profileContext') as { readonly installAnchor?: string } | undefined
-  const installAnchor = profileContext?.installAnchor
+  // 锚点只有一份来源：facts.installAnchor（analyzeEnvironment 已经按"调用方透传优先、其次官方
+  // profileContext"算好了）。这里若自己再算一份，两处口径一旦不一致，"锚点是否参与过解析"
+  // 这个判据就会失真，把致命判成不确定。
+  const installAnchor = facts.installAnchor
   const rawRows: RawRow[] = []
+  const bootIssues: DiagnosticIssue[] = []
   let layers: { readonly path: string; readonly patches: readonly unknown[] }[] | undefined
   let rows: readonly ComposedRow[] | undefined
 
@@ -791,8 +909,16 @@ async function readComposition(
         ...enablementOf(entry.disabled),
       }))
   } catch (error) {
+    // 异常文本里可能就写着启动阻断的根因：解析出来成为一等公民 issue，而不是只留一段 skip.reason。
+    // anchorConsulted 的判据：本次解析真的用到了安装锚点（没用到时不能断言"这次启动一定失败"）。
+    const anchorConsulted = facts.installRoots !== null && installAnchor !== undefined
+    const blocker = bootBlockerFromError(error, env, anchorConsulted)
+    if (blocker !== undefined) bootIssues.push(toBootIssue(blocker))
     skips.push({
       check: 'composition-official',
+      // 官方合成抛错 = 组合层这一次真的没查成（纯文本检查只是兜底的一部分），
+      // 层计数格必须显示"没查"而不是 0——不然与"查过且干净"长得一样。
+      layers: ['composition'],
       reason: '官方组合口径（dsh-app-boot 的 loadProfileDirectory/composeEntries）不可用，'
         + '只做纯文本检查，依赖禁用状态的检查已跳过：' + messageOf(error),
     })
@@ -807,7 +933,13 @@ async function readComposition(
     rawRows.push(...locatePatchRows(path))
   }
 
-  return { rows: rows ?? [], rawRows, skips, effectiveState: rows !== undefined }
+  if (rows !== undefined) {
+    // 合成路径同样可能带出启动阻断（同一 insert 列表内重复 id）。
+    const composedBlocker = duplicateIdBootIssue(rows, env)
+    if (composedBlocker !== undefined) bootIssues.push(composedBlocker)
+  }
+
+  return { rows: rows ?? [], rawRows, skips, bootIssues, effectiveState: rows !== undefined }
 }
 
 /** 把官方 disabled 值翻译成启停状态；条件表达式静态不可判定。 */
@@ -2473,6 +2605,65 @@ function scopeOfPatchFile(envName: string, envDir: string, file: string | undefi
   return packageNameOfFile(file) ?? (envName.length > 0 ? envName : undefined)
 }
 
+/**
+ * 把解析出的启动阻断根因变成一条正式发现。
+ *
+ * @param blocker - bootBlockerFromError 的结果。
+ * @returns 一条发现（severity 与 evidence 都来自解析，不在这里改判定）。
+ */
+function toBootIssue(blocker: BootBlocker): DiagnosticIssue {
+  return makeIssue({
+    layer: 'composition',
+    severity: blocker.severity,
+    code: blocker.code,
+    title: blocker.title,
+    detail: blocker.detail,
+    subjects: blocker.subjects,
+    evidence: blocker.evidence,
+    extra: { operation: blocker.operation },
+    id: blocker.id,
+  })
+}
+
+/**
+ * 合成结果里的启动阻断：**同一个 insert 列表内**重复 id。
+ *
+ * 这条由官方 composeEntries 自己抛（duplicate loader entry id: <id>），所以它一定致命；
+ * duplicate-row-id 只扫原始文本、官方不可用时也在跑，两者互相补位。
+ *
+ * @param rows - 官方合成出的行。
+ * @param env - 被诊断环境。
+ * @returns 重复 id 的发现；没有重复时 undefined。
+ */
+function duplicateIdBootIssue(rows: readonly ComposedRow[], env: EnvironmentInfo): DiagnosticIssue | undefined {
+  const seen = new Set<string>()
+  for (const row of rows) {
+    if (row.id.length === 0) continue
+    if (!seen.has(row.id)) {
+      seen.add(row.id)
+      continue
+    }
+    return makeIssue({
+      layer: 'composition',
+      severity: 'confirm-fix',
+      code: 'boot-blocker-row',
+      title: '组合层启动被阻断：同一个 insert 列表里重复的 id ' + row.id,
+      detail: '官方 composeEntries 在这个组合上直接抛 TypeError（duplicate loader entry id: ' + row.id + '）：'
+        + '**整个 profile 起不来**，启动阶段就停在 plugin tree failed to load，HTTP 服务从未开始监听。'
+        + '删掉多余的重复行（只保留一处）后**重启该环境**才会生效。'
+        + '这条结论来自官方组合口径本身；具体改哪个文件、删哪一行见同一次报告里的 duplicate-row-id。',
+      subjects: [row.id, env.name],
+      evidence: [{
+        kind: 'official',
+        at: 'composeEntries(profile layers)',
+        note: '官方合成时对同一 insert 列表内的重复 id 抛 duplicate loader entry id: ' + row.id,
+      }],
+      extra: { operation: '删除 ' + row.id + ' 的重复 insert 行（只保留一处），然后重启该环境' },
+      id: 'boot-blocker-row:' + row.id,
+    })
+  }
+  return undefined
+}
 /**
  * patch 文件归属的包名：从它的目录起往上找最近的 package.json（包根），读那一个包的 name。
  *

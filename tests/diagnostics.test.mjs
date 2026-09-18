@@ -29,6 +29,7 @@ let bundleDir
 let bundlePatchPath
 let crossPlainLine
 let crossSecondLine
+let bootBlocking
 
 /** reverse profile 的 patch 里某片段的行号（1 起）。 */
 function reversePatchLine(needle) {
@@ -251,6 +252,43 @@ before(async () => {
   ].join('\n'))
   crossPlainLine = reversePatchLine('- id: cross-both')
   crossSecondLine = reversePatchLine('    - id: cross-both')
+  // ── task-31：三种"起不来的环境"的忠实夹具（整份复制可启动的 profile 再注入一处脏）──
+  //  1) bundles 里放一个解析不到的包 → 官方 loadProfileDirectory 抛 cannot resolve profile bundle
+  //  2) 同一个 insert 列表内重复 id → 官方 composeEntries 抛 duplicate loader entry id
+  //  3) user patch 里插一行启用中的、解析不到的行 → 合成成功，但启动挂载必然 ERR_MODULE_NOT_FOUND
+  bootBlocking = {}
+  for (const name of ['boot-bundle', 'boot-dup', 'boot-orphan', 'boot-throw']) {
+    const dir = join(profiles, name)
+    await writeJson(join(dir, 'package.json'), {
+      name: 'dsh-profile-' + name, private: true, dependencies: {},
+      dsh: { profile: { bundles: [] } },
+    })
+    bootBlocking[name] = dir
+  }
+  await writeJson(join(bootBlocking['boot-bundle'], 'package.json'), {
+    name: 'dsh-profile-boot-bundle', private: true, dependencies: {},
+    dsh: { profile: { bundles: ['@deepseek-ai/definitely-not-installed'] } },
+  })
+  await writeText(join(bootBlocking['boot-dup'], 'cordis.patch.yml'), [
+    '- insert:',
+    '    - id: boot-dup-row',
+    "      name: 'dsh-plugin-manager-companion'",
+    '    - id: boot-dup-row',
+    "      name: 'dsh-plugin-manager-companion'",
+    '',
+  ].join('\n'))
+  await writeText(join(bootBlocking['boot-orphan'], 'cordis.patch.yml'), [
+    '- insert:',
+    '    - id: boot-orphan-row',
+    "      name: '@nope/boot-orphan-not-installed'",
+    '',
+  ].join('\n'))
+  await writeText(join(bootBlocking['boot-throw'], 'cordis.patch.yml'), [
+    '- insert:',
+    '    - id: boot-throw-row',
+    "      name: '@deepseek-ai/definitely-not-installed'",
+    '',
+  ].join('\n'))
 })
 
 after(async () => {
@@ -639,7 +677,7 @@ describe('diagnostics · 作用域标签（环境名 vs manifest name）', () =>
 describe('diagnostics · 跳过项（哪一层没查，是引擎给的显式事实）', () => {
   /** 非层级检查的稳定机器码：它们只说明某层结论不完整，不代表整层没查，不许带 layers。 */
   const NON_LAYER_CHECKS = [
-    'install-anchor', 'dependency-scan', 'composition-official', 'ecosystem-index',
+    'install-anchor', 'dependency-scan', 'ecosystem-index',
   ]
 
   it('关闭某一层：skip 的 layers 等于 [该层]，check 名不变', async () => {
@@ -670,7 +708,7 @@ describe('diagnostics · 跳过项（哪一层没查，是引擎给的显式事�
     assert.deepEqual([...skip.layers].sort(), ['composition', 'consistency', 'dependency', 'ecosystem', 'runtime'])
   })
 
-  it('反向用例：install-anchor / dependency-scan / composition-official / ecosystem-index 不设 layers', async () => {
+  it('反向用例：install-anchor / dependency-scan / ecosystem-index 不设 layers', async () => {
     const env = { name: 'broken', dir: brokenDir, current: false, builtin: false, bundles: [], dependencies: [], runs: [] }
     // 打开生态层才会走到它的骨架跳过（默认关闭时那一层是显式关闭，属于层级跳过）。
     const config = { ...CONFIG, diagnostics: { ...CONFIG.diagnostics, ecosystem: true } }
@@ -689,6 +727,10 @@ describe('diagnostics · 跳过项（哪一层没查，是引擎给的显式事�
     const anchorSkip = noAnchor.skipped.find(item => item.check === 'install-anchor')
     assert.ok(anchorSkip, '缺锚点要有 install-anchor skip')
     assert.equal(anchorSkip.layers, undefined, '锚点缺失不是整层没查')
+    // 例外（task-31 改判）：官方合成抛错 = 组合层这一次真的没查成，必须标出来，
+    // 否则层计数格里它会显示成 0，与"查过且干净"长得一样。
+    const compositionSkip = report.skipped.find(item => item.check === 'composition-official')
+    assert.deepEqual(compositionSkip.layers, ['composition'], '官方合成抛错时组合层必须标成没查')
   })
 
   it('不变量：带 layers 的 skip 的 check 必须是 <layer>-layer', async () => {
@@ -726,6 +768,88 @@ describe('diagnostics · 跳过项（哪一层没查，是引擎给的显式事�
     assert.deepEqual(collapsed.layers, ['runtime'])
     assert.throws(() => assert.deepEqual(collapsed.layers, ['runtime', 'consistency']),
       '压成一层后必须报红——那会把 consistency 画成"查过且没问题"')
+  })
+})
+
+describe('diagnostics · 启动阻断根因（一等公民）', () => {
+  /** 被 skip 明说成"没查"的层集合。 */
+  function unverifiedLayers(report) {
+    const marked = new Set()
+    for (const item of report.skipped) for (const layer of item.layers ?? []) marked.add(layer)
+    return marked
+  }
+
+  it('bundle 解析不到：给出不可解析的 bundle 名、致命级别与三要素', async () => {
+    const env = { name: 'boot-bundle', dir: bootBlocking['boot-bundle'], current: false, builtin: false, bundles: [], dependencies: [], runs: [], installAnchor }
+    const report = await analyzeEnvironment(makeCtx({}), env, CONFIG)
+    const issue = report.issues.find(item => item.code === 'unresolvable-bundle')
+    assert.ok(issue, '必须产出一条 issue 而不是只留 skip.reason：' + JSON.stringify(report.issues.map(item => item.code)))
+    assert.equal(issue.severity, 'confirm-fix', '锚点可用时这条就是致命的')
+    assert.ok(issue.subjects.includes('@deepseek-ai/definitely-not-installed'))
+    assert.ok(issue.detail.includes(join(bootBlocking['boot-bundle'], 'package.json')), '三要素①：文件绝对路径：' + issue.detail)
+    assert.ok(issue.detail.includes('重启该环境'), '三要素②：改完重启')
+    assert.match(issue.extra.operation, /definitely-not-installed/, '三要素③：可复制的操作文本要指名这一项')
+    assert.equal(issue.fix, undefined, '没有可自动执行的动作，不许挂 safe-fix')
+    assert.ok(unverifiedLayers(report).has('composition'), '这一层必须被标成没查：' + JSON.stringify([...unverifiedLayers(report)]))
+  })
+
+  it('同一 insert 列表内重复 id：报一条致命，并与 duplicate-row-id 去重', async () => {
+    const env = { name: 'boot-dup', dir: bootBlocking['boot-dup'], current: false, builtin: false, bundles: [], dependencies: [], runs: [], installAnchor }
+    const report = await analyzeEnvironment(makeCtx({}), env, CONFIG)
+    const duplicate = report.issues.filter(item => item.code === 'duplicate-row-id')
+    const boot = report.issues.filter(item => item.code === 'boot-blocker-row')
+    assert.equal(boot.length, 0, '更细的 duplicate-row-id 已在报同一条事实，不许重复：' + JSON.stringify(report.issues.map(item => item.code)))
+    assert.equal(duplicate.length, 1, '要有一条 duplicate-row-id：' + JSON.stringify(report.issues.map(item => item.code)))
+    assert.equal(duplicate[0].severity, 'confirm-fix')
+    assert.ok(duplicate[0].evidence.some(item => item.kind === 'file'), '要带文件证据')
+    assert.equal(duplicate[0].fix.action, 'remove-duplicate-row')
+  })
+
+  it('user patch 里启用中的孤儿行：orphan-row 就是启动阻断，三要素齐全', async () => {
+    const env = { name: 'boot-orphan', dir: bootBlocking['boot-orphan'], current: false, builtin: false, bundles: [], dependencies: [], runs: [], installAnchor }
+    const report = await analyzeEnvironment(makeCtx({}), env, CONFIG)
+    const issue = report.issues.find(item => item.code === 'orphan-row')
+    assert.ok(issue, '要检出 orphan-row')
+    assert.equal(issue.severity, 'confirm-fix')
+    assert.ok(issue.detail.includes('整个 profile 起不来'))
+    assert.ok(issue.fix.summary.includes(join(bootBlocking['boot-orphan'], 'cordis.patch.yml')), '三要素：文件绝对路径：' + issue.fix.summary)
+  })
+
+  it('判不定时不猜：锚点没被用到时降为 report-only 并写明不确定', async () => {
+    const env = { name: 'boot-unclear', dir: bootBlocking['boot-bundle'], current: false, builtin: false, bundles: [], dependencies: [], runs: [], installAnchor: join(home, 'runtime', 'no-such-anchor.json') }
+    const report = await analyzeEnvironment(makeCtx({}), env, CONFIG)
+    const issue = report.issues.find(item => item.code === 'unresolvable-bundle')
+    assert.ok(issue, '仍要给出一条 issue：' + JSON.stringify(report.issues.map(item => item.code)))
+    assert.equal(issue.severity, 'report-only', '判不定就必须降级，不能吓人')
+    assert.match(issue.detail, /没有.{0,4}用到安装锚点/, '要把不确定写出来：' + issue.detail)
+    assert.match(issue.detail, /不能据此断言/, '要说明为什么不升级')
+  })
+
+  it('变异验证：把根因解析去掉（退回只记 skip.reason）→ 必须报红', async () => {
+    const env = { name: 'boot-bundle', dir: bootBlocking['boot-bundle'], current: false, builtin: false, bundles: [], dependencies: [], runs: [], installAnchor }
+    const report = await analyzeEnvironment(makeCtx({}), env, CONFIG)
+    assert.ok(report.issues.some(item => item.code === 'unresolvable-bundle'))
+    const mutatedIssues = report.issues.filter(item => item.code !== 'unresolvable-bundle')
+    assert.throws(() => assert.ok(mutatedIssues.find(item => item.code === 'unresolvable-bundle'), '必须产出一条 issue'),
+      '去掉解析后断言必须失败——否则这条事实又只剩 skip.reason 里那段长文本')
+    const skip = report.skipped.find(item => item.check === 'composition-official')
+    assert.ok(skip, '旧通道（skip）仍在，只是不再是唯一身份')
+    assert.ok(skip.reason.includes('cannot resolve profile bundle'), '原始异常文本照样保留在 reason 里')
+  })
+
+  it('不变量：出现启动阻断 issue 时，对应层不得被静默画成"查过且干净"', async () => {
+    for (const name of ['boot-bundle', 'boot-dup', 'boot-orphan']) {
+      const env = { name, dir: bootBlocking[name], current: false, builtin: false, bundles: [], dependencies: [], runs: [], installAnchor }
+      const report = await analyzeEnvironment(makeCtx({}), env, CONFIG)
+      const blocking = report.issues.filter(item => item.code === 'unresolvable-bundle'
+        || item.code === 'boot-blocker-row' || item.code === 'orphan-row' || item.code === 'duplicate-row-id')
+      assert.ok(blocking.length > 0, name + ' 应当产出启动阻断类发现')
+      const marked = unverifiedLayers(report)
+      for (const layer of new Set(blocking.map(item => item.layer))) {
+        const looksClean = report.counts[layer] === 0 && !marked.has(layer)
+        assert.equal(looksClean, false, name + ' 的 ' + layer + ' 层被画成了查过且干净，但这里有启动阻断')
+      }
+    }
   })
 })
 describe('diagnostics · 词法扫描器', () => {
