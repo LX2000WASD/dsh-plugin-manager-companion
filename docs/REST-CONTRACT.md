@@ -12,6 +12,7 @@
 | `fix` | `{ action: string, target?: string }` | `FixOutcome` | job |
 | `install` | `{ spec: string, enable?: boolean, answers?: Record<string,string> }` | `GatedInstallResult` | job |
 | `listEnvironments` | `{}` | `EnvironmentInfo[]` | |
+| `environmentTemplates` | `{}` | `{ default: string, templates: { name: string, bundles: string[] }[] }` | |
 | `scanRuns` | `{ refresh?: boolean }` | `Record<string, EnvironmentRun[]>` | |
 | `startEnvironment` | `{ name: string, background?: boolean }` | `EnvironmentResult` | |
 | `stopEnvironment` | `{ name: string }` | `EnvironmentResult` | |
@@ -96,3 +97,23 @@ node_modules 实体、凭据、缓存都不进来——备份的价值是可重�
 
 客户端的 `runJob` 同时接受两种形状作为**防御**，但契约以 `{ jobId }` 为准，
 `tests/index.test.mjs` 的 `jobIdOf()` 刻意**不接受**裸字符串。
+## 环境生命周期（建 / 启 / 停）契约
+
+- **建**：`createEnvironment` 省略 `template` 时用**官方 web 模板**（`@deepseek-ai/dsh-base` +
+  `@deepseek-ai/dsh-web-app`），不再是官方 `DEFAULT_PROFILE_BUNDLES`——后者只有 base、没有任何
+  app，建出来的环境必然没有 web 服务（实测：启动它只能干等 30s 再报 timeout）。可选模板与
+  默认值由 `environmentTemplates` 给出，客户端**不要自建模板表**。
+- **启**：就绪判据是**官方 HTTP 应答**——`GET /` 返回 `200/303/401` 才算就绪。`404` 不算，
+  「端口可连接」也不算：本机实测首个 HTTP 应答 628ms 时是 `404`（连接已通、路由未注册），
+  838ms 才是 `401`，中间约 210ms 的窗口里 TCP 判据会给出打不开的地址。
+- **启不起来的两种即时拒绝**（都在发起启动之前）：层栈里没有任何 web 服务层 → `no-web-layer`
+  （附两条可执行动作）；调用方显式指定的端口已被监听 → `port-in-use`（HTTP 探针无法判断应答
+  来自谁，所以不让「端口已被占」进入等就绪流程）。拿不到官方 web 层事实时如实降级为
+  「按就绪探测等待」，不预判拒绝。超时 → `timeout`，附官方输出尾巴。
+- **token**：后台启动时 host 从官方 stdout 捕获 `dsh web: http://127.0.0.1:<port>/?token=<token>`，
+  把这条**带 token 的可用地址**作为 `EnvironmentResult.output` 里的「可用地址」随本次返回交给页面。
+  边界：token 只出现在该环境目录下 `0600` 的启动日志与**这一次**返回里（失败文案里的日志尾巴
+  已脱敏为 `token=***`）；客户端**不得持久化**它——不进 localStorage、不进任何缓存、不进备份
+  与差异状态；界面上也不要加「该地址含令牌」之类的解释段（`DESIGN §12`）。
+- **启动方式**如实返回：终端窗口（带终端名）或后台。后台启动默认加 `--no-open`（没有人看着
+  那个窗口，官方否则会在那台机器桌面弹浏览器）；终端模式保持官方默认行为。

@@ -13,7 +13,7 @@
 
 import type { Context } from "@deepseek-ai/cordis"
 import { analyzeEnvironment } from "./diagnostics.ts"
-import { backupDiff, backupExport, backupRestore, copyPlugins, createEnvironment, listEnvironments, removeEnvironment, renameEnvironment, scanRuns, startEnvironment, stopEnvironment } from "./envManager.ts"
+import { DEFAULT_ENVIRONMENT_TEMPLATE, backupDiff, backupExport, backupRestore, copyPlugins, createEnvironment, environmentTemplates, listEnvironments, removeEnvironment, renameEnvironment, repairDependencies, scanRuns, startEnvironment, stopEnvironment } from "./envManager.ts"
 import { loadKindRecords, presetsRoot, pruneGhostRecords, removeKindDir, removeKindRecord, skillsRoot } from "./kinds.ts"
 import { buildInstalledIndex, cachedMarketplace, invalidateInstalledIndex, registryItems } from "./marketplace.ts"
 import { probeOfficialCapabilities, requireManager, type OfficialCapabilities } from "./official.ts"
@@ -255,13 +255,26 @@ async function dispatch(op: string, body: Record<string, unknown>, deps: OpDepen
     case "scanRuns":
       return Object.fromEntries(scanRuns())
 
-    case "startEnvironment":
-      return await startEnvironment(requireString(body, "name"), {})
+    case "environmentTemplates": {
+      // 模板清单 = 官方 PROFILE_TEMPLATES 的投影；默认模板由后端给，客户端不要自己猜
+      // （客户端猜成 base-only 就会建出一个必然起不来的环境，实测踩过）。
+      return { default: DEFAULT_ENVIRONMENT_TEMPLATE, templates: environmentTemplates() }
+    }
+
+    case "startEnvironment": {
+      const name = requireString(body, "name")
+      // background=true 走后台（客户端已有的意图，之前被丢掉，导致永远弹终端窗口）。
+      const mode = body["background"] === true ? "background" : "terminal"
+      // 必须传 ctx：envManager 用它取官方 installAnchor 判定 web 层；拿不到时如实降级为
+      // 「无法预判，仍按就绪探测等待」，而不是拒绝。
+      return await startEnvironment(name, { ctx: deps.ctx, mode })
+    }
 
     case "stopEnvironment":
       return await stopEnvironment(requireString(body, "name"))
 
     case "createEnvironment":
+      // 省略 template 时由后端默认到官方 web 模板（能起得来），不是官方 base-only 默认。
       return await createEnvironment(requireString(body, "name"),
         typeof body["template"] === "string" ? body["template"] : undefined)
 
@@ -352,6 +365,8 @@ async function dispatch(op: string, body: Record<string, unknown>, deps: OpDepen
         ctx: deps.ctx,
         environmentName: () => deps.capabilities().environmentName,
         install: async (spec) => await gatedInstall(deps.ctx, config, spec),
+        // install-dependency 走这条：声明已在、只是没装，官方 add 会以 already-installed 拒绝。
+        repair: async (target) => await repairDependencies(target, { ctx: deps.ctx }),
       }))
     }
 

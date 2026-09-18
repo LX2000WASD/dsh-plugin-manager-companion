@@ -25,13 +25,17 @@
  */
 
 import { execFileSync, spawn } from 'node:child_process'
-import { accessSync, constants, existsSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from 'node:fs'
+import {
+  accessSync, closeSync, constants, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync,
+  rmSync, statSync,
+} from 'node:fs'
+import { request as httpRequest } from 'node:http'
 import { connect, createServer } from 'node:net'
 import { basename, delimiter, dirname, isAbsolute, join, resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { withFileLock } from '@deepseek-ai/dsh-atomic-write'
 import {
-  DEFAULT_PROFILE_BUNDLES, initProfile, PROFILE_TEMPLATES, readProfileManifest, writeProfileBundles,
+  DEFAULT_PROFILE_BUNDLES, initProfile, PROFILE_TEMPLATES, readProfileManifest, resolveBundleDir, writeProfileBundles,
 } from '@deepseek-ai/dsh-app-boot'
 import type { PackageOperationContext, PackageOperationOptions } from '@deepseek-ai/dsh-plugin-manager/operations'
 import type { PackageResult } from '@deepseek-ai/dsh-plugin-manager/types'
@@ -68,6 +72,37 @@ export const DEFAULT_WEB_PORT = 3090
 /** 就绪轮询间隔。 */
 const READY_POLL_MS = 250
 
+/** 单次 HTTP 就绪探测的超时。 */
+const READY_HTTP_TIMEOUT_MS = 2_000
+
+/**
+ * 官方 web 层的判定依据之一：提供 web 服务的那个官方包。
+ *
+ * 这是一个官方包名，不是我们的 bundle/模板名单（模板与层栈一律从官方
+ * PROFILE_TEMPLATES 派生）。证据：packages/bundle/web-app/package.json 依赖
+ * @deepseek-ai/dsh-host-webserver；官方另外四个 app bundle（base / headless /
+ * acp-app / sdk-app / sdk-minimal）都没有这个依赖。
+ */
+const WEB_SERVER_PACKAGE = '@deepseek-ai/dsh-host-webserver'
+
+/**
+ * 视为「实例已应答」的 HTTP 状态。
+ *
+ * 官方 browser-auth：未授权回 401、带 token 的根请求回 303 换 cookie、已授权回 200。
+ * 404 是「这条路由还没注册上」，不是就绪 —— 实测 TCP 刚可连接时 GET / 正是 404。
+ */
+const READY_HTTP_STATUSES: readonly number[] = [200, 303, 401]
+
+/**
+ * 创建环境时的默认模板名。
+ *
+ * 官方 DEFAULT_PROFILE_BUNDLES 只有 @deepseek-ai/dsh-base（官方语义：故意最小，没有
+ * 任何 app），用它建出来的环境**必然没有 web 服务**：实测 startEnvironment 拉起后
+ * 干等 30s 报 timeout。官方 PROFILE_TEMPLATES.web 才是「建一个能访问的环境」的语义。
+ * 取名字时按官方键校验，官方常量里没有这个键就 fail loud（不悄悄退化成 base-only）。
+ */
+export const DEFAULT_ENVIRONMENT_TEMPLATE = 'web'
+
 /** 官方 pnpm 通道的默认输出上限与锁等待上限（与官方 CLI 同量级）。 */
 const OPERATION_OUTPUT_BYTES = 64 * 1024
 const OPERATION_LOCK_WAIT_MS = 120_000
@@ -93,6 +128,10 @@ export type EnvironmentErrorCode =
   | 'running'
   /** 环境没有运行实例。 */
   | 'not-running'
+  /** 环境的层栈里没有任何能提供 web 服务的层，启动它不会有网页可访问。 */
+  | 'no-web-layer'
+  /** 调用方显式指定的端口已经被监听：不猜「应答来自谁」，直接拒绝、不发起启动。 */
+  | 'port-in-use'
   /** 未知的 bundle 模板名。 */
   | 'unknown-template'
   /** 不是由 dsh 以 profile 方式启动，官方跨环境通道拿不到 installAnchor。 */
@@ -556,6 +595,72 @@ export function environmentTemplates(): readonly EnvironmentTemplate[] {
   return Object.entries(PROFILE_TEMPLATES).map(([name, template]) => ({ name, bundles: [...template.bundles] }))
 }
 
+/**
+ * 官方 web 模板相对官方默认层栈多出来的那几层 —— 也就是「能提供 web 面」的包。
+ *
+ * 派生自官方常量（PROFILE_TEMPLATES / DEFAULT_PROFILE_BUNDLES）：官方改了模板，
+ * 这里跟着变，不需要改代码，也不需要我们维护一份会漂移的名字表。
+ *
+ * @returns 官方 web app 层的包名；官方常量里没有该模板时返回空数组。
+ */
+export function officialWebAppBundles(): readonly string[] {
+  const template = PROFILE_TEMPLATES[DEFAULT_ENVIRONMENT_TEMPLATE]
+  if (template === undefined) return []
+  return template.bundles.filter((name) => !DEFAULT_PROFILE_BUNDLES.includes(name))
+}
+
+/** 一个环境的 web 层判定。 */
+export type WebLayerPresence = 'present' | 'absent' | 'unknown'
+
+/**
+ * 判断一个环境的层栈里有没有能提供 web 服务的层。
+ *
+ * 两条官方事实，先静态后动态：
+ *   1. 层名出现在官方 web 模板的 app 层里（官方常量派生，覆盖官方模板建的层栈）；
+ *   2. 逐层用官方 resolveBundleDir 找到包目录、读它的 manifest：依赖或 peer 里出现
+ *      WEB_SERVER_PACKAGE 的层就是 web 层（这条能认出官方模板之外的 web bundle）。
+ *
+ * 只有「每一层都能解析、且都不满足上面两条」才敢说 absent —— 任何一层的事实拿不到
+ * 就返回 unknown，调用方据此降级为「无法预判，仍按就绪探测等待」，绝不预判成 absent
+ * 去拒绝一个可能能跑的环境。
+ *
+ * @param dir - 环境目录。
+ * @param bundles - 该环境的 bundle 层栈。
+ * @param installAnchor - 官方安装锚点；省略时用该环境自己的 manifest 作解析锚点（官方第二锚点）。
+ * @returns 判定结果。
+ */
+export function environmentWebLayer(
+  dir: string, bundles: readonly string[], installAnchor?: string,
+): WebLayerPresence {
+  // 层栈读不出来（manifest 损坏）：没有任何可依据的事实。
+  if (bundles.length === 0) return 'unknown'
+  const webApps = officialWebAppBundles()
+  if (bundles.some((name) => webApps.includes(name))) return 'present'
+  const anchor = installAnchor ?? join(dir, 'package.json')
+  let allResolved = true
+  for (const name of bundles) {
+    let bundleDir: string
+    try {
+      bundleDir = resolveBundleDir(OUR_PACKAGE_NAME, name, anchor, dir)
+    } catch {
+      // 这一层装没装、装的是什么都读不到：不能拿它当证据。
+      allResolved = false
+      continue
+    }
+    try {
+      const manifest = readProfileManifest(OUR_PACKAGE_NAME, bundleDir) as {
+        dependencies?: Record<string, unknown>
+        peerDependencies?: Record<string, unknown>
+      }
+      const declared = { ...manifest.dependencies, ...manifest.peerDependencies }
+      if (Object.keys(declared).includes(WEB_SERVER_PACKAGE)) return 'present'
+    } catch {
+      allResolved = false
+    }
+  }
+  return allResolved ? 'absent' : 'unknown'
+}
+
 // ── 创建 / 重命名 / 删除 ──────────────────────────────────────────────────
 
 /** Windows 保留设备名：这些名字当目录会在写入时报原始 EINVAL。 */
@@ -582,23 +687,27 @@ export function environmentNameProblem(name: string): string | null {
  * 创建一个环境（骨架由官方 initProfile 写：manifest、空 patch 层、pnpm 设置）。
  *
  * 模板只接受官方 PROFILE_TEMPLATES 的名字；不存在的模板名是配置错误，直接失败，
- * 而不是悄悄换成默认 bundle 列表。
+ * 而不是悄悄换成别的 bundle 列表。
+ *
+ * 省略模板时用 DEFAULT_ENVIRONMENT_TEMPLATE（官方 web 模板），**不是**官方
+ * DEFAULT_PROFILE_BUNDLES：后者只有 base、没有任何 app，建出来的环境必然起不来
+ * （实测 startEnvironment 干等 30s 超时）。
  *
  * @param name - 新环境名。
- * @param template - 官方模板名；省略时用官方 DEFAULT_PROFILE_BUNDLES。
+ * @param template - 官方模板名；省略时用官方 web 模板。
  * @returns 操作结果。
  */
 export async function createEnvironment(name: string, template?: string): Promise<EnvironmentResult> {
   const problem = environmentNameProblem(name)
   if (problem !== null) return failure('invalid-name', problem)
   if (isBuiltinEnvironment(name)) return failure('builtin', name + ' 是官方内置环境，不能重新创建')
-  const wanted = template ?? ''
-  const selected = wanted.length > 0 ? PROFILE_TEMPLATES[wanted] : undefined
-  if (wanted.length > 0 && selected === undefined) {
+  const wanted = template === undefined || template.length === 0 ? DEFAULT_ENVIRONMENT_TEMPLATE : template
+  const selected = PROFILE_TEMPLATES[wanted]
+  if (selected === undefined) {
     return failure('unknown-template', '未知模板 ' + JSON.stringify(wanted) + '；可用模板：'
       + Object.keys(PROFILE_TEMPLATES).join(', '))
   }
-  const bundles = selected === undefined ? [...DEFAULT_PROFILE_BUNDLES] : [...selected.bundles]
+  const bundles = [...selected.bundles]
   const dir = environmentDir(name)
   if (existsSync(join(dir, 'package.json'))) {
     return failure('already-exists', '环境已存在：' + name + '（' + dir + '）')
@@ -720,6 +829,12 @@ export interface LaunchSpec {
 export interface LaunchOutcome {
   readonly ok: boolean
   readonly detail: string
+  /** 实际采用的启动方式；没有可用终端时会从 terminal 降级为 background。 */
+  readonly mode: 'terminal' | 'background'
+  /** 终端模式实际用的终端名。 */
+  readonly terminal?: string
+  /** 后台模式捕获官方输出到的日志路径（里面有官方打印的带 token 地址）。 */
+  readonly logPath?: string
 }
 
 /** startEnvironment 的选项。 */
@@ -730,14 +845,18 @@ export interface StartEnvironmentOptions {
   readonly port?: number
   /** 自动选端口的起点；默认 DEFAULT_WEB_PORT。 */
   readonly portStart?: number
-  /** 端口就绪上限；默认 START_READY_TIMEOUT_MS。 */
+  /** 就绪上限；默认 START_READY_TIMEOUT_MS。 */
   readonly readyTimeoutMs?: number
   /** 追加给被启动应用的参数。 */
   readonly extraArgs?: readonly string[]
+  /** host 上下文：用于取官方 installAnchor 判定 web 层。 */
+  readonly ctx?: Context
+  /** installAnchor 覆盖；省略时取 ctx.profileContext.installAnchor，再退到该环境自己的 manifest。 */
+  readonly installAnchor?: string
   /** 启动器注入（测试）：替换终端/后台启动。 */
   readonly launch?: (spec: LaunchSpec) => Promise<LaunchOutcome>
-  /** 端口探测注入（测试）。 */
-  readonly probe?: (port: number) => Promise<boolean>
+  /** HTTP 就绪探测注入（测试）：返回状态码；null 表示没有应答。 */
+  readonly probe?: (port: number) => Promise<number | null>
   /** 时钟注入（测试）。 */
   readonly now?: () => number
   /** 等待注入（测试）。 */
@@ -747,13 +866,17 @@ export interface StartEnvironmentOptions {
 /**
  * 启动一个环境的实例。
  *
- * 先拒绝已经在跑的环境（否则第二个实例会掩盖第一个，端口与停止目标都变得含
- * 糊），再选一个空闲端口，然后按 mode 在终端窗口或后台启动，最后轮询端口就绪
- * （有上限）。
+ * 四道关，越靠前越便宜：
+ *   1. 环境存在、不在运行中；
+ *   2. **web 层预检**：层栈里没有任何 web 服务层就立刻拒绝（实测 base-only 环境要干等
+ *      30s 才超时，用户拿到的是「端口未就绪」这种没法行动的信息）；
+ *   3. 选空闲端口，按 mode 在终端窗口或后台启动；
+ *   4. 等**官方 HTTP 端点应答**（不是等 TCP 可连接 —— 实测 TCP 通了那一刻 GET / 还是
+ *      404，1000ms 后才是 401，提前报成功会把不可用的 url 交出去）。
  *
  * @param name - 环境名。
  * @param options - 启动选项。
- * @returns 操作结果；成功时 output 含实例 URL。
+ * @returns 操作结果；成功时 output 含实际启动方式与可用地址（带 token，见 startedMessage）。
  */
 export async function startEnvironment(
   name: string, options: StartEnvironmentOptions = {},
@@ -769,20 +892,115 @@ export async function startEnvironment(
       + (ports.length > 0 ? '（端口 ' + ports.join(', ') + '）' : '（pid ' + running.map((run) => run.pid).join(', ') + '）')
       + '，请先停止它')
   }
+  // 层栈事实来自该环境自己的 manifest；web 层判定见 environmentWebLayer。
+  const layers = readEnvironmentManifest(dir).bundles
+  const installAnchor = options.installAnchor ?? profileContextOf(options.ctx)?.installAnchor
+  if (environmentWebLayer(dir, layers, installAnchor) === 'absent') {
+    return failure('no-web-layer', noWebLayerMessage(name, layers))
+  }
   const start = options.portStart ?? DEFAULT_WEB_PORT
   const port = options.port ?? await findFreePort(start)
   if (port === null) return failure('io-failed', '从 ' + String(start) + ' 起的 200 个端口内没有空闲端口')
+  // 显式端口是调用方指定的：已经被监听就根本不该进入「等就绪」流程 —— HTTP 探针
+  // 无法判断应答来自谁，会把别人的实例当成我们刚启动的那个报 ok。
+  if (options.port !== undefined && await tcpListening(port)) {
+    return failure('port-in-use', '端口 ' + String(port) + ' 已经被监听：无法确认它会由本次启动的实例接管，'
+      + '所以不发起启动。请换一个端口，或先停掉占用它的进程。')
+  }
   const spec = launchSpec(name, dir, port, options)
   const outcome = await (options.launch ?? defaultLaunch)(spec)
   if (!outcome.ok) return failure('launch-failed', outcome.detail)
-  const ready = await waitForPort(port, options)
-  if (!ready) {
-    return failure('timeout', name + ' 已启动，但 ' + String(options.readyTimeoutMs ?? START_READY_TIMEOUT_MS)
-      + 'ms 内端口 ' + String(port) + ' 未就绪 —— 请看启动窗口的输出。命令：' + spec.display)
+  const status = await waitForReady(port, options)
+  if (status === null) {
+    return failure('timeout', startTimeoutMessage(name, port, spec, outcome, options))
   }
   // 新实例立刻可见：丢弃陈旧缓存。
   resetRunCache()
-  return success(outcome.detail + '\nurl：http://127.0.0.1:' + String(port) + '\n命令：' + spec.display)
+  return success(startedMessage(name, port, status, spec, outcome))
+}
+
+/**
+ * 没有 web 层时的可操作拒绝文案。
+ *
+ * 两个可选动作都是用户能立刻执行的，且包名来自官方常量（officialWebAppBundles），
+ * 不是我们抄的名字表。
+ *
+ * @param name - 环境名。
+ * @param layers - 该环境当前的 bundle 层栈。
+ * @returns 面向用户的说明。
+ */
+function noWebLayerMessage(name: string, layers: readonly string[]): string {
+  const suggestion = officialWebAppBundles()
+  return name + ' 的 bundle 层栈里没有任何能提供 web 服务的层，启动它不会得到可访问的网页。\n'
+    + '当前层栈：' + (layers.length === 0 ? '（空）' : layers.join(', ')) + '\n'
+    + '请二选一：\n'
+    + '  1. 在官方插件页给它启用 web 层（'
+    + (suggestion.length === 0 ? '官方 web 模板里的 app 层' : suggestion.join(', ')) + '）；\n'
+    + '  2. 用官方 web 模板重建一个环境。\n'
+    + '本次没有发起启动（不占用端口、不弹窗口）。'
+}
+
+/**
+ * 启动成功文案：启动方式、可用地址、日志都如实说明。
+ *
+ * 关键：**不带 token 的地址不是可点开的入口**。官方 browser-auth 会 401，正文让用户
+ * 「reopen the URL printed by dsh web」。所以只有从官方输出里读到带 token 的地址时才
+ * 把它作为可用地址给出；否则明确告诉用户去哪里拿。
+ *
+ * @param name - 环境名。
+ * @param port - 实例端口。
+ * @param status - 就绪时的 HTTP 状态码。
+ * @param spec - 启动描述。
+ * @param outcome - 启动结果。
+ * @returns 面向用户的多行说明。
+ */
+function startedMessage(
+  name: string, port: number, status: number, spec: LaunchSpec, outcome: LaunchOutcome,
+): string {
+  const lines = ['已启动 ' + name
+    + '（启动方式：' + (outcome.mode === 'terminal' ? '终端窗口 ' + (outcome.terminal ?? '') : '后台') + '）'
+    + '　官方 HTTP 已应答：GET / -> ' + String(status)]
+  const authenticated = outcome.logPath === undefined ? null : authenticatedUrlFromLog(outcome.logPath)
+  if (authenticated !== null) {
+    lines.push('可用地址：' + authenticated)
+  } else {
+    lines.push('注意：http://127.0.0.1:' + String(port) + '/ 不带 token 会被官方 browser-auth 拒绝（401）。')
+    lines.push(outcome.mode === 'terminal'
+      ? '可用地址只在刚打开的终端窗口里由 dsh 打印（形如 dsh web: http://127.0.0.1:' + String(port) + '/?token=...），请从那里复制。'
+      : '官方输出里没有读到带 token 的地址，请查看日志。')
+  }
+  if (outcome.logPath !== undefined) lines.push('日志：' + outcome.logPath)
+  lines.push('命令：' + spec.display)
+  return lines.join('\n')
+}
+
+/**
+ * 启动超时文案：带上官方输出的尾巴。
+ *
+ * 不再是「请看启动窗口的输出」——终端模式下等于把用户推到看不见的窗口，后台模式下
+ * 更没有窗口可看。日志尾巴是我们手上最具体的事实。
+ *
+ * @param name - 环境名。
+ * @param port - 实例端口。
+ * @param spec - 启动描述。
+ * @param outcome - 启动结果。
+ * @param options - 启动选项（取超时上限）。
+ * @returns 面向用户的多行说明。
+ */
+function startTimeoutMessage(
+  name: string, port: number, spec: LaunchSpec, outcome: LaunchOutcome, options: StartEnvironmentOptions,
+): string {
+  const lines = [name + ' 已启动，但 ' + String(options.readyTimeoutMs ?? START_READY_TIMEOUT_MS)
+    + 'ms 内端口 ' + String(port) + ' 没有给出官方 web 应答（GET / 需要返回 200/303/401；404 不算就绪）。']
+  if (outcome.logPath === undefined) {
+    lines.push('请看刚打开的终端窗口里 dsh 的输出。')
+  } else {
+    const tail = tailOfLog(outcome.logPath, 20)
+    lines.push('日志：' + outcome.logPath)
+    lines.push(tail.length === 0 ? '（日志还是空的）' : tail.join('\n'))
+  }
+  lines.push('命令：' + spec.display)
+  return lines.join('\n')
 }
 
 /** 组装一次启动：入口、参数与展示用命令行。 */
@@ -819,30 +1037,152 @@ function dshEntryPoint(): { command: string; args: readonly string[]; entry: str
   return { command: process.platform === 'win32' ? 'dsh.cmd' : 'dsh', args: [], entry: null }
 }
 
-/** 端口就绪轮询。 */
-async function waitForPort(port: number, options: StartEnvironmentOptions): Promise<boolean> {
-  const probe = options.probe ?? probePort
+/**
+ * 等到官方 HTTP 端点应答为止。
+ *
+ * 判据只有一条：GET / 返回 READY_HTTP_STATUSES 里的状态。
+ *
+ * 为什么不看「TCP 可连接」——现场证据（本机实测，官方 web 模板环境）：
+ *   首个 HTTP 应答 628ms，状态码 404（连接已通、路由还没注册）；
+ *   首个官方就绪应答 838ms，状态码 401；
+ *   404 窗口约 210ms：这 210ms 里 TCP 判据会报 ok，并把一个 404 的地址交给用户。
+ * 就绪报出的时刻由实例决定，判据本身不拖慢启动：同一台机器上单次探测 0.6ms 拿到 401。
+ *
+ * @param port - 实例端口。
+ * @param options - 启动选项（注入探测/时钟/等待与超时上限）。
+ * @returns 就绪时的状态码；超时返回 null。
+ */
+async function waitForReady(port: number, options: StartEnvironmentOptions): Promise<number | null> {
+  const probe = options.probe ?? httpStatus
   const now = options.now ?? Date.now
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((done) => { setTimeout(done, ms) }))
   const deadline = now() + (options.readyTimeoutMs ?? START_READY_TIMEOUT_MS)
   for (;;) {
-    if (await probe(port)) return true
+    const status = await probe(port)
+    if (status !== null && READY_HTTP_STATUSES.includes(status)) return status
     const left = deadline - now()
-    if (left <= 0) return false
+    if (left <= 0) return null
     await sleep(Math.min(READY_POLL_MS, left))
   }
 }
 
-/** 端口是否接受连接。 */
-function probePort(port: number): Promise<boolean> {
+/**
+ * 对 GET / 发一次真实 HTTP 请求，返回状态码。
+ *
+ * 用 node:http 直接请求，不起探测服务、不跟随重定向（303 本身就是「已就绪」的证据）。
+ *
+ * @param port - 实例端口。
+ * @returns 状态码；没有应答（连接被拒、超时）时 null。
+ */
+function httpStatus(port: number): Promise<number | null> {
+  return new Promise((done) => {
+    const request = httpRequest(
+      { host: '127.0.0.1', port, path: '/', method: 'GET', timeout: READY_HTTP_TIMEOUT_MS },
+      (response) => {
+        const status = response.statusCode ?? null
+        response.resume()
+        done(status)
+      },
+    )
+    // 被防火墙静默丢弃的连接会让 promise 永远不落地，就绪循环要给它上限。
+    request.once('timeout', () => { request.destroy(); done(null) })
+    request.once('error', () => done(null))
+    request.end()
+  })
+}
+
+/**
+ * 端口是否已经被监听。
+ *
+ * 只在调用方显式指定端口时用于启动前的归属检查：TCP 一连上就说明有人占着它。
+ * 这里刻意不做 HTTP 判断 —— 要回答的是「这个端口是不是空的」，不是「它是否已可用」。
+ *
+ * @param port - 目标端口。
+ * @returns 已被监听时 true。
+ */
+function tcpListening(port: number): Promise<boolean> {
   return new Promise((done) => {
     const socket = connect(port, '127.0.0.1')
-    const settle = (ok: boolean): void => { socket.destroy(); done(ok) }
-    // 被防火墙静默丢弃的 SYN 会让 promise 永远不落地，就绪循环要给它上限。
+    const settle = (listening: boolean): void => { socket.destroy(); done(listening) }
+    // 防火墙静默丢弃的 SYN 会让 promise 永远不落地，给这次归属检查一个上限。
     socket.setTimeout(1_000, () => settle(false))
     socket.once('connect', () => settle(true))
     socket.once('error', () => settle(false))
   })
+}
+
+/**
+ * 后台启动的日志路径。
+ *
+ * 与官方 operations 的日志同构（<环境>/.plugin-manager/logs/...），放在环境目录里
+ * 而不是 /tmp：环境删了日志跟着走，用户找得到。
+ *
+ * @param dir - 环境目录。
+ * @param kind - 日志类别（start）。
+ * @returns 日志文件的绝对路径。
+ */
+function operationLogPath(dir: string, kind: string): string {
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+  return join(dir, '.plugin-manager', 'logs', kind + '-' + stamp + '.log')
+}
+
+/**
+ * 从官方启动输出里取带 token 的可用地址。
+ *
+ * 官方 web-app 在 Loader 落定后打印 dsh web: http://127.0.0.1:<port>/?token=<token>，
+ * 那是官方的就绪信号，token 就是本实例的入口凭据。后台模式这份输出由我们持有，所以
+ * 能把真正点得开的地址交给用户；终端模式输出在窗口里，我们不去截它。
+ *
+ * 只取回环地址：官方同时会打印 LAN 地址，跨机地址不该出现在本机页面上。
+ *
+ * @param logPath - 捕获到的官方输出。
+ * @returns 带 token 的回环地址；没读到 null。
+ */
+function authenticatedUrlFromLog(logPath: string): string | null {
+  try {
+    const text = readFileSync(logPath, 'utf8')
+    const match = /https?:\/\/127\.0\.0\.1:\d+\/\?token=[A-Za-z0-9_-]+/.exec(text)
+    return match === null ? null : match[0]
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 读日志尾部若干行，给失败文案用。
+ *
+ * 单行截断、总量截断：启动日志里可能有很长的堆栈，REST 响应不该被它撑爆。
+ *
+ * @param logPath - 日志文件。
+ * @param lines - 取最后多少行。
+ * @returns 尾部行；读不到时空数组。
+ */
+function tailOfLog(logPath: string, lines: number): string[] {
+  try {
+    const text = readFileSync(logPath, 'utf8')
+    return text.split(/\r?\n/).filter((line) => line.trim().length > 0).slice(-lines)
+      .map((line) => (line.length > 500 ? line.slice(0, 500) + '…' : line))
+      // token 只允许出现在那份 0600 日志与 startEnvironment 的成功返回里：
+      // 失败文案里的日志尾巴必须脱敏。
+      .map((line) => line.replace(/token=[A-Za-z0-9_-]+/g, 'token=***'))
+  } catch {
+    return []
+  }
+}
+
+/**
+ * 后台启动用的参数：补 --no-open。
+ *
+ * 后台模式没有终端窗口可看，官方默认行为会在那台机器的桌面上弹出浏览器（实测弹过）。
+ * 带 token 的地址我们交给用户在页面上自己点。
+ *
+ * @param spec - 启动描述。
+ * @returns 加了 --no-open 的启动描述（已有则原样返回）。
+ */
+function backgroundSpec(spec: LaunchSpec): LaunchSpec {
+  if (spec.args.includes('--no-open')) return spec
+  const args = [...spec.args, '--no-open']
+  return { ...spec, args, display: [spec.command, ...args].join(' ') }
 }
 
 /** 从 start 起找一个空闲端口。 */
@@ -858,36 +1198,67 @@ async function findFreePort(start: number, span = 200): Promise<number | null> {
   return null
 }
 
-/** 默认启动器：终端窗口优先，没有终端就后台。 */
+/**
+ * 默认启动器：终端窗口优先，没有可用终端就降级为后台。
+ *
+ * @param spec - 启动描述。
+ * @returns 启动结果；mode 字段如实反映**实际**采用的启动方式。
+ */
 async function defaultLaunch(spec: LaunchSpec): Promise<LaunchOutcome> {
   if (spec.mode === 'terminal') {
     const terminal = openInTerminal(spec)
     if (terminal !== null) {
-      return { ok: true, detail: '已在 ' + terminal + ' 终端窗口中启动 —— 关闭该窗口即停止实例' }
+      return {
+        ok: true, mode: 'terminal', terminal,
+        detail: '已在 ' + terminal + ' 终端窗口中启动 —— 关闭该窗口即停止实例',
+      }
     }
+    return await spawnBackground(backgroundSpec(spec), '没有可用终端，已降级为后台启动')
   }
-  return spawnBackground(spec)
+  return await spawnBackground(backgroundSpec(spec))
 }
 
-/** 后台启动（detached + unref）：实例活在本页面之外的进程里，进程扫描能看到它。 */
-async function spawnBackground(spec: LaunchSpec): Promise<LaunchOutcome> {
+/**
+ * 后台启动（detached + unref）。
+ *
+ * 官方输出重定向到环境目录下的日志：不是管道，而是把文件描述符 dup 给子进程 ——
+ * 宿主进程退出后实例照旧写自己的日志，不会因为管道断开收到 EPIPE。日志里同时有官方
+ * 打印的带 token 地址，所以后台模式能给出真正点得开的 URL。
+ *
+ * @param spec - 启动描述。
+ * @param note - 附加说明（降级原因）。
+ * @returns 启动结果。
+ */
+async function spawnBackground(spec: LaunchSpec, note?: string): Promise<LaunchOutcome> {
+  const logPath = operationLogPath(spec.dir, 'start')
   let failure: string | null = null
   try {
-    const child = spawn(spec.command, [...spec.args], {
-      cwd: process.cwd(), detached: true, stdio: 'ignore', windowsHide: true,
-    })
-    await new Promise<void>((settle) => {
-      const timer = setTimeout(settle, 500)
-      timer.unref()
-      child.once('spawn', () => { clearTimeout(timer); settle() })
-      child.once('error', (error) => { failure = messageOf(error); clearTimeout(timer); settle() })
-    })
-    child.unref()
+    mkdirSync(dirname(logPath), { recursive: true, mode: 0o700 })
+    const fd = openSync(logPath, 'a', 0o600)
+    try {
+      const child = spawn(spec.command, [...spec.args], {
+        cwd: process.cwd(), detached: true, stdio: ['ignore', fd, fd], windowsHide: true,
+      })
+      await new Promise<void>((settle) => {
+        const timer = setTimeout(settle, 500)
+        timer.unref()
+        child.once('spawn', () => { clearTimeout(timer); settle() })
+        child.once('error', (error) => { failure = messageOf(error); clearTimeout(timer); settle() })
+      })
+      child.unref()
+    } finally {
+      closeSync(fd)
+    }
   } catch (error) {
     failure = messageOf(error)
   }
-  if (failure !== null) return { ok: false, detail: '无法启动：' + failure + '（命令：' + spec.display + '）' }
-  return { ok: true, detail: '已在后台启动' }
+  if (failure !== null) {
+    return { ok: false, mode: 'background', logPath, detail: '无法启动：' + failure + '（命令：' + spec.display + '）' }
+  }
+  return {
+    ok: true, mode: 'background', logPath,
+    detail: '已在后台启动' + (note === undefined ? '' : '（' + note + '）'),
+  }
 }
 
 /**
@@ -1201,6 +1572,48 @@ async function runPackageOperation(
     lockWaitMs: options.lockWaitMs ?? OPERATION_LOCK_WAIT_MS,
     ...options.onOutput === undefined ? {} : { onOutput: options.onOutput },
   })
+}
+
+/**
+ * 修复安装：把当前 profile **已声明**的依赖真正装进 node_modules。
+ *
+ * 为什么不能走 add：官方 inspect 把「已声明」当作「已安装」（already-installed 是官方
+ * PluginInspectProblem 闭集里的取值），于是对「声明了但没装」的包走 add 必被拒绝，
+ * 修复输出「拒绝安装：already-installed」——与诊断结论直接矛盾，用户点多少次都不会成功
+ * （write-auditor 真机验证发现，见 docs/private/write-path-audit.md §3·P3）。
+ *
+ * 官方 `dsh plugin --profile X install` 就是把参数转发给 pnpm 的官方通道（apps/cli/src/plugin.ts
+ * 也走同一个 runPluginCommand），修复安装用它。
+ *
+ * @param target - 包名（只用于文案；官方 install 按 package.json 全量收敛）。
+ * @param options - 共享选项。
+ * @returns 结果；官方通道不可用或 pnpm 非零退出时如实报失败，不静默降级。
+ */
+export async function repairDependencies(
+  target: string, options: CrossEnvironmentOptions = {},
+): Promise<EnvironmentResult> {
+  const context = profileContextOf(options.ctx)
+  const profile = context?.name
+  if (profile === undefined || profile.length === 0) {
+    return failure('no-profile-context', '拿不到当前环境名（ctx.profileContext.name），无法修复安装')
+  }
+  const dir = environmentDir(profile)
+  if (!existsSync(join(dir, 'package.json'))) return failure('not-found', '环境不存在：' + profile)
+  try {
+    const runner = await officialRunner(options)
+    const result = await runPackageOperation(
+      runner, operationContext(profile, dir, context?.cwd ?? dir, options), ['install'], options,
+    )
+    if (result.exitCode !== 0) {
+      const tail = result.output.trim().split(/\r?\n/).filter((line) => line.length > 0).slice(-8).join('\n')
+      return failure('package-operation-failed',
+        '修复安装失败（官方 install 退出码 ' + String(result.exitCode) + '）：' + (tail === '' ? result.output.slice(-600) : '\n' + tail))
+    }
+    return success('已修复安装 ' + target + '（官方 install 通道，环境 ' + profile + '）')
+  } catch (error) {
+    if (error instanceof EnvironmentError) return failure(error.code, messageOf(error))
+    return failure('io-failed', messageOf(error))
+  }
 }
 
 /** 已解析的安装来源。 */

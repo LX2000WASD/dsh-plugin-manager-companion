@@ -40,15 +40,36 @@ export interface FixOutcome {
  */
 const MANUAL_ACTIONS: ReadonlySet<string> = new Set(["remove-duplicate-row", "remove-row"])
 
-/** 安装类动作：它们是装包，走受质量门保护的安装。 */
-const INSTALL_ACTIONS: ReadonlySet<string> = new Set(["install-provider", "install-dependency"])
+/**
+ * 装包类动作分两条通道，**不能合并**：
+ *
+ *   - install-provider：某个插件 import 了一个没被声明的包 → 要 `add` 它。
+ *   - install-dependency：package.json **已经声明**了，但 node_modules 里没有 → 要修复安装。
+ *
+ * 为什么 install-dependency 不能走 `add`：官方 inspect 把「已声明」当作「已安装」
+ * （already-installed 是官方 PluginInspectProblem 闭集里的取值），于是 `add` 必然被拒绝，
+ * 输出「拒绝安装：already-installed」——与诊断结论直接矛盾，用户点多少次都不会成功
+ * （write-auditor 真机验证发现，见 docs/private/write-path-audit.md §3·P3）。
+ * 官方 `dsh plugin --profile X install` 是把参数转发给 pnpm 的官方通道，修复安装用它。
+ */
+const ADD_ACTIONS: ReadonlySet<string> = new Set(["install-provider"])
+
+/** 修复安装类动作：声明齐全但 node_modules 缺失，走官方 install 通道。 */
+const REPAIR_ACTIONS: ReadonlySet<string> = new Set(["install-dependency"])
 
 /** applyFix 的依赖（由入口注入，避免 fix.ts 反向依赖 index.ts）。 */
 export interface FixDependencies {
   readonly ctx: Context
   readonly environmentName: () => string | null
-  /** 受质量门保护的安装；由入口提供（它需要 config 与官方 Remote 编排）。 */
+  /** 受质量门保护的安装（官方 add 通道）；由入口提供（它需要 config 与官方 Remote 编排）。 */
   readonly install: (spec: string) => Promise<{ readonly ok: boolean; readonly output: string }>
+  /**
+   * 修复安装（官方 install 通道）：把 profile **已声明**的依赖真正装进 node_modules。
+   *
+   * @param target - 包名（用于文案；官方 install 按 package.json 全量收敛）。
+   * @returns 结果。
+   */
+  readonly repair: (target: string) => Promise<{ readonly ok: boolean; readonly output: string }>
 }
 
 /**
@@ -56,7 +77,8 @@ export interface FixDependencies {
  *
  * 三条路，按"官方有没有现成通道"划分：
  *   1. 行级启停 → 官方 setPluginEnabled（enable-row / disable-row）
- *   2. 装包 → 入口的 gatedInstall（install-provider / install-dependency）
+ *   2. 装包 → 入口提供的通道：install-provider 走受质量门保护的 add，
+ *      install-dependency 走官方 install（声明已在、只是没装，add 必被 already-installed 拒绝）
  *   3. 删重复官方包拷贝 → 官方 withFileLock + 官方 saveManifest（remove-official-copy）
  *
  * @param action - 修复动作（诊断给出的闭集取值）。
@@ -68,9 +90,11 @@ export async function applyFix(
   action: string, target: string | undefined, deps: FixDependencies,
 ): Promise<FixOutcome> {
   if (MANUAL_ACTIONS.has(action)) return manualOutcome(action, target)
-  if (INSTALL_ACTIONS.has(action)) {
-    if (target === undefined) return failed(action, "缺少 target（要安装的 spec）")
-    const result = await deps.install(target)
+  if (ADD_ACTIONS.has(action) || REPAIR_ACTIONS.has(action)) {
+    if (target === undefined) {
+      return failed(action, ADD_ACTIONS.has(action) ? "缺少 target（要安装的 spec）" : "缺少 target（包名）")
+    }
+    const result = ADD_ACTIONS.has(action) ? await deps.install(target) : await deps.repair(target)
     return {
       ok: result.ok, action, target,
       status: result.ok ? "executed" : "failed", output: result.output,

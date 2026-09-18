@@ -7,6 +7,7 @@
 import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
+import { createServer } from 'node:net'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -38,16 +39,22 @@ function readManifest(name) {
 }
 
 /** 在环境里放一个真的能被官方 bundle 解析器认出来的本地 bundle 包。 */
-function addResolvableBundle(envName, bundleName = '@fake/dsh-bundle') {
+function addBundleFixture(envName, bundleName, { webserver = false } = {}) {
   const dir = join(PROFILES, envName, 'node_modules', bundleName)
   mkdirSync(dir, { recursive: true })
   writeFileSync(join(dir, 'package.json'), JSON.stringify({
     name: bundleName,
     version: '1.0.0',
+    // 只有 web 层的 bundle 才声明官方 webserver 依赖（官方 web-app 的真实特征）。
+    ...(webserver ? { dependencies: { '@deepseek-ai/dsh-host-webserver': '^0.1.6' } } : {}),
     dsh: { bundle: { patch: './cordis.patch.yml' } },
   }, undefined, 2) + '\n')
   writeFileSync(join(dir, 'cordis.patch.yml'), '[]\n')
   return dir
+}
+
+function addResolvableBundle(envName, bundleName = '@fake/dsh-bundle') {
+  return addBundleFixture(envName, bundleName)
 }
 
 /** 假的 host 上下文：只提供官方 profileContext。 */
@@ -168,19 +175,21 @@ test('scanRuns：解析、TTL 缓存、fresh 绕过缓存', () => {
   env.resetRunCache()
 })
 
-test('startEnvironment：已在运行会拒绝、端口就绪与超时、命令组装', async () => {
+test('startEnvironment：已在运行会拒绝、HTTP 就绪与超时、命令组装', async () => {
   makeEnv('starter')
   const launched = []
   const ok = await env.startEnvironment('starter', {
     mode: 'background',
     port: 4600,
-    launch: async (spec) => { launched.push(spec); return { ok: true, detail: 'fake-launch' } },
-    probe: async (port) => port === 4600,
+    launch: async (spec) => { launched.push(spec); return { ok: true, detail: 'fake-launch', mode: 'background' } },
+    probe: async (port) => (port === 4600 ? 401 : null),
     sleep: async () => {},
     now: () => 0,
   })
   assert.equal(ok.ok, true, ok.output)
   assert.match(ok.output, /127\.0\.0\.1:4600/)
+  assert.match(ok.output, /GET \/ -> 401/)
+  assert.match(ok.output, /启动方式：后台/)
   assert.equal(launched.length, 1)
   assert.equal(launched[0].profile, 'starter')
   assert.equal(launched[0].mode, 'background')
@@ -190,8 +199,8 @@ test('startEnvironment：已在运行会拒绝、端口就绪与超时、命令�
   const timedOut = await env.startEnvironment('starter', {
     port: 4601,
     readyTimeoutMs: 1_000,
-    launch: async () => ({ ok: true, detail: 'fake-launch' }),
-    probe: async () => false,
+    launch: async () => ({ ok: true, detail: 'fake-launch', mode: 'background' }),
+    probe: async () => null,
     sleep: async () => {},
     now: () => (clock += 400),
   })
@@ -201,7 +210,7 @@ test('startEnvironment：已在运行会拒绝、端口就绪与超时、命令�
 
   const failed = await env.startEnvironment('starter', {
     port: 4602,
-    launch: async () => ({ ok: false, detail: '没有可用终端' }),
+    launch: async () => ({ ok: false, detail: '没有可用终端', mode: 'background' }),
   })
   assert.equal(failed.code, 'launch-failed')
 
@@ -212,11 +221,199 @@ test('startEnvironment：已在运行会拒绝、端口就绪与超时、命令�
     reader: () => ['777 node /opt/apps/@deepseek-ai/dsh/lib/bin.js starter --port 4610'],
     fresh: true,
   })
-  const running = await env.startEnvironment('starter', { launch: async () => ({ ok: true, detail: 'x' }) })
+  const running = await env.startEnvironment('starter', {
+    launch: async () => ({ ok: true, detail: 'x', mode: 'background' }),
+  })
   assert.equal(running.ok, false)
   assert.equal(running.code, 'running')
   assert.match(running.output, /4610/)
   env.resetRunCache()
+})
+
+test('F1: 创建环境默认走官方 web 模板（层栈逐字来自官方 PROFILE_TEMPLATES）', async () => {
+  const official = await import('@deepseek-ai/dsh-app-boot')
+  assert.equal(env.DEFAULT_ENVIRONMENT_TEMPLATE, 'web')
+  // op 暴露给客户端的清单必须与官方常量逐字一致（本仓库不维护任何 bundle 名单）
+  const listed = env.environmentTemplates().map((item) => [item.name, [...item.bundles]]).sort()
+  const expected = Object.entries(official.PROFILE_TEMPLATES).map(([name, tpl]) => [name, [...tpl.bundles]]).sort()
+  assert.deepEqual(listed, expected)
+
+  const created = await env.createEnvironment('tpl-default')
+  assert.equal(created.ok, true, created.output)
+  assert.deepEqual(readManifest('tpl-default').dsh.profile.bundles, [...official.PROFILE_TEMPLATES.web.bundles])
+  // 默认层栈**不是**官方 DEFAULT_PROFILE_BUNDLES：那样建出来的环境没有任何 web 服务（实测 30s 超时）
+  assert.notDeepEqual(readManifest('tpl-default').dsh.profile.bundles, [...official.DEFAULT_PROFILE_BUNDLES])
+  const headless = await env.createEnvironment('tpl-headless', 'headless')
+  assert.equal(headless.ok, true, headless.output)
+  assert.deepEqual(readManifest('tpl-headless').dsh.profile.bundles, [...official.PROFILE_TEMPLATES.headless.bundles])
+  // web 层判定派生自官方常量（不是我们抄的名字表）
+  assert.deepEqual([...env.officialWebAppBundles()],
+    official.PROFILE_TEMPLATES.web.bundles.filter((name) => !official.DEFAULT_PROFILE_BUNDLES.includes(name)))
+})
+
+test('F2: 就绪判据是官方 HTTP 应答，TCP 可连接（404）不算就绪', async () => {
+  makeEnv('httpenv')
+  const statuses = [404, 404, 401]
+  const calls = []
+  const ok = await env.startEnvironment('httpenv', {
+    mode: 'background',
+    port: 4800,
+    launch: async () => ({ ok: true, detail: 'x', mode: 'background' }),
+    probe: async (port) => {
+      const status = statuses[Math.min(calls.length, statuses.length - 1)]
+      calls.push([port, status])
+      return status
+    },
+    sleep: async () => {},
+    now: () => 0,
+  })
+  assert.equal(ok.ok, true, ok.output)
+  assert.equal(calls.length, 3, '404 必须继续等，不能当成就绪')
+  assert.deepEqual(calls.map(([, status]) => status), [404, 404, 401])
+  assert.match(ok.output, /GET \/ -> 401/)
+
+  // 端口一直可连接、但路由始终 404：必须超时失败，而不是 ok=true 给出一个 404 的 url
+  let clock = 0
+  const stuck = await env.startEnvironment('httpenv', {
+    mode: 'background',
+    port: 4801,
+    readyTimeoutMs: 1_000,
+    launch: async () => ({ ok: true, detail: 'x', mode: 'background' }),
+    probe: async () => 404,
+    sleep: async () => {},
+    now: () => (clock += 400),
+  })
+  assert.equal(stuck.ok, false)
+  assert.equal(stuck.code, 'timeout')
+  assert.match(stuck.output, /404 不算就绪/)
+})
+
+test('F3: 没有 web 层的环境立刻给出可操作拒绝（不启动、不干等 30s）', async () => {
+  // base-only：每一层都能解析、且都不声明官方 webserver 依赖 → absent
+  makeEnv('noweb', { bundles: ['@deepseek-ai/dsh-base'] })
+  addBundleFixture('noweb', '@deepseek-ai/dsh-base', { webserver: false })
+  const launched = []
+  const started = Date.now()
+  const refused = await env.startEnvironment('noweb', {
+    mode: 'background',
+    readyTimeoutMs: 30_000,
+    launch: async (spec) => { launched.push(spec); return { ok: true, detail: 'x', mode: 'background' } },
+  })
+  assert.equal(refused.ok, false)
+  assert.equal(refused.code, 'no-web-layer')
+  assert.equal(launched.length, 0, '拒绝必须发生在启动之前（不占端口、不弹窗口）')
+  assert.ok(Date.now() - started < 2_000, '拒绝必须是即时的，不能等 30s 就绪上限')
+  assert.match(refused.output, /没有任何能提供 web 服务的层/)
+  assert.match(refused.output, /@deepseek-ai\/dsh-web-app/, '建议的包名来自官方常量')
+  assert.match(refused.output, /官方插件页/)
+  assert.match(refused.output, /web 模板重建/)
+
+  // 层里有 web 层（manifest 声明了官方 webserver 依赖）→ 正常往下走
+  makeEnv('hasweb', { bundles: ['@deepseek-ai/dsh-base'] })
+  addBundleFixture('hasweb', '@deepseek-ai/dsh-base', { webserver: true })
+  const launchedWeb = []
+  const okWeb = await env.startEnvironment('hasweb', {
+    mode: 'background',
+    port: 4900,
+    launch: async (spec) => { launchedWeb.push(spec); return { ok: true, detail: 'x', mode: 'background' } },
+    probe: async () => 401,
+    sleep: async () => {},
+    now: () => 0,
+  })
+  assert.equal(okWeb.ok, true, okWeb.output)
+  assert.equal(launchedWeb.length, 1)
+
+  // 事实拿不到（层解析不到）→ 如实降级：仍然启动并等就绪探测
+  makeEnv('unknownweb', { bundles: ['@not-installed/whatever'] })
+  const launchedUnknown = []
+  const okUnknown = await env.startEnvironment('unknownweb', {
+    mode: 'background',
+    port: 4901,
+    launch: async (spec) => { launchedUnknown.push(spec); return { ok: true, detail: 'x', mode: 'background' } },
+    probe: async () => 401,
+    sleep: async () => {},
+    now: () => 0,
+  })
+  assert.equal(okUnknown.ok, true, okUnknown.output)
+  assert.equal(launchedUnknown.length, 1, '无法预判时不得拒绝，按就绪探测等待')
+})
+
+test('F3b: 显式端口已被监听 → 立刻 port-in-use，不发起启动', async () => {
+  // 层栈有 web 层，确保能走到端口归属检查这一步
+  makeEnv('portbusy', { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'] })
+  const server = createServer()
+  await new Promise((done) => { server.listen(0, '127.0.0.1', done) })
+  const port = server.address().port
+  try {
+    const launched = []
+    const result = await env.startEnvironment('portbusy', {
+      mode: 'background',
+      port,
+      launch: async (spec) => { launched.push(spec); return { ok: true, detail: 'x', mode: 'background' } },
+      probe: async () => 401,
+      sleep: async () => {},
+      now: () => 0,
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.code, 'port-in-use')
+    assert.equal(launched.length, 0, '端口被占时不得发起启动')
+    assert.match(result.output, new RegExp(String(port)))
+    assert.match(result.output, /已经被监听/)
+  } finally {
+    await new Promise((done) => { server.close(done) })
+  }
+})
+
+test('F4: 只有官方输出里的带 token 地址才算可用入口', async () => {
+  makeEnv('tokenenv')
+  const logDir = join(PROFILES, 'tokenenv', '.plugin-manager', 'logs')
+  mkdirSync(logDir, { recursive: true })
+  const logPath = join(logDir, 'start-fake.log')
+  writeFileSync(logPath,
+    'booting\ndsh web: http://127.0.0.1:4700/?token=abc-DEF_123 (LAN: http://192.168.1.9:4700/?token=abc-DEF_123)\n')
+  const ok = await env.startEnvironment('tokenenv', {
+    mode: 'background',
+    port: 4700,
+    launch: async () => ({ ok: true, detail: 'x', mode: 'background', logPath }),
+    probe: async () => 401,
+    sleep: async () => {},
+    now: () => 0,
+  })
+  assert.equal(ok.ok, true, ok.output)
+  assert.match(ok.output, /可用地址：http:\/\/127\.0\.0\.1:4700\/\?token=abc-DEF_123/)
+  assert.doesNotMatch(ok.output, /192\.168\.1\.9/, 'LAN 地址不该出现在本机页面里')
+  assert.match(ok.output, /日志：/)
+  // DESIGN §12：不给「该地址含令牌」加解释段（事实写进 docs/REST-CONTRACT.md）
+  assert.doesNotMatch(ok.output, /令牌|每次启动都会换|带本实例的 token/)
+
+  // 失败文案里的日志尾巴必须脱敏：token 只允许出现在那份 0600 日志与成功返回里
+  let clock = 0
+  const leaky = await env.startEnvironment('tokenenv', {
+    mode: 'background',
+    port: 4702,
+    readyTimeoutMs: 500,
+    launch: async () => ({ ok: true, detail: 'x', mode: 'background', logPath }),
+    probe: async () => 404,
+    sleep: async () => {},
+    now: () => (clock += 200),
+  })
+  assert.equal(leaky.code, 'timeout')
+  assert.doesNotMatch(leaky.output, /abc-DEF_123/, '失败文案不得带 token')
+  assert.match(leaky.output, /token=\*\*\*/)
+
+  // 读不到 token（终端模式 / 输出里没有那行）→ 不把裸地址说成可用入口，并如实说明 401
+  const bare = await env.startEnvironment('tokenenv', {
+    mode: 'terminal',
+    port: 4701,
+    launch: async () => ({ ok: true, detail: 'x', mode: 'terminal', terminal: 'konsole' }),
+    probe: async () => 401,
+    sleep: async () => {},
+    now: () => 0,
+  })
+  assert.equal(bare.ok, true, bare.output)
+  assert.doesNotMatch(bare.output, /可用地址：/)
+  assert.match(bare.output, /401/)
+  assert.match(bare.output, /启动方式：终端窗口 konsole/)
 })
 
 test('stopEnvironment：拒绝当前环境、未运行时报 not-running', async () => {
@@ -287,8 +484,9 @@ test('createEnvironment 用官方模板；renameEnvironment 的拒绝面', async
   assert.match(patch, /^# Your patch layer for this dsh profile/)
   assert.equal(existsSync(join(PROFILES, 'fresh', 'pnpm-workspace.yaml')), true)
 
+  // 省略模板 = 官方 web 模板（能起得来），不是官方 base-only 默认
   const plain = await env.createEnvironment('plain')
-  assert.deepEqual(readManifest('plain').dsh.profile.bundles, ['@deepseek-ai/dsh-base'])
+  assert.deepEqual(readManifest('plain').dsh.profile.bundles, ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'])
   assert.equal((await env.createEnvironment('fresh2', 'nope')).code, 'unknown-template')
   assert.equal((await env.createEnvironment('web')).code, 'builtin')
   assert.equal((await env.createEnvironment('fresh')).code, 'already-exists')

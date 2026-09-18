@@ -8,12 +8,15 @@ const { applyFix } = await import("../dist/fix.js")
 /** 构造依赖桩件。 */
 function makeDeps(overrides = {}) {
   const calls = []
+  const repairs = []
   return {
     calls,
+    repairs,
     deps: {
       ctx: { get: () => undefined, logger: { info() {}, warn() {}, error() {} } },
       environmentName: () => "demo-env",
       install: async (spec) => { calls.push(spec); return { ok: true, output: "已安装 " + spec } },
+      repair: async (spec) => { repairs.push(spec); return { ok: true, output: "已修复安装 " + spec } },
       ...overrides,
     },
   }
@@ -54,10 +57,24 @@ test('安装类修复转交受质量门保护的安装通道', async () => {
 })
 
 test('安装类修复失败时如实报 failed', async () => {
-  const { deps } = makeDeps({ install: async () => ({ ok: false, output: "质量门拦截" }) })
+  const { deps } = makeDeps({ repair: async () => ({ ok: false, output: "质量门拦截" }) })
   const result = await applyFix("install-dependency", "bad-pkg", deps)
   assert.equal(result.status, "failed")
   assert.match(result.output, /质量门拦截/)
+})
+
+// 钉形状：两条装包通道不能混。install-dependency 若走了 add，官方 inspect 会以
+// already-installed 拒绝（声明已在），修复 100% 失败——这条断言就是防它退回去。
+test('install-dependency 走官方 install 通道，install-provider 走 add 通道', async () => {
+  const a = makeDeps()
+  await applyFix("install-dependency", "declared-but-missing", a.deps)
+  assert.deepEqual(a.repairs, ["declared-but-missing"])
+  assert.deepEqual(a.calls, [], "声明已在的包不能走 add（必被 already-installed 拒绝）")
+
+  const b = makeDeps()
+  await applyFix("install-provider", "undeclared-pkg", b.deps)
+  assert.deepEqual(b.calls, ["undeclared-pkg"])
+  assert.deepEqual(b.repairs, [], "没声明的包不能走 install（install 只看 package.json，装不上它）")
 })
 
 test('安装类修复缺 target 时报错而不是装空包', async () => {
