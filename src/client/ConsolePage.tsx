@@ -5,9 +5,11 @@
  *   PluginEnvironmentsTab / PluginCatalogTab 里，且自带样式与散落文案）。
  * 旧实现参考：dsh-web-plugin-manager/src/client/*Tab.tsx（只取交互意图：健康总览、
  *   分环境卡片、分级修复；未复制代码）。
- * 官方复用：设置子页机制照抄官方 ui-settings-plugins 的 PluginsSettingsSection
- *   （本地 useState 管 activeId + visitedIds 保证切页不丢草稿 + role=tablist/tab/tabpanel
- *   + 方向键导航）；全部控件来自 @deepseek-ai/dsh-client-ui-primitives；
+ * 官方复用：子页机制沿用官方 ui-settings-plugins 的 PluginsSettingsSection 形态
+ *   （role=tablist/tab/tabpanel + 方向键导航 + 首次选中才挂载、之后隐藏保留草稿），
+ *   但**选中状态放在 register 声明的 store 里**而不是组件内 useState：任何一次 store 发布或
+ *   条目重挂载都会让组件内状态复位回「体检」，而结果块就在「环境」子页里（实测缺陷，见
+ *   createConsoleStore 的注释）；全部控件来自 @deepseek-ai/dsh-client-ui-primitives；
  *   配置读写走官方 ctx.settingsScope（经 ConfigController 注入）。
  * 前提检查：旧实现的"官方没有管理页，所以自建"前提已消失——启停/安装/卸载交给
  *   官方通道，本页只做官方不做的事：诊断报告、多环境管理、本插件配置。
@@ -21,7 +23,8 @@ import {
   StateDot, Switch, Tag, TerminalBlock, Toast, Tooltip,
   type MenuEntry, type TerminalBlockLabels,
 } from '@deepseek-ai/dsh-client-ui-primitives'
-import type { SnapshotSelectorHook, TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
+import { defineStore, type HandleOf } from '@deepseek-ai/dsh-client-store'
+import type { ComposedProps, EntryKeyOf, SnapshotSelectorHook, TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
 import type { DiagnosticGroup, DiagnosticIssue, DiagnosticLayer } from '../types.ts'
 import { NS } from './locales.ts'
 import { PmSelect } from './pmSelect.tsx'
@@ -41,8 +44,54 @@ type T = TranslateNS<typeof NS>
 type EnvironmentActions = Omit<EnvironmentsFace, 'hooks'>
 type ConfigActions = Omit<ConfigFace, 'hooks'>
 
-/** 环境控制台的注册项 props（官方组合别名 + 本插件字典）。 */
-export type ConsolePageProps = CompanionSlotProps<'settings.section', ConsoleFace>
+/** 控制台里跨重挂载必须存活的状态。 */
+export interface ConsoleStoreState {
+  /** 当前子页 id；undefined = 还没选过（首屏落在第一个子页）。 */
+  activeId: string | undefined
+  /** 已经挂载过的子页：切回来时本地草稿、展开状态与已读报告都还在。 */
+  visitedIds: readonly string[]
+}
+
+/**
+ * 控制台的声明式 store（在 apply 里创建，经 register 的 store 座位交给框架）。
+ *
+ * 为什么必须是 store，而不是组件内 useState：控制台只有一个注册项，但它的渲染路径会被
+ * **任何一次 store 发布**穿过（体检在跑时每秒都在发布），组件内状态会当场复位到第一个子页。
+ * 后果很具体：用户在「环境」子页点操作、结果块就在那个子页里，页面却跳回「体检」——等于把
+ * 刚发生的结果藏起来。write-auditor 5 轮里撞到 2 轮（当时未定性），client-dev 真机复现两次，
+ * task-17 取证时连点 6 次「环境」都被弹回。所以这一项状态属于"跨重挂载必须存活"，
+ * 按官方 slot 纪律放进声明式 store。
+ */
+export function createConsoleStore() {
+  return defineStore({
+    init: (): ConsoleStoreState => ({ activeId: undefined, visitedIds: [] }),
+    actions: {
+      /**
+       * 选中一个子页并记进"已挂载"集合。
+       * @param draft - store 草稿。
+       * @param id - 子页 id。
+       */
+      select(draft, id: string) {
+        draft.activeId = id
+        if (!draft.visitedIds.includes(id)) draft.visitedIds = [...draft.visitedIds, id]
+      },
+    },
+  })
+}
+
+/** 控制台的 store 句柄类型（句柄在 apply 里创建；模块级不放句柄）。 */
+export type ConsoleStoreHandle = ReturnType<typeof createConsoleStore>
+
+/** 环境控制台的注册项 props（官方组合别名 + store 座位 + 本插件字典）。 */
+export type ConsolePageProps = ComposedProps<
+  'settings.section',
+  EntryKeyOf<'settings.section'>,
+  never,
+  HandleOf<ConsoleStoreHandle>,
+  ConsoleFace,
+  never,
+  typeof NS
+>
 
 /** 一个子页面的定义。 */
 interface ConsoleTab {
@@ -57,15 +106,16 @@ interface ConsoleTab {
  * @returns 带本地子页面切换的控制台。
  */
 export function ConsolePage({
-  t, useHealth, useEnvironments, useConfig,
+  t, useStore, actions, useHealth, useEnvironments, useConfig,
   diagnose, fix, setDiagnosticTarget, refreshEnvironments, startEnvironment, stopEnvironment,
   createEnvironment, renameEnvironment, removeEnvironment, copyPlugins, exportBackup, loadBackup,
   diffBackup, restoreBackup, dismissEnvironmentNotice, editConfigField, saveConfig, discardConfig,
 }: ConsolePageProps) {
   const tabsId = useId()
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([])
-  const [activeId, setActiveId] = useState<string>()
-  const [visitedIds, setVisitedIds] = useState<ReadonlySet<string>>(() => new Set())
+  // 子页选择来自声明式 store：store 发布与条目重挂载都不会把它复位（缺陷背景见 createConsoleStore）。
+  const activeId = useStore(state => state.activeId)
+  const visitedIds = useStore(state => state.visitedIds)
   const tabs: readonly ConsoleTab[] = [
     { id: 'health', label: t('console.tab.health') },
     { id: 'env', label: t('console.tab.env') },
@@ -73,12 +123,8 @@ export function ConsolePage({
   ]
   const active = tabs.find(tab => tab.id === activeId)?.id ?? tabs[0]?.id
 
-  // 子页面只在首次选中时挂载，之后隐藏着保留：切换 tab 不丢表单草稿、展开状态与
-  // 已读到的报告（与官方 PluginsSettingsSection 同一机制）。
-  useEffect(() => {
-    if (active === undefined) return
-    setVisitedIds((previous) => previous.has(active) ? previous : new Set([...previous, active]))
-  }, [active])
+  // 子页面只在首次选中时挂载，之后隐藏着保留：切换 tab 不丢表单草稿、展开状态与已读报告。
+  // "选中即记入 visited"由 store 的 select action 一次做完（不靠 effect，避免首屏时序差）。
 
   const environmentActions: EnvironmentActions = {
     refreshEnvironments, startEnvironment, stopEnvironment, createEnvironment, renameEnvironment,
@@ -105,7 +151,7 @@ export function ConsolePage({
               aria-controls={`${tabsId}-panel-${tab.id}`}
               data-active={selected ? 'true' : undefined}
               tabIndex={selected ? 0 : -1}
-              onClick={() => { setActiveId(tab.id) }}
+              onClick={() => { actions.select(tab.id) }}
               onKeyDown={(event) => {
                 let nextIndex: number
                 switch (event.key) {
@@ -117,7 +163,7 @@ export function ConsolePage({
                 }
                 event.preventDefault()
                 const next = tabs[nextIndex] as ConsoleTab
-                setActiveId(next.id)
+                actions.select(next.id)
                 tabRefs.current[nextIndex]?.focus()
               }}
             >
@@ -126,7 +172,7 @@ export function ConsolePage({
           )
         })}
       </div>
-      {tabs.filter(tab => tab.id === active || visitedIds.has(tab.id)).map((tab) => (
+      {tabs.filter(tab => tab.id === active || visitedIds.includes(tab.id)).map((tab) => (
         <div
           key={tab.id}
           id={`${tabsId}-panel-${tab.id}`}

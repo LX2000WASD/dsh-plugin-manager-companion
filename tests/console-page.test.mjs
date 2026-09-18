@@ -102,23 +102,18 @@ function makeSnapshotStore(init) {
  * @param options - 首屏子页 id 与是否把新建对话框摆成打开。
  * @returns { react, reset }：塞进模块表的 react 替身 + 每次渲染前的复位函数。
  */
-function shimReact({ tabId = 'health', openDialog = false } = {}) {
-  let noArgCalls = 0
+function shimReact({ openDialog = false } = {}) {
   return {
     react: {
       ...React,
       useState(initial) {
-        if (arguments.length === 0 || initial === undefined) {
-          noArgCalls += 1
-          return React.useState(noArgCalls === 1 ? tabId : undefined)
-        }
         if (openDialog && typeof initial === 'object' && initial !== null && initial.kind === 'none') {
           return React.useState({ kind: 'create' })
         }
         return React.useState(initial)
       },
     },
-    reset: () => { noArgCalls = 0 },
+    reset: () => {},
   }
 }
 
@@ -132,7 +127,32 @@ function boot(options = {}) {
     'react/jsx-runtime': require_('react/jsx-runtime'),
     'react-dom': {}, 'react-dom/client': {},
     '@deepseek-ai/cordis': { Context: class {} },
-    '@deepseek-ai/dsh-client-store': { createSnapshotStore: makeSnapshotStore, shallowEqual: (a, b) => a === b },
+    '@deepseek-ai/dsh-client-store': {
+      createSnapshotStore: makeSnapshotStore,
+      shallowEqual: (a, b) => a === b,
+      // 控制台的子页选择用声明式 store（defineStore），所以桩件必须提供它：
+      // 句柄 create() 出来的实例就是"就地改草稿 + 通知"的引擎契约（与 makeSnapshotStore 同一意图）。
+      defineStore(spec) {
+        return {
+          spec,
+          create() {
+            let state = spec.init()
+            const listeners = new Set()
+            const notify = () => { for (const fn of [...listeners]) fn() }
+            const instance = {
+              getSnapshot: () => state,
+              subscribe(fn) { listeners.add(fn); return () => { listeners.delete(fn) } },
+              clearPersisted() {},
+              actions: {},
+            }
+            for (const [name, mutator] of Object.entries(spec.actions)) {
+              instance.actions[name] = (...params) => { mutator(state, ...params); notify() }
+            }
+            return instance
+          },
+        }
+      },
+    },
     '@deepseek-ai/dsh-client-ui-slots': {},
     '@deepseek-ai/dsh-client-ui-primitives': stubPrimitives(),
     '@deepseek-ai/dsh-client-ui-dockkit': {},
@@ -185,6 +205,7 @@ function boot(options = {}) {
   })
   const entry = registrations.find(item => item.options.id === CONSOLE_ID)
   assert.ok(entry !== undefined, '控制台注册项不存在：' + registrations.map(r => String(r.options.id)).join(','))
+  currentEntry = entry
   const face = entry.options.inject()
   const t = exported.apply === undefined ? undefined : (() => {
     // t 走同一份注册字典（缺键即抛，等于"零缺键文案"）。
@@ -198,14 +219,40 @@ function boot(options = {}) {
   return { entry, face, t, dicts }
 }
 
-/** 把注入面铺成组件 props。 */
+/** 最近一次 boot 的注册项：propsFor 需要它来铺 store 座位（框架在运行时做这件事）。 */
+let currentEntry
+
+/**
+ * 把注入面与 store 座位铺成组件 props。
+ *
+ * 注册项声明了 store 时，这里按官方说法自己 `create()` 一个实例铺成 useStore/actions——
+ * 注意每次调用都会拿到**新实例**；需要跨渲染保持同一实例的用例，请用 withStore 显式覆盖。
+ * @param face - 注入面。
+ * @param t - 字典翻译。
+ * @param extra - 额外 props。
+ * @returns 组件 props。
+ */
 function propsFor(face, t, extra = {}) {
   const { hooks, ...actions } = face
   const props = { t, ...actions, close: () => {}, ...extra }
   for (const [name, source] of Object.entries(hooks)) {
     props['use' + name[0].toUpperCase() + name.slice(1)] = selector => selector(source.getSnapshot())
   }
+  const handle = currentEntry?.options.store
+  if (handle !== undefined) {
+    const instance = handle.create()
+    props.useStore = selector => selector(instance.getSnapshot())
+    props.actions = instance.actions
+  }
   return props
+}
+
+/** 渲染控制台并落在指定子页（子页选择走 store 的 select action，不再是组件内 state）。 */
+function renderTab(entry, face, t, tabId, extra = {}) {
+  const props = propsFor(face, t, extra)
+  assert.ok(props.actions !== undefined, '控制台注册项没声明 store')
+  props.actions.select(tabId)
+  return renderToStaticMarkup(React.createElement(entry.component, props))
 }
 
 /** 装一个 fetch 桩：记录每次调用的 op 与请求体。 */
@@ -247,10 +294,9 @@ describe('环境子页：模板来自官方、启动结果如实', () => {
   })
 
   it('渲染出的新建对话框带模板下拉（清单未读到时给占位文案，不猜模板名）', () => {
-    const shim = shimReact({ tabId: 'env', openDialog: true })
+    const shim = shimReact({ openDialog: true })
     const { entry, face, t } = boot({ react: shim.react })
-    shim.reset()
-    const html = renderToStaticMarkup(React.createElement(entry.component, propsFor(face, t)))
+    const html = renderTab(entry, face, t, 'env')
     assert.ok(html.includes('新建环境'), '对话框没渲染出来：' + html.slice(0, 200))
     assert.ok(html.includes('模板'), '对话框里没有模板字段')
     // 下拉在清单还没读到时显示占位文案（清单是一次只读，SSR 不跑 effect）。
@@ -258,7 +304,7 @@ describe('环境子页：模板来自官方、启动结果如实', () => {
   })
 
   it('创建请求带上选中的模板；没有模板时省掉该字段（由后端落到官方默认模板）', async () => {
-    const shim = shimReact({ tabId: 'env' })
+    const shim = shimReact()
     const { face } = boot({ react: shim.react })
     const stub = stubFetch({
       createEnvironment: () => ({ ok: true, value: { ok: true, output: '已创建' } }),
@@ -278,7 +324,7 @@ describe('环境子页：模板来自官方、启动结果如实', () => {
   })
 
   it('启动请求把「终端 / 后台」两种模式都如实送到后端', async () => {
-    const shim = shimReact({ tabId: 'env' })
+    const shim = shimReact()
     const { face } = boot({ react: shim.react })
     const stub = stubFetch({
       startEnvironment: () => ({ ok: true, value: { ok: true, output: '启动方式：后台' } }),
@@ -297,7 +343,7 @@ describe('环境子页：模板来自官方、启动结果如实', () => {
   })
 
   it('启动结果按后端原文呈现：模式说明与失败态都不被改写', async () => {
-    const shim = shimReact({ tabId: 'env' })
+    const shim = shimReact()
     const { entry, face, t } = boot({ react: shim.react })
     const stub = stubFetch({
       startEnvironment: () => ({ ok: true, value: { ok: true, output: '启动方式：终端窗口 konsole' } }),
@@ -306,8 +352,7 @@ describe('环境子页：模板来自官方、启动结果如实', () => {
     try {
       face.startEnvironment('pm-web', false)
       await until(() => face.hooks.environments.getSnapshot().notice === '启动方式：终端窗口 konsole', '结果落进 store')
-      shim.reset()
-      const html = renderToStaticMarkup(React.createElement(entry.component, propsFor(face, t)))
+      const html = renderTab(entry, face, t, 'env')
       assert.ok(html.includes('启动方式：终端窗口 konsole'), '结果块必须原样呈现后端给的启动方式')
       assert.ok(html.includes('data-run-state="done"'), '成功结果必须是成功态')
     } finally {
@@ -316,7 +361,7 @@ describe('环境子页：模板来自官方、启动结果如实', () => {
   })
 
   it('启动失败不回退成成功态（task-14 的护栏）', async () => {
-    const shim = shimReact({ tabId: 'env' })
+    const shim = shimReact()
     const { entry, face, t } = boot({ react: shim.react })
     const stub = stubFetch({
       startEnvironment: () => ({ ok: true, value: { ok: false, code: 'timeout', output: 'pm-web 已启动，但 30000ms 内端口未就绪' } }),
@@ -325,8 +370,7 @@ describe('环境子页：模板来自官方、启动结果如实', () => {
     try {
       face.startEnvironment('pm-web', false)
       await until(() => face.hooks.environments.getSnapshot().notice !== undefined, '结果落进 store')
-      shim.reset()
-      const html = renderToStaticMarkup(React.createElement(entry.component, propsFor(face, t)))
+      const html = renderTab(entry, face, t, 'env')
       assert.ok(html.includes('data-run-state="failed"'), '失败结果必须是失败态：' + html.slice(0, 300))
     } finally {
       stub.restore()
@@ -334,7 +378,7 @@ describe('环境子页：模板来自官方、启动结果如实', () => {
   })
 
   it('主按钮把启动模式写明白，不再是含糊的一句「启动」', () => {
-    const shim = shimReact({ tabId: 'env' })
+    const shim = shimReact()
     const { entry, face, t } = boot({ react: shim.react })
     face.hooks.environments.update((draft) => {
       draft.environments = [{
@@ -342,8 +386,7 @@ describe('环境子页：模板来自官方、启动结果如实', () => {
         bundles: ['@deepseek-ai/dsh-base'], dependencies: [], runs: [],
       }]
     })
-    shim.reset()
-    const html = renderToStaticMarkup(React.createElement(entry.component, propsFor(face, t)))
+    const html = renderTab(entry, face, t, 'env')
     assert.ok(html.includes('终端启动'), '没运行的实例上必须写清是终端启动：' + html.slice(0, 300))
     assert.ok(!html.includes('>启动<'), '不该再出现含糊的「启动」')
   })
@@ -368,11 +411,10 @@ describe('环境子页与设置子页：控件唯一、归因准确、作用域�
   }
 
   it('备份区只有一个「导出备份」选择器（重复控件已删）', () => {
-    const shim = shimReact({ tabId: 'env' })
+    const shim = shimReact()
     const { entry, face, t } = boot({ react: shim.react })
     face.hooks.environments.update((draft) => { draft.environments = [ENV] })
-    shim.reset()
-    const html = renderToStaticMarkup(React.createElement(entry.component, propsFor(face, t)))
+    const html = renderTab(entry, face, t, 'env')
     // 一次是工具栏按钮的文字，一次是那个选择器的可见标签；再出现第三次就是重复控件回来了。
     const occurrences = html.split('导出备份').length - 1
     assert.equal(occurrences, 2, '「导出备份」应恰好出现两次（按钮 + 一个选择器标签），实际 ' + String(occurrences))
@@ -430,7 +472,7 @@ describe('环境子页与设置子页：控件唯一、归因准确、作用域�
   })
 
   it('设置子页如实点明作用域（配置对所有环境生效）', () => {
-    const shim = shimReact({ tabId: 'settings' })
+    const shim = shimReact()
     const { entry, face, t } = boot({ react: shim.react })
     face.hooks.config.update((draft) => {
       draft.status = 'ready'
@@ -441,8 +483,7 @@ describe('环境子页与设置子页：控件唯一、归因准确、作用域�
       }
       draft.draft = draft.value
     })
-    shim.reset()
-    const html = renderToStaticMarkup(React.createElement(entry.component, propsFor(face, t)))
+    const html = renderTab(entry, face, t, 'settings')
     assert.ok(html.includes('配置对所有环境生效。'), '设置子页要有一句作用域事实：' + html.slice(0, 300))
   })
 
@@ -537,5 +578,63 @@ describe('体检页：跳过层如实标注、修复说明行内可见（task-27
     const rule = /\.issueCode\s*\{([^}]*)\}/.exec(css)
     assert.ok(rule !== null, '.issueCode 必须有独立规则（否则会跟着 .evidenceAt 一起可断行）')
     assert.ok(/white-space:\s*nowrap/.test(rule[1]), '.issueCode 必须是 nowrap：' + String(rule[1]))
+  })
+})
+
+describe('控制台：子页选择跨重挂载存活（task-30）', () => {
+  /** 把注册项声明的 store 铺进 props（框架在运行时做这件事；测试按官方说法自己 create()）。 */
+  const withStore = (entry, props) => {
+    const handle = entry.options.store
+    assert.ok(handle !== undefined, '控制台注册项必须声明 store：子页选择要跨重挂载存活')
+    const instance = handle.create()
+    return {
+      instance,
+      props: {
+        ...props,
+        useStore: selector => selector(instance.getSnapshot()),
+        actions: instance.actions,
+      },
+    }
+  }
+
+  it('注册项声明了 store，且首屏仍落在体检（默认没变）', () => {
+    const { entry, face, t } = boot()
+    const { props } = withStore(entry, propsFor(face, t))
+    const html = renderToStaticMarkup(React.createElement(entry.component, props))
+    assert.ok(html.includes('开始体检') || html.includes('健康分'), '首屏应落在体检：' + html.slice(0, 200))
+  })
+
+  it('切到「环境」子页后重挂载仍在环境子页（选择来自 store，不是组件内 state）', () => {
+    const { entry, face, t } = boot()
+    const { props } = withStore(entry, propsFor(face, t))
+    props.actions.select('env')
+    const first = renderToStaticMarkup(React.createElement(entry.component, props))
+    assert.ok(first.includes('新建环境'), '切过去应看到环境子页：' + first.slice(0, 200))
+    // 再渲染一次等价于重挂载：组件内 useState 会复位回体检，store 不会。
+    const again = renderToStaticMarkup(React.createElement(entry.component, props))
+    assert.ok(again.includes('新建环境'), '重挂载后必须还在环境子页')
+    assert.ok(!again.includes('开始体检'), '不得被弹回体检')
+  })
+
+  it('体检还在跑、store 连续发布时，切过去的子页不被弹回', () => {
+    const { entry, face, t } = boot()
+    const { props } = withStore(entry, propsFor(face, t))
+    const stub = stubFetch({
+      diagnose: () => ({ ok: true, value: { jobId: 'job-1' } }),
+      job: () => ({ ok: true, value: { done: false } }),
+      listEnvironments: () => ({ ok: true, value: [] }),
+    })
+    try {
+      face.diagnose()
+      props.actions.select('env')
+      for (let tick = 0; tick < 3; tick += 1) {
+        face.hooks.health.update(draft => { draft.notice = 'tick ' + String(tick) })
+        const html = renderToStaticMarkup(React.createElement(entry.component, props))
+        assert.ok(html.includes('新建环境'), '第 ' + String(tick + 1) + ' 次发布后必须还在环境子页')
+        assert.ok(!html.includes('开始体检'), '第 ' + String(tick + 1) + ' 次发布后不得被弹回体检')
+      }
+    } finally {
+      stub.restore()
+    }
   })
 })

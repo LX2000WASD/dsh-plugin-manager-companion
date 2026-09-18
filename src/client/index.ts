@@ -27,7 +27,7 @@ import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 import type { CompanionConfig } from '../settings.ts'
-import { ConsolePage } from './ConsolePage.tsx'
+import { ConsolePage, createConsoleStore } from './ConsolePage.tsx'
 import { KindsPage } from './KindsPage.tsx'
 import { MarketplacePage } from './MarketplacePage.tsx'
 import { CompanionOfficialItem } from './OfficialSlots.tsx'
@@ -100,12 +100,16 @@ export function apply(ctx: ClientContext): void {
   }, MarketplacePage))
 
   // 一级入口 2：环境控制台（order 17；体检 / 环境 / 设置三个本地子页面）。
+  // 子页选择走声明的 store（句柄在这里创建，模块级不放句柄）：任何一次 store 发布或条目
+  // 重挂载都不能把用户从「环境」子页弹回「体检」——结果块就在那个子页里。
+  const consoleStore = createConsoleStore()
   ctx.slots.inject('settings.section', () => ctx.slots.register({
     name: 'settings.section',
     id: 'console',
     order: 17,
     label: () => t('nav.console'),
     locale: NS,
+    store: consoleStore,
     inject: consoleFace,
   }, ConsolePage))
 

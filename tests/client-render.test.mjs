@@ -115,7 +115,30 @@ function bootBundle(overrides = {}) {
     'react/jsx-runtime': require_('react/jsx-runtime'),
     'react-dom': {}, 'react-dom/client': {},
     '@deepseek-ai/cordis': { Context: class {} },
-    '@deepseek-ai/dsh-client-store': { createSnapshotStore: makeSnapshotStore, shallowEqual: (a, b) => a === b },
+    '@deepseek-ai/dsh-client-store': {
+      createSnapshotStore: makeSnapshotStore,
+      shallowEqual: (a, b) => a === b,
+    // 声明式 store（register 的 store 座位）也要能被桩件启动：控制台把「当前子页」搬进了 store，
+    // 缺这个导出的话产物 apply() 会抛 "defineStore is not a function"（报错指向产物、不指向桩件）。
+    defineStore: spec => ({
+      spec,
+      create() {
+        let state = spec.init()
+        const listeners = new Set()
+        const notify = () => { for (const fn of [...listeners]) fn() }
+        const instance = {
+          getSnapshot: () => state,
+          subscribe(fn) { listeners.add(fn); return () => { listeners.delete(fn) } },
+          clearPersisted() {},
+          actions: {},
+        }
+        for (const [name, mutator] of Object.entries(spec.actions)) {
+          instance.actions[name] = (...params) => { mutator(state, ...params); notify() }
+        }
+        return instance
+      },
+    }),
+  },
     '@deepseek-ai/dsh-client-ui-slots': {},
     '@deepseek-ai/dsh-client-ui-primitives': stubPrimitives(),
     '@deepseek-ai/dsh-client-ui-dockkit': {},
@@ -210,11 +233,15 @@ function makeT(dicts) {
   }
 }
 
+/** 最近一次 registration() 取到的注册项：propsFor 需要它来铺 store 座位（框架在运行时做这件事）。 */
+let currentEntry
+
 /** 取一个注册项。 */
 function registration(slotRegistrations, name, id) {
   const hit = slotRegistrations.find(entry =>
     entry.options.name === name && (id === undefined || entry.options.id === id))
   assert.ok(hit !== undefined, '未注册 slot: ' + name + (id === undefined ? '' : '/' + id))
+  currentEntry = hit
   return hit
 }
 
@@ -231,6 +258,15 @@ function propsFor(face, t, extra = {}) {
   const props = { t, ...actions, ...extra }
   for (const [name, source] of Object.entries(hooks)) {
     props['use' + name[0].toUpperCase() + name.slice(1)] = selector => selector(source.getSnapshot())
+  }
+  // 声明式 store 是组件 props 的一部分：注册项声明了就必须铺上，否则控制台读 useStore 会抛。
+  // 每次调用都会 create() 一个新实例（框架的语义是一 handle x 一 scope 一实例）；
+  // 需要跨渲染保持同一实例的用例请自己 create 一次再铺。
+  const handle = currentEntry?.options.store
+  if (handle !== undefined) {
+    const instance = handle.create()
+    props.useStore = selector => selector(instance.getSnapshot())
+    props.actions = instance.actions
   }
   return props
 }
@@ -257,32 +293,6 @@ async function until(check, what) {
     await new Promise(resolve => setTimeout(resolve, 5))
   }
   throw new Error('等待超时：' + what)
-}
-
-/**
- * 让 ConsolePage 首屏落在指定子页的 React 替身。
- *
- * 为什么需要：环境子页不是独立注册项（控制台只有一个注册项），SSR 首屏默认落在「体检」，
- * 于是环境页结果块的成败文案在无 DOM 的测试里根本渲染不到。做法：ConsolePage 的**第一个**
- * 无初值 useState 是 activeId，替身只改这一个调用的初值。这是纯粹的"渲染到目标子页"手段：
- * 钩子顺序一旦变化，断言会直接失败（不会静默变成永远通过）。
- *
- * @param tabId - 首屏要落在的子页 id（health / env / settings）。
- * @returns { react, reset }：要被塞进模块表的 react 替身，与每次渲染前必须调用的复位函数。
- */
-function reactWithInitialTab(tabId) {
-  let noArgCalls = 0
-  const react = {
-    ...React,
-    useState(initial) {
-      if (arguments.length === 0 || initial === undefined) {
-        noArgCalls += 1
-        return React.useState(noArgCalls === 1 ? tabId : undefined)
-      }
-      return React.useState(initial)
-    },
-  }
-  return { react, reset: () => { noArgCalls = 0 } }
 }
 
 /** 一份形状正确的诊断报告（作为"正常路径"的对照）。 */
@@ -778,8 +788,7 @@ describe('客户端渲染健壮性（残缺载荷不许变成空白页）', () =
     // 关键：这条护栏**驱动真实序列**——UI 的动作 → act() → refresh()，不直接喂状态。
     // task-14 的护栏直接写 store，绕过了 act()→refresh()，所以真机上"失败画成完成"没被抓到
     // （docs/CODE-POLICY.md 第 7.4 节记的正是这类自证式护栏）。
-    const { react, reset } = reactWithInitialTab('env')
-    const exported = bootBundle({ 'react': react })
+    const exported = bootBundle()
     const { slotRegistrations, dicts } = applyWithMocks(exported)
     const reg = registration(slotRegistrations, 'settings.section', 'console')
     const face = reg.options.inject()
@@ -802,8 +811,9 @@ describe('客户端渲染健壮性（残缺载荷不许变成空白页）', () =
       }, '复制操作落定（含其后的列表刷新）')
       assert.equal(settled.error, 'package-operation-failed', '失败态必须活过 refresh()：' + JSON.stringify(settled))
 
-      reset()
-      const { html, error } = renderSafely(reg.component, propsFor(face, makeT(dicts)))
+      const props = propsFor(face, makeT(dicts))
+      props.actions.select('env')
+      const { html, error } = renderSafely(reg.component, props)
       assert.equal(error, undefined)
       assert.match(html, /data-run-state="failed"/, '结果块必须是失败态：' + html.slice(-600))
       assert.ok(!html.includes('完成'), '不得出现 trace.done「完成」文案')
@@ -836,13 +846,16 @@ describe('客户端渲染健壮性（残缺载荷不许变成空白页）', () =
   })
 
   it('导入无效备份：结果块不得留下上一次操作的内容（P6）', async () => {
-    const { react, reset } = reactWithInitialTab('env')
-    const exported = bootBundle({ 'react': react })
+    const exported = bootBundle()
     const { slotRegistrations, dicts } = applyWithMocks(exported)
     const reg = registration(slotRegistrations, 'settings.section', 'console')
     const face = reg.options.inject()
     const t = makeT(dicts)
-    const renderEnv = () => { reset(); return renderSafely(reg.component, propsFor(face, t)) }
+    const renderEnv = () => {
+      const props = propsFor(face, t)
+      props.actions.select('env')
+      return renderSafely(reg.component, props)
+    }
 
     // 前置：结果块里确实有"上一次操作"的内容。
     face.hooks.environments.update((draft) => { draft.notice = '上一次操作结果：已启动 foo' })
@@ -879,15 +892,15 @@ describe('客户端渲染健壮性（残缺载荷不许变成空白页）', () =
 
   it('失败态护栏：环境结果块在 errorKey-only / error-only 下都不是成功态（旧代码会画成"完成"）', () => {
     // 环境子页不是独立注册项，所以这里用 react 替身把首屏落在「环境」子页。
-    const { react, reset } = reactWithInitialTab('env')
-    const exported = bootBundle({ 'react': react })
+    const exported = bootBundle()
     const { slotRegistrations, dicts } = applyWithMocks(exported)
     const reg = registration(slotRegistrations, 'settings.section', 'console')
     const face = reg.options.inject()
     const t = makeT(dicts)
     const renderEnv = () => {
-      reset()
-      return renderSafely(reg.component, propsFor(face, t))
+      const props = propsFor(face, t)
+      props.actions.select('env')
+      return renderSafely(reg.component, props)
     }
 
     // 1) errorKey-only：payload 残缺类失败（真实形状：只设 errorKey，不设 error）。

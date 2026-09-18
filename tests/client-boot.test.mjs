@@ -77,7 +77,30 @@ function bootBundle() {
     'react/jsx-runtime': require_('react/jsx-runtime'),
     'react-dom': {}, 'react-dom/client': {},
     '@deepseek-ai/cordis': { Context: class {} },
-    '@deepseek-ai/dsh-client-store': { createSnapshotStore: makeSnapshotStore, shallowEqual: (a, b) => a === b },
+    '@deepseek-ai/dsh-client-store': {
+      createSnapshotStore: makeSnapshotStore,
+      shallowEqual: (a, b) => a === b,
+    // 声明式 store（register 的 store 座位）也要能被桩件启动：控制台把「当前子页」搬进了 store，
+    // 缺这个导出的话产物 apply() 会抛 "defineStore is not a function"（报错指向产物、不指向桩件）。
+    defineStore: spec => ({
+      spec,
+      create() {
+        let state = spec.init()
+        const listeners = new Set()
+        const notify = () => { for (const fn of [...listeners]) fn() }
+        const instance = {
+          getSnapshot: () => state,
+          subscribe(fn) { listeners.add(fn); return () => { listeners.delete(fn) } },
+          clearPersisted() {},
+          actions: {},
+        }
+        for (const [name, mutator] of Object.entries(spec.actions)) {
+          instance.actions[name] = (...params) => { mutator(state, ...params); notify() }
+        }
+        return instance
+      },
+    }),
+  },
     '@deepseek-ai/dsh-client-ui-slots': {},
     '@deepseek-ai/dsh-client-ui-primitives': stubPrimitives(),
     '@deepseek-ai/dsh-client-ui-dockkit': {},
