@@ -10,12 +10,15 @@
  *   官方能力（插件启停/安装/清单）客户端直连官方 Remote，本插件的自有能力按
  *   docs/REST-CONTRACT.md 走 /api2/companion；乐观更新被取消（变更必须等 job 落定）。
  *
- * 三条纪律：
+ * 四条纪律：
  *   1. 变更类请求不带 AbortSignal（中止只杀传输，会留下"改了但没反馈"的状态），
  *      只有加载类请求可以带。
  *   2. 组件不订阅任何外部源：控制器持有 SnapshotStore，经 inject 的 hooks 隔间
  *      合成 use<Name> 选择器 Hook。
  *   3. 这一层不认识 React，也不认识 ctx；它只做数据与动作。
+ *   4. **外来数据在这里归一**：REST 与官方 settings 的返回值先过 wire.ts 的归一函数，
+ *      再进 SnapshotStore。组件因此可以按类型直接读字段——这一步是实测驱动的：不归一
+ *      时，一个缺字段的载荷会让官方 SlotErrorBoundary 把整个 settings.section 渲染成空 div。
  */
 
 import { createSnapshotStore, type SnapshotStore } from '@deepseek-ai/dsh-client-store'
@@ -27,11 +30,16 @@ import type { OfficialCapabilities } from '../official.ts'
 import type { MarketTagKind } from '../tags.ts'
 import type { CompanionConfig } from '../settings.ts'
 import type {
-  DiagnosticIssue, DiagnosticLayer, DiagnosticReport, DiagnosticSeverity, EnvironmentBackup,
+  DiagnosticGroup, DiagnosticIssue, DiagnosticLayer, DiagnosticReport, DiagnosticSeverity, EnvironmentBackup,
   EnvironmentBackupDiff, EnvironmentInfo, EnvironmentResult, GatedInstallResult,
   InstalledKind, KindListResult, MarketItemKind, MarketplaceResult,
 } from '../types.ts'
 import { NS, type CompanionLocaleKey } from './locales.ts'
+import {
+  normalizeBackup, normalizeBackupDiff, normalizeCapabilities, normalizeConfig,
+  normalizeEnvironmentResult, normalizeEnvironments, normalizeGatedInstall, normalizeKindList,
+  normalizeMarketplace, normalizeReport,
+} from './wire.ts'
 
 /**
  * 官方 settings 服务上本插件的命名空间。
@@ -147,13 +155,12 @@ export const sleep = (ms: number, signal?: AbortSignal): Promise<void> =>
  * @throws {CompanionError} job 失败、结果丢失或轮询被中止时。
  */
 export async function runJob<T>(op: string, body: unknown = {}, signal?: AbortSignal): Promise<T> {
-  const started = await callOp<{ jobId?: string } | T>(op, body, signal)
-  // 契约把长操作 job 化，但也容忍 host 把它实现成同步返回：拿到 jobId 才轮询，
-  // 否则该值就是结果。这样"host 先同步实现、以后改 job"不需要客户端改代码。
-  if (started === null || typeof started !== 'object' || typeof (started as { jobId?: unknown }).jobId !== 'string') {
-    return started as T
-  }
-  const jobId = (started as { jobId: string }).jobId
+  const started = await callOp<{ jobId?: string } | string | T>(op, body, signal)
+  const jobId = jobIdOf(started)
+  // 契约把长操作 job 化（REST-CONTRACT 声明的信封是 `{ jobId }`），但也容忍 host 把长操作
+  // 实现成同步返回：**认得出 job id 才轮询**，否则那个值就是结果。这样"host 先同步实现、
+  // 以后改 job"不需要客户端改代码。
+  if (jobId === undefined) return started as T
   const startedAt = Date.now()
   for (;;) {
     const status = await callOp<JobStatus<T>>('job', { id: jobId }, signal)
@@ -166,22 +173,37 @@ export async function runJob<T>(op: string, body: unknown = {}, signal?: AbortSi
   }
 }
 
+/**
+ * 认出一个 op 返回值里的 job id。
+ *
+ * 两种形状都认：
+ *   - `{ jobId }`：docs/REST-CONTRACT.md 声明的信封；
+ *   - **裸 id 字符串**：host 侧 JobRegistry.start() 实际返回的形状（实测 2026-09-19：
+ *     它直接返回 `string`，op 信封里的 value 就是 `"mu7d…-1"`）。
+ *
+ * 认错的代价是实测过的：把裸 id 当成结果用，`report.counts` 是 undefined，HealthPanel 在
+ * `report.counts[layer]` 上抛 TypeError，官方 SlotErrorBoundary 把整个 settings.section
+ * 渲染成一个空 div —— 用户看到的就是"点开环境控制台一片空白"。
+ *
+ * 只认这两种形状，且本插件的长操作结果都是对象（诊断报告 / 操作结果信封），所以
+ * "字符串即 job id"没有歧义。
+ *
+ * @param value - op 的返回值。
+ * @returns job id；该值本身就是结果时 undefined。
+ */
+function jobIdOf(value: unknown): string | undefined {
+  if (typeof value === 'string') return value.length > 0 ? value : undefined
+  if (value === null || typeof value !== 'object') return undefined
+  const candidate = (value as { jobId?: unknown }).jobId
+  return typeof candidate === 'string' && candidate.length > 0 ? candidate : undefined
+}
+
 /** 本插件诊断的修复 op。
  *
  * 契约缺口：docs/REST-CONTRACT.md 的操作表还没有这个 op，而 src/types.ts 的
  * DiagnosticFix 明确写了"host 端据此分派"。这里先按 DiagnosticFix 的字段调用，
  * op 名集中在这一个常量里，等 Lead 定稿后改名只动这一行。 */
 const FIX_OP = 'fix'
-
-/** 一次能力/配置读取的结果。 */
-export interface CapabilityReport {
-  readonly capabilities: OfficialCapabilities
-  readonly config: CompanionConfig
-}
-
-/** 读官方能力探针与当前配置（设置子页与体检页共用的只读入口）。 */
-export const fetchCapabilities = (signal?: AbortSignal): Promise<CapabilityReport> =>
-  callOp<CapabilityReport>('capabilities', {}, signal)
 
 // ── 官方插件页 slot 契约（镜像官方声明）──────────────────────────────────
 
@@ -353,6 +375,64 @@ export function formatRelative(t: TranslateNS<typeof NS>, iso: string): string {
   return t(RELATIVE_LABEL[bucket.unit], { n: bucket.n })
 }
 
+/**
+ * 一个层值 → 字典键。
+ *
+ * 报告来自外部（host），所以层值可能是本客户端不认识的字符串；此时返回 undefined，
+ * 由组件回退成显示原始 id。直接 `t(LAYER_LABEL[layer])` 会把未知值渲染成 undefined。
+ *
+ * @param layer - 报告里的层值。
+ * @returns 字典键；未知层值时 undefined。
+ */
+export function layerLabelKey(layer: string): CompanionLocaleKey | undefined {
+  return (LAYER_LABEL as Readonly<Record<string, CompanionLocaleKey | undefined>>)[layer]
+}
+
+/**
+ * 处置等级 → 字典键。
+ * @param severity - 报告里的等级值。
+ * @returns 字典键；未知等级时 undefined。
+ */
+export function severityLabelKey(severity: string): CompanionLocaleKey | undefined {
+  return (SEVERITY_LABEL as Readonly<Record<string, CompanionLocaleKey | undefined>>)[severity]
+}
+
+/**
+ * 处置等级 → Tag 色调。
+ * @param severity - 报告里的等级值。
+ * @returns 色调；未知等级按"需注意"显示（绝不把未知降级成好色调）。
+ */
+export function severityToneOf(severity: string): TagTone {
+  return (SEVERITY_TONE as Readonly<Record<string, TagTone | undefined>>)[severity] ?? 'warning'
+}
+
+/**
+ * 证据类型 → 展示用标识。
+ * @param kind - 证据里的类型值。
+ * @returns 展示标识；未知类型原样显示（技术标识不做翻译）。
+ */
+export function evidenceKindOf(kind: string): string {
+  return (EVIDENCE_KIND as Readonly<Record<string, string | undefined>>)[kind] ?? kind
+}
+
+/**
+ * 一条发现是否属于某个分组。
+ *
+ * 判据只用 wire 上真实存在的字段（层 / 类别 / 等级 + 作用域清单），**不重算 host 的组键格式**：
+ * 键是实现细节，而"这一组包含哪些发现"必须能从契约字段推出来。发现自身没有 scope 时按
+ * 空串对待（与 host 的"无法归属即空串"一致）；组没有作用域清单时，层+类别+等级相同即同组。
+ *
+ * @param issue - 一条发现。
+ * @param group - 报告里的一个分组。
+ * @returns 属于该组时为 true。
+ */
+export function issueInGroup(issue: DiagnosticIssue, group: DiagnosticGroup): boolean {
+  if (issue.layer !== group.layer || issue.code !== group.code || issue.severity !== group.severity) return false
+  if (group.scopes.length === 0) return true
+  const scope = issue.scope ?? ''
+  return group.scopes.some(entry => entry.scope === scope)
+}
+
 /** 证据类型 → 展示用前缀（不做翻译：文件/运行时/官方是技术标识）。 */
 export const EVIDENCE_KIND: Readonly<Record<'file' | 'runtime' | 'official', string>> = {
   file: 'file',
@@ -371,6 +451,16 @@ export interface HealthState {
   report: DiagnosticReport | undefined
   running: boolean
   error: string | undefined
+  /** 客户端自己判定的失败（载荷残缺等）；文案归字典，控制层只给键。 */
+  errorKey?: CompanionLocaleKey
+  /**
+   * 诊断目标环境名；undefined 表示当前环境。
+   *
+   * 为什么保留 undefined 而不是在控制器里解析成当前环境名：控制器不认识 profile 列表
+   * （那是 host 的事实）。界面把"用户选的就是当前环境"折回 undefined，语义只有两个：
+   * "当前环境"与"某个具名环境"。
+   */
+  target: string | undefined
   /** 正在执行修复的 issue id。 */
   fixingId: string | undefined
   /** 最近一次修复的输出。 */
@@ -386,16 +476,30 @@ export interface HealthFace {
   diagnose(layers?: readonly DiagnosticLayer[]): void
   /** 执行一条发现的修复动作。 */
   fix(issue: DiagnosticIssue): void
+  /**
+   * 切换诊断目标环境；undefined 表示当前环境。
+   *
+   * 切换会**立刻丢弃**上一份报告（报告属于某个环境，跨环境复用它的展开状态与修复按钮
+   * 就是事故），并立即重跑诊断；在途的那次响应按代号作废。
+   */
+  setDiagnosticTarget(environment: string | undefined): void
 }
 
 /** 体检控制器：持有报告状态，动作全部走自有 REST。 */
 export class HealthController {
   private readonly store: SnapshotStore<HealthState>
+  /**
+   * 诊断代号：每次目标切换或重新诊断自增。
+   *
+   * 用途唯一——作废在途的响应。用户在诊断跑到一半时切了环境，旧环境的报告绝不能
+   * 落进新目标的状态里（那会让"报告属于哪个环境"变成一个谎言）。
+   */
+  private generation = 0
 
   constructor() {
     this.store = createSnapshotStore<HealthState>({
       report: undefined, running: false, error: undefined, fixingId: undefined, notice: undefined,
-      capabilities: undefined,
+      capabilities: undefined, target: undefined,
     })
   }
 
@@ -405,7 +509,27 @@ export class HealthController {
       hooks: { health: this.store },
       diagnose: (layers) => { void this.diagnose(layers) },
       fix: (issue) => { void this.fix(issue) },
+      setDiagnosticTarget: (environment) => { this.setTarget(environment) },
     }
+  }
+
+  /**
+   * 切换诊断目标环境。
+   * @param environment - 目标环境名；undefined 表示当前环境。
+   */
+  setTarget(environment: string | undefined): void {
+    const next = environment === undefined || environment === '' ? undefined : environment
+    if (this.store.getSnapshot().target === next) return
+    this.generation += 1
+    this.store.update((draft) => {
+      draft.target = next
+      draft.report = undefined
+      draft.fixingId = undefined
+      draft.notice = undefined
+      draft.error = undefined
+      draft.errorKey = undefined
+    })
+    void this.diagnose()
   }
 
   /**
@@ -413,19 +537,41 @@ export class HealthController {
    * @param layers - 只诊断这些层；省略即按配置全量。
    */
   async diagnose(layers?: readonly DiagnosticLayer[]): Promise<void> {
-    this.store.update((draft) => { draft.running = true; draft.error = undefined; draft.notice = undefined })
+    const generation = ++this.generation
+    const target = this.store.getSnapshot().target
+    this.store.update((draft) => {
+      draft.running = true
+      draft.error = undefined
+      draft.errorKey = undefined
+      draft.notice = undefined
+    })
     try {
-      const report = await runJob<DiagnosticReport>('diagnose', layers === undefined ? {} : { layers })
+      // 目标环境由 host 决定语义：省略即当前环境；指定的环境不存在时 host 返回
+      // operation-failed（绝不悄悄退回当前环境），界面据此如实报错。
+      const raw = await runJob<unknown>('diagnose', {
+        ...layers === undefined ? {} : { layers },
+        ...target === undefined ? {} : { environment: target },
+      })
+      if (generation !== this.generation) return
+      const report = normalizeReport(raw, LAYER_ORDER)
+      if (report === undefined) {
+        // 载荷不可用时不渲染半个报告：如实报"失败"，页面照常可读（绝不空白）。
+        this.store.update((draft) => { draft.running = false; draft.errorKey = 'error.incompletePayload' })
+        return
+      }
       this.store.update((draft) => { draft.report = report; draft.running = false })
       // 顺带读一次官方能力探针：报告里的 skipped 已说明缺口，这里给出更直接的一句话。
       // 读不到就保持 undefined（不伪造"能力齐全"），失败原因由报告承担。
       try {
-        const info = await callOp<CapabilityReport>('capabilities', {})
-        this.store.update((draft) => { draft.capabilities = info.capabilities })
+        const info = await callOp<{ capabilities?: unknown }>('capabilities', {})
+        if (generation !== this.generation) return
+        const capabilities = normalizeCapabilities(info.capabilities)
+        if (capabilities !== undefined) this.store.update((draft) => { draft.capabilities = capabilities })
       } catch {
         // 探针本身失败不是体检失败：报告已经生成了。
       }
     } catch (error) {
+      if (generation !== this.generation) return
       this.store.update((draft) => {
         draft.running = false
         draft.error = error instanceof Error ? error.message : String(error)
@@ -438,6 +584,8 @@ export class HealthController {
    * @param issue - 带 fix 的发现。
    */
   async fix(issue: DiagnosticIssue): Promise<void> {
+    // 不变式：修复只在"目标是当前环境"时被界面渲染出来（官方写通道只覆盖当前环境，
+    // 见 ConsolePage 的 HealthPanel）。控制器不重复判断——它拿不到 profile 事实。
     const action = issue.fix
     if (action === undefined) return
     this.store.update((draft) => { draft.fixingId = issue.id; draft.error = undefined })
@@ -465,6 +613,8 @@ export interface EnvironmentsState {
   /** 正在执行的操作名（用于按钮禁用与提示）。 */
   busy: string | undefined
   error: string | undefined
+  /** 客户端自己判定的失败（载荷残缺、备份文件格式不对）；文案归字典。 */
+  errorKey?: CompanionLocaleKey
   notice: string | undefined
   /** 已读入内存的备份文档。 */
   backup: EnvironmentBackup | undefined
@@ -511,29 +661,33 @@ export class EnvironmentsController {
     return {
       hooks: { environments: this.store },
       refreshEnvironments: () => { void this.refresh() },
-      startEnvironment: (name, background) => { void this.act(`start ${name}`, () => callOp<EnvironmentResult>('startEnvironment', { name, background })) },
-      stopEnvironment: (name) => { void this.act(`stop ${name}`, () => callOp<EnvironmentResult>('stopEnvironment', { name })) },
+      startEnvironment: (name, background) => { void this.act(`start ${name}`, () => callOp<unknown>('startEnvironment', { name, background })) },
+      stopEnvironment: (name) => { void this.act(`stop ${name}`, () => callOp<unknown>('stopEnvironment', { name })) },
       createEnvironment: (name, template) => {
-        void this.act(`create ${name}`, () => callOp<EnvironmentResult>('createEnvironment', template === undefined || template === '' ? { name } : { name, template }))
+        void this.act(`create ${name}`, () => callOp<unknown>('createEnvironment', template === undefined || template === '' ? { name } : { name, template }))
       },
-      renameEnvironment: (from, to) => { void this.act(`rename ${from}`, () => callOp<EnvironmentResult>('renameEnvironment', { from, to })) },
-      removeEnvironment: (name) => { void this.act(`remove ${name}`, () => callOp<EnvironmentResult>('removeEnvironment', { name })) },
-      copyPlugins: (from, to, names) => { void this.act(`copy ${from} → ${to}`, () => runJob<EnvironmentResult>('copyPlugins', { from, to, names })) },
+      renameEnvironment: (from, to) => { void this.act(`rename ${from}`, () => callOp<unknown>('renameEnvironment', { from, to })) },
+      removeEnvironment: (name) => { void this.act(`remove ${name}`, () => callOp<unknown>('removeEnvironment', { name })) },
+      copyPlugins: (from, to, names) => { void this.act(`copy ${from} → ${to}`, () => runJob<unknown>('copyPlugins', { from, to, names })) },
       exportBackup: (name) => { void this.exportBackup(name) },
       loadBackup: (file) => { void this.loadBackup(file) },
       diffBackup: (target) => { void this.diffBackup(target) },
       restoreBackup: (target) => { void this.restoreBackup(target) },
       dismissEnvironmentNotice: () => {
-        this.store.update((draft) => { draft.notice = undefined; draft.error = undefined })
+        this.store.update((draft) => { draft.notice = undefined; draft.error = undefined; draft.errorKey = undefined })
       },
     }
   }
 
   /** 重新读环境列表。 */
   async refresh(): Promise<void> {
-    this.store.update((draft) => { draft.loading = true; draft.error = undefined })
+    this.store.update((draft) => { draft.loading = true; draft.error = undefined; draft.errorKey = undefined })
     try {
-      const environments = await callOp<EnvironmentInfo[]>('listEnvironments', {})
+      const environments = normalizeEnvironments(await callOp<unknown>('listEnvironments', {}))
+      if (environments === undefined) {
+        this.store.update((draft) => { draft.loading = false; draft.errorKey = 'error.incompletePayload' })
+        return
+      }
       this.store.update((draft) => { draft.environments = environments; draft.loading = false })
     } catch (error) {
       this.store.update((draft) => {
@@ -549,12 +703,17 @@ export class EnvironmentsController {
    * 变更一律不带 AbortSignal：中止只杀传输，服务端仍会推进。
    *
    * @param label - 操作标签，用于 UI 的忙碌提示。
-   * @param task - 具体调用。
+   * @param task - 具体调用（返回值一律过归一，形状不对时如实报失败而不是当成功）。
    */
-  private async act(label: string, task: () => Promise<EnvironmentResult>): Promise<void> {
-    this.store.update((draft) => { draft.busy = label; draft.error = undefined; draft.notice = undefined })
+  private async act(label: string, task: () => Promise<unknown>): Promise<void> {
+    this.store.update((draft) => {
+      draft.busy = label
+      draft.error = undefined
+      draft.errorKey = undefined
+      draft.notice = undefined
+    })
     try {
-      const result = await task()
+      const result = normalizeEnvironmentResult(await task())
       this.store.update((draft) => {
         draft.busy = undefined
         draft.notice = result.output
@@ -574,9 +733,13 @@ export class EnvironmentsController {
    * @param name - 被备份的环境名。
    */
   async exportBackup(name: string): Promise<void> {
-    this.store.update((draft) => { draft.busy = `backup ${name}`; draft.error = undefined; draft.diff = undefined })
+    this.store.update((draft) => { draft.busy = `backup ${name}`; draft.error = undefined; draft.errorKey = undefined; draft.diff = undefined })
     try {
-      const backup = await callOp<EnvironmentBackup>('backupExport', { name })
+      const backup = normalizeBackup(await callOp<unknown>('backupExport', { name }))
+      if (backup === undefined) {
+        this.store.update((draft) => { draft.busy = undefined; draft.errorKey = 'error.incompletePayload' })
+        return
+      }
       this.store.update((draft) => { draft.busy = undefined; draft.backup = backup })
       downloadJson(`companion-${name}-${Date.now()}.json`, backup)
     } catch (error) {
@@ -594,10 +757,24 @@ export class EnvironmentsController {
   async loadBackup(file: File): Promise<void> {
     try {
       const text = await file.text()
-      const backup = JSON.parse(text) as EnvironmentBackup
-      this.store.update((draft) => { draft.backup = backup; draft.diff = undefined; draft.error = undefined })
+      // 用户挑的文件可能根本不是备份（甚至是任意 JSON）：归一不过就拒绝，
+      // 绝不把猜出来的对象交给"覆盖目标环境"的恢复流程。
+      const backup = normalizeBackup(JSON.parse(text) as unknown)
+      if (backup === undefined) {
+        this.store.update((draft) => { draft.errorKey = 'env.backupInvalid'; draft.error = undefined })
+        return
+      }
+      this.store.update((draft) => {
+        draft.backup = backup
+        draft.diff = undefined
+        draft.error = undefined
+        draft.errorKey = undefined
+      })
     } catch (error) {
-      this.store.update((draft) => { draft.error = error instanceof Error ? error.message : String(error) })
+      this.store.update((draft) => {
+        draft.errorKey = 'env.backupInvalid'
+        draft.error = error instanceof Error ? error.message : String(error)
+      })
     }
   }
 
@@ -608,9 +785,13 @@ export class EnvironmentsController {
   async diffBackup(target: string): Promise<void> {
     const backup = this.store.getSnapshot().backup
     if (backup === undefined) return
-    this.store.update((draft) => { draft.busy = `diff ${target}`; draft.error = undefined })
+    this.store.update((draft) => { draft.busy = `diff ${target}`; draft.error = undefined; draft.errorKey = undefined })
     try {
-      const diff = await callOp<EnvironmentBackupDiff>('backupDiff', { backup, target })
+      const diff = normalizeBackupDiff(await callOp<unknown>('backupDiff', { backup, target }))
+      if (diff === undefined) {
+        this.store.update((draft) => { draft.busy = undefined; draft.errorKey = 'error.incompletePayload' })
+        return
+      }
       this.store.update((draft) => { draft.busy = undefined; draft.diff = diff })
     } catch (error) {
       this.store.update((draft) => {
@@ -627,7 +808,7 @@ export class EnvironmentsController {
   async restoreBackup(target: string): Promise<void> {
     const backup = this.store.getSnapshot().backup
     if (backup === undefined) return
-    await this.act(`restore ${target}`, () => runJob<EnvironmentResult>('backupRestore', { backup, target }))
+    await this.act(`restore ${target}`, () => runJob<unknown>('backupRestore', { backup, target }))
     this.store.update((draft) => { draft.diff = undefined })
   }
 }
@@ -637,6 +818,8 @@ export interface MarketplaceState {
   result: MarketplaceResult | undefined
   loading: boolean
   error: string | undefined
+  /** 客户端自己判定的失败（索引载荷残缺）；文案归字典。 */
+  errorKey?: CompanionLocaleKey
   query: string
   /** 选中的分类 id；空串表示全部。 */
   category: string
@@ -698,9 +881,13 @@ export class MarketplaceController {
    * @param refresh - 是否强制绕过缓存。
    */
   async load(refresh: boolean): Promise<void> {
-    this.store.update((draft) => { draft.loading = true; draft.error = undefined })
+    this.store.update((draft) => { draft.loading = true; draft.error = undefined; draft.errorKey = undefined })
     try {
-      const result = await callOp<MarketplaceResult>('marketplace', { refresh })
+      const result = normalizeMarketplace(await callOp<unknown>('marketplace', { refresh }))
+      if (result === undefined) {
+        this.store.update((draft) => { draft.loading = false; draft.errorKey = 'error.incompletePayload' })
+        return
+      }
       this.store.update((draft) => { draft.result = result; draft.loading = false })
     } catch (error) {
       this.store.update((draft) => {
@@ -722,7 +909,7 @@ export class MarketplaceController {
       draft.rolledBack = false
     })
     try {
-      const result = await runJob<GatedInstallResult>('install', { spec: item.repo })
+      const result = normalizeGatedInstall(await runJob<unknown>('install', { spec: item.repo }))
       this.store.update((draft) => {
         draft.installing = undefined
         draft.gateIssues = result.gateIssues
@@ -745,6 +932,8 @@ export interface KindsState {
   orphans: readonly string[]
   loading: boolean
   error: string | undefined
+  /** 客户端自己判定的失败（载荷残缺）；文案归字典。 */
+  errorKey?: CompanionLocaleKey
   busy: string | undefined
   notice: string | undefined
 }
@@ -777,9 +966,13 @@ export class KindsController {
 
   /** 读技能与预设记录。 */
   async load(): Promise<void> {
-    this.store.update((draft) => { draft.loading = true; draft.error = undefined })
+    this.store.update((draft) => { draft.loading = true; draft.error = undefined; draft.errorKey = undefined })
     try {
-      const result = await callOp<KindListResult>('listKinds', {})
+      const result = normalizeKindList(await callOp<unknown>('listKinds', {}))
+      if (result === undefined) {
+        this.store.update((draft) => { draft.loading = false; draft.errorKey = 'error.incompletePayload' })
+        return
+      }
       this.store.update((draft) => {
         draft.records = result.records
         draft.orphans = result.orphans
@@ -800,7 +993,7 @@ export class KindsController {
   async uninstall(repo: string): Promise<void> {
     this.store.update((draft) => { draft.busy = repo; draft.error = undefined; draft.notice = undefined })
     try {
-      const result = await runJob<EnvironmentResult>('uninstallKind', { repo })
+      const result = normalizeEnvironmentResult(await runJob<unknown>('uninstallKind', { repo }))
       this.store.update((draft) => {
         draft.busy = undefined
         draft.notice = result.output
@@ -820,10 +1013,12 @@ export class KindsController {
 export interface ConfigState {
   status: 'loading' | 'ready' | 'unavailable'
   writable: boolean
-  /** 官方已解析的当前值。 */
+  /** 官方已解析的当前值（原样保留：保存时的"前后对比"和写盘路径都以它为准）。 */
   value: CompanionConfig | undefined
-  /** 叠加了本地草稿的值（未编辑时等于 value）。 */
+  /** 渲染用草稿：已过 wire 归一（缺字段按客户端默认值补齐）再叠加本地编辑。 */
   draft: CompanionConfig | undefined
+  /** 宿主给的文档缺字段（draft 里有默认值补出来的部分）——界面要如实说明。 */
+  incomplete: boolean
   dirty: boolean
   saving: boolean
   failed: boolean
@@ -856,7 +1051,7 @@ export class ConfigController {
    */
   constructor(private readonly scope: SettingsScope<CompanionConfig>) {
     this.store = createSnapshotStore<ConfigState>({
-      status: 'loading', writable: false, value: undefined, draft: undefined,
+      status: 'loading', writable: false, value: undefined, draft: undefined, incomplete: false,
       dirty: false, saving: false, failed: false, saved: false,
     })
     this.scope.subscribe(() => { this.publish() })
@@ -877,12 +1072,17 @@ export class ConfigController {
   private publish(): void {
     const snapshot = this.scope.getSnapshot()
     const value = snapshot.value
-    const draft = value === undefined ? undefined : applyEdits(value, this.staged)
+    // 归一在前、草稿在后：官方文档可能残缺（例如宿主只落了用户层），归一补齐默认值后
+    // 再叠加用户的暂存编辑，渲染侧因此永远拿到完整字段。写盘仍只写用户改过的路径
+    // （见 save()：逐条 set，按路径），补出来的字段不会被写回。
+    const normalized = value === undefined ? undefined : normalizeConfig(value)
+    const draft = normalized === undefined ? undefined : applyEdits(normalized.config, this.staged)
     this.store.update((state) => {
       state.status = snapshot.status
       state.writable = snapshot.writable
       state.value = value
       state.draft = draft
+      state.incomplete = (normalized?.filled.length ?? 0) > 0
       state.dirty = this.staged.length > 0
       if (!state.saving) state.failed = false
     })

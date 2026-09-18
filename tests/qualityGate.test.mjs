@@ -12,9 +12,11 @@ import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { inspectPackage, isSafePackageName, isBuiltinSpecifier } from '../dist/qualityGate.js'
+import { installedPackageDir, specifierResolves } from '../dist/diagnostics.js'
 
 let home
 let envDir
+let installAnchor
 
 /** 写 JSON 文件（自动建目录）。 */
 async function writeJson(file, value) {
@@ -132,6 +134,28 @@ before(async () => {
     ].join('\n'),
   })
 
+  // 8b) 安装锚点：官方包与 bundle 行由**安装侧**提供，profile 的 node_modules 里没有它们。
+  //     质量门不接锚点时会把它们全判成缺包（与诊断同一个误报根源）。
+  installAnchor = join(home, 'runtime', 'node_modules', '@deepseek-ai', 'dsh', 'package.json')
+  await writeJson(installAnchor, { name: '@deepseek-ai/dsh', version: '0.1.6-alpha.2' })
+  await writeJson(join(home, 'runtime', 'node_modules', '@deepseek-ai', 'dsh-official', 'package.json'),
+    { name: '@deepseek-ai/dsh-official', version: '0.1.6-alpha.2' })
+  await writeText(join(home, 'runtime', 'node_modules', '@deepseek-ai', 'dsh-official', 'index.js'),
+    'export const apply = () => {}\n')
+  await install('uses-official-anchor', {
+    exports: { '.': './index.js' },
+    peerDependencies: { '@deepseek-ai/dsh-official': '^0.1.6-alpha.2' },
+    dsh: { bundle: { patch: './cordis.patch.yml' } },
+  }, {
+    'index.js': 'export const apply = () => {}\n',
+    'cordis.patch.yml': [
+      '- insert:',
+      '    - id: official-row',
+      '      name: "@deepseek-ai/dsh-official"',
+      '',
+    ].join('\n'),
+  })
+
   // 9) 扫描上限：入口 + 405 个相对可达文件
   const leaves = Array.from({ length: 405 }, (_, index) => 'leaf-' + index + '.js')
   await install('big-pkg', { exports: { '.': './index.js' } }, {})
@@ -213,6 +237,44 @@ describe('qualityGate · 回归用例', () => {
     const result = await inspectPackage(envDir, 'big-pkg', CONFIG)
     assert.equal(result.ok, true, JSON.stringify(result.issues))
     assert.ok(result.notes.some(note => note.includes('400')), '要有截断说明：' + JSON.stringify(result.notes))
+  })
+})
+
+describe('qualityGate · 安装锚点解析根', () => {
+  it('接了安装锚点后：官方 peer 与 bundle 行解析得到，质量门不误报', async () => {
+    const result = await inspectPackage(envDir, 'uses-official-anchor', CONFIG, installAnchor)
+    assert.equal(result.ok, true, '锚点提供的包不该被判成缺包：' + JSON.stringify(result.issues))
+    assert.ok(installedPackageDir(envDir, '@deepseek-ai/dsh-official', installAnchor),
+      '安装侧的包必须能在解析根里找到')
+    assert.equal(specifierResolves(envDir, '@deepseek-ai/dsh-official', installAnchor), true)
+  })
+
+  it('反向证明：锚点也不提供的包照样被判不合格', async () => {
+    const bare = await install('anchor-only-missing', {
+      exports: { '.': './index.js' },
+      dsh: { bundle: { patch: './cordis.patch.yml' } },
+    }, {
+      'index.js': 'export const apply = () => {}\n',
+      'cordis.patch.yml': [
+        '- insert:',
+        '    - id: missing-row',
+        '      name: "never-anywhere-pkg"',
+        '',
+      ].join('\n'),
+    })
+    assert.ok(bare, 'fixture 包应当建好')
+    const result = await inspectPackage(envDir, 'anchor-only-missing', CONFIG, installAnchor)
+    assert.equal(result.ok, false)
+    assert.match(result.issues.join('\n'), /never-anywhere-pkg/)
+    assert.match(result.issues.join('\n'), /安装锚点/)
+  })
+
+  it('也可以直接传 host Context：引擎自己从 profileContext 取锚点', async () => {
+    const ctx = { get: name => (name === 'profileContext' ? { installAnchor } : undefined) }
+    const result = await inspectPackage(envDir, 'uses-official-anchor', CONFIG, ctx)
+    assert.equal(result.ok, true, JSON.stringify(result.issues))
+    const withoutAnchor = await inspectPackage(envDir, 'uses-official-anchor', CONFIG)
+    assert.equal(withoutAnchor.ok, false, '没有锚点时如实报缺包（不是静默放行）')
   })
 })
 

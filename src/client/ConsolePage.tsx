@@ -22,11 +22,12 @@ import {
   type MenuEntry, type TerminalBlockLabels,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { SnapshotSelectorHook, TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
+import type { DiagnosticGroup, DiagnosticIssue } from '../types.ts'
 import { NS } from './locales.ts'
 import { PmSelect } from './pmSelect.tsx'
 import {
-  DIAGNOSTIC_LABEL, EVIDENCE_KIND, LAYER_LABEL, LAYER_ORDER, SEVERITY_LABEL, SEVERITY_TONE,
-  formatRelative, healthScore,
+  DIAGNOSTIC_LABEL, LAYER_LABEL, LAYER_ORDER,
+  evidenceKindOf, formatRelative, healthScore, issueInGroup, layerLabelKey, severityLabelKey, severityToneOf,
   type CompanionSlotProps, type ConfigFace, type ConfigState, type ConsoleFace,
   type EnvironmentsFace, type EnvironmentsState, type HealthFace, type HealthState,
 } from './shared.ts'
@@ -56,9 +57,9 @@ interface ConsoleTab {
  */
 export function ConsolePage({
   t, useHealth, useEnvironments, useConfig,
-  diagnose, fix, refreshEnvironments, startEnvironment, stopEnvironment, createEnvironment,
-  renameEnvironment, removeEnvironment, copyPlugins, exportBackup, loadBackup, diffBackup,
-  restoreBackup, dismissEnvironmentNotice, editConfigField, saveConfig, discardConfig,
+  diagnose, fix, setDiagnosticTarget, refreshEnvironments, startEnvironment, stopEnvironment,
+  createEnvironment, renameEnvironment, removeEnvironment, copyPlugins, exportBackup, loadBackup,
+  diffBackup, restoreBackup, dismissEnvironmentNotice, editConfigField, saveConfig, discardConfig,
 }: ConsolePageProps) {
   const tabsId = useId()
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([])
@@ -135,7 +136,17 @@ export function ConsolePage({
           hidden={tab.id !== active}
         >
           {tab.id === 'health'
-            ? <HealthPanel t={t} useHealth={useHealth} diagnose={diagnose} fix={fix} />
+            ? (
+              <HealthPanel
+                t={t}
+                useHealth={useHealth}
+                useEnvironments={useEnvironments}
+                diagnose={diagnose}
+                fix={fix}
+                setDiagnosticTarget={setDiagnosticTarget}
+                refreshEnvironments={refreshEnvironments}
+              />
+            )
             : tab.id === 'env'
               ? <EnvironmentsPanel t={t} useEnvironments={useEnvironments} actions={environmentActions} />
               : <ConfigPanel t={t} useConfig={useConfig} actions={configActions} />}
@@ -145,13 +156,24 @@ export function ConsolePage({
   )
 }
 
-/** 体检子页的 props。 */
+/**
+ * 体检子页的 props。
+ *
+ * 体检面板同时需要环境面：诊断目标选择器的数据源是 listEnvironments，而"哪个环境是当前
+ * 环境"这个事实只能从这里读到（诊断接口本身只认环境名，不回答"谁在运行"）。
+ */
 interface HealthPanelProps {
   readonly t: T
   readonly useHealth: SnapshotSelectorHook<HealthState>
+  readonly useEnvironments: SnapshotSelectorHook<EnvironmentsState>
   readonly diagnose: HealthFace['diagnose']
   readonly fix: HealthFace['fix']
+  readonly setDiagnosticTarget: HealthFace['setDiagnosticTarget']
+  readonly refreshEnvironments: EnvironmentsFace['refreshEnvironments']
 }
+
+/** 组摘要里最多平铺几个作用域标签（其余折进 Tooltip，避免一行被包名挤爆）。 */
+const MAX_SCOPE_TAGS = 4
 
 /** 处置等级 → 展开图标（可自动修复用盾牌，需确认用警告，只报告用信息）。 */
 const SEVERITY_ICON = {
@@ -160,29 +182,224 @@ const SEVERITY_ICON = {
   'report-only': <IconInfoOutline14 />,
 } as const
 
+/** 一条发现的卡片 props（体检页与分组视图共用）。 */
+interface IssueRowProps {
+  readonly t: T
+  readonly issue: DiagnosticIssue
+  readonly open: boolean
+  readonly confirming: boolean
+  readonly fixing: boolean
+  /** 有别的修复在跑时禁用本行的按钮。 */
+  readonly busy: boolean
+  /** 目标不是当前环境：不提供修复（官方写通道只覆盖当前环境）。 */
+  readonly foreign: boolean
+  readonly onToggle: () => void
+  readonly onFix: () => void
+  readonly onConfirm: () => void
+}
+
+/**
+ * 渲染一条发现的卡片：标题 + 等级/层/类别标签，展开后有说明、涉及对象、证据链与修复按钮。
+ *
+ * @param props - 字典座位、这一条发现的状态与三个回调。
+ * @returns 一条发现的卡片。
+ */
+function IssueRow({
+  t, issue, open, confirming, fixing, busy, foreign, onToggle, onFix, onConfirm,
+}: IssueRowProps) {
+  const severityKey = severityLabelKey(issue.severity)
+  const layerKey = layerLabelKey(issue.layer)
+  return (
+    <li className={css.issue}>
+      <DisclosureRow
+        icon={SEVERITY_ICON[issue.severity] ?? <IconInfoOutline14 />}
+        title={issue.title}
+        open={open}
+        expandable
+        expandOnRowClick
+        onToggle={onToggle}
+        collapsedContent={(
+          <span className={css.issueMeta}>
+            {severityKey === undefined
+              ? <Tag tone="quiet">{issue.severity}</Tag>
+              : <Tag tone={severityToneOf(issue.severity)}>{t(severityKey)}</Tag>}
+            {layerKey === undefined
+              ? <Tag tone="quiet">{issue.layer}</Tag>
+              : <Tag tone="quiet">{t(layerKey)}</Tag>}
+            <code className={css.issueCode}>{issue.code}</code>
+          </span>
+        )}
+      >
+        <div className={css.issueBody}>
+          <p className={css.issueDetail}>{issue.detail}</p>
+          {issue.subjects.length === 0 ? null : (
+            <p className={css.subjects}>
+              <span className={css.metaLabel}>{t('health.subjects')}</span>
+              {issue.subjects.map(subject => <Tag key={subject} tone="neutral">{subject}</Tag>)}
+            </p>
+          )}
+          <div className={css.evidenceBlock}>
+            <span className={css.metaLabel}>{t('health.evidence')}</span>
+            <ul className={css.evidence}>
+              {issue.evidence.map((item, index) => (
+                <li key={`${issue.id}-${String(index)}`} className={css.evidenceRow}>
+                  <Tag tone="quiet">{evidenceKindOf(item.kind)}</Tag>
+                  <code className={css.evidenceAt}>{item.at}</code>
+                  <span className={css.evidenceNote}>{item.note}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+          <div className={css.issueActions}>
+            {foreign || issue.fix === undefined
+              ? <Tag tone="quiet">{t('health.reportOnly')}</Tag>
+              : (
+                <Button
+                  variant={issue.severity === 'safe-fix' ? 'primary' : 'outline'}
+                  size="sm"
+                  disabled={fixing || busy}
+                  title={issue.fix.summary}
+                  onClick={() => {
+                    if (issue.severity === 'safe-fix' || confirming) {
+                      onFix()
+                      return
+                    }
+                    onConfirm()
+                  }}
+                >
+                  {fixing
+                    ? t('health.fixing')
+                    : issue.severity === 'safe-fix'
+                      ? t('health.fixSafe')
+                      : confirming ? t('common.confirm') : t('health.fixConfirm')}
+                </Button>
+              )}
+          </div>
+        </div>
+      </DisclosureRow>
+    </li>
+  )
+}
+
+/** 一组同类发现在界面上的桶：组本身 + 属于它的条目（按真实渲染条数计数）。 */
+interface IssueBucket {
+  readonly group: DiagnosticGroup
+  readonly items: readonly DiagnosticIssue[]
+}
+
 /**
  * 渲染「体检」子页：健康分、各层计数、问题卡片（证据可展开）与分级修复按钮。
  *
  * @param props - 字典座位、报告选择器与诊断/修复动作。
  * @returns 体检面板。
  */
-function HealthPanel({ t, useHealth, diagnose, fix }: HealthPanelProps) {
+function HealthPanel({
+  t, useHealth, useEnvironments, diagnose, fix, setDiagnosticTarget, refreshEnvironments,
+}: HealthPanelProps) {
   const report = useHealth(state => state.report)
   const running = useHealth(state => state.running)
   const error = useHealth(state => state.error)
+  const errorKey = useHealth(state => state.errorKey)
   const fixingId = useHealth(state => state.fixingId)
   const notice = useHealth(state => state.notice)
   const capabilities = useHealth(state => state.capabilities)
+  const target = useHealth(state => state.target)
+  const environments = useEnvironments(state => state.environments)
+  const loadingEnvironments = useEnvironments(state => state.loading)
   const [openIds, setOpenIds] = useState<ReadonlySet<string>>(() => new Set())
+  const [openGroups, setOpenGroups] = useState<ReadonlySet<string>>(() => new Set())
   const [confirmingId, setConfirmingId] = useState<string>()
   const [toast, setToast] = useState<{ text: string; seq: number }>()
+  const requestedEnvironments = useRef(false)
 
   const issues = report?.issues ?? []
+  const groups = report?.groups ?? []
   const score = useMemo(() => healthScore(issues), [issues])
+  // 当前环境名：profile 列表是唯一权威；列表还没读到时退到官方能力探针给的名字。
+  const current = environments.find(environment => environment.current)?.name
+    ?? capabilities?.environmentName
+    ?? undefined
+  // "非当前环境"判定：target 为 undefined 就是当前环境；否则按名字比对。
+  const foreign = target !== undefined && target !== current
+
+  // 选择器的数据源：环境列表；列表还没读到（或读失败）时至少给出当前环境。
+  const environmentOptions = useMemo(() => {
+    const list = environments.map(environment => ({
+      id: environment.name,
+      label: environment.current ? `${environment.name} · ${t('env.current')}` : environment.name,
+    }))
+    if (list.length > 0) return list
+    return current === undefined ? [] : [{ id: current, label: `${current} · ${t('env.current')}` }]
+  }, [environments, current, t])
+
+  // 体检页先挂载（它是第一个子页），所以由它来补一次环境列表——只补一次，
+  // 失败也不重试（重试会形成 loading 翻转的死循环），失败原因由环境子页自己报。
+  useEffect(() => {
+    if (requestedEnvironments.current || environments.length > 0 || loadingEnvironments) return
+    requestedEnvironments.current = true
+    refreshEnvironments()
+  }, [environments.length, loadingEnvironments, refreshEnvironments])
 
   useEffect(() => { if (notice !== undefined && notice !== '') setToast({ text: notice, seq: Date.now() }) }, [notice])
   // 落地即体检：这一页存在的意义就是这份报告，但只在没有报告时自动跑一次。
   useEffect(() => { if (report === undefined) diagnose() }, [diagnose, report])
+  // 报告换了环境就丢掉属于上一份报告的局部状态（展开的发现、待确认的修复）。
+  // 诊断目标不同 = 事实不同，沿用上一份的交互状态是跨环境串味。
+  const reportEnvironment = report?.environment
+  useEffect(() => {
+    setOpenIds(new Set())
+    setOpenGroups(new Set())
+    setConfirmingId(undefined)
+  }, [reportEnvironment])
+
+  // 分组视图：host 把同层同码同级的命中折成组，这里按**契约字段**把条目分回组里
+  // （issueInGroup 不重算组键）。落不进任何组的发现进"未归入任何组"，一条都不丢。
+  // 组的折叠状态默认收起：163 条同类命中先看到一行，而不是 163 行。
+  const { buckets, rest } = useMemo(() => {
+    if (groups.length === 0) return { buckets: [] as IssueBucket[], rest: [] as DiagnosticIssue[] }
+    const claimed = new Set<string>()
+    const list = groups.map((group): IssueBucket => ({
+      group,
+      items: issues.filter((issue) => {
+        if (claimed.has(issue.id) || !issueInGroup(issue, group)) return false
+        claimed.add(issue.id)
+        return true
+      }),
+    }))
+    return { buckets: list, rest: issues.filter(issue => !claimed.has(issue.id)) }
+  }, [groups, issues])
+
+  const toggleIssue = (id: string): void => {
+    setOpenIds((previous) => {
+      const next = new Set(previous)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+  const toggleGroup = (key: string): void => {
+    setOpenGroups((previous) => {
+      const next = new Set(previous)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
+  const renderIssue = (issue: DiagnosticIssue) => (
+    <IssueRow
+      key={issue.id}
+      t={t}
+      issue={issue}
+      open={openIds.has(issue.id)}
+      confirming={confirmingId === issue.id}
+      fixing={fixingId === issue.id}
+      busy={fixingId !== undefined}
+      foreign={foreign}
+      onToggle={() => { toggleIssue(issue.id) }}
+      onFix={() => { setConfirmingId(undefined); fix(issue) }}
+      onConfirm={() => { setConfirmingId(issue.id) }}
+    />
+  )
 
   return (
     <section className={css.section}>
@@ -199,7 +416,32 @@ function HealthPanel({ t, useHealth, diagnose, fix }: HealthPanelProps) {
         </Button>
       </div>
       <p className={css.hint}>{t('health.intro')}</p>
-      {error === undefined ? null : <p className={css.error} role="status">{t('health.failed', { message: error })}</p>}
+      <div className={css.fieldRow}>
+        <span className={css.metaLabel}>{t('health.target')}</span>
+        <PmSelect
+          label={t('health.target')}
+          placeholder={t('env.selectEnv')}
+          value={target ?? current ?? ''}
+          options={environmentOptions}
+          onChange={(id) => {
+            // 选中当前环境即回到默认语义（undefined），这样"当前环境"只有一个表示法。
+            setDiagnosticTarget(id === current ? undefined : id)
+          }}
+        />
+        {foreign ? <Tag tone="warning">{t('health.foreignTag')}</Tag> : null}
+      </div>
+      <p className={css.hint}>{t('health.targetHint')}</p>
+      {foreign ? (
+        <div className={css.capabilities} role="status">
+          <span className={css.metaLabel}>{t('health.foreignTitle', { name: target ?? '' })}</span>
+          <p className={css.hint}>{t('health.foreignBody')}</p>
+        </div>
+      ) : null}
+      {error === undefined && errorKey === undefined ? null : (
+        <p className={css.error} role="status">
+          {t('health.failed', { message: errorKey === undefined ? error ?? '' : t(errorKey) })}
+        </p>
+      )}
       {capabilities === undefined || capabilities.missing.length === 0 ? null : (
         <div className={css.capabilities} role="status">
           <span className={css.metaLabel}>{t('health.capabilities')}</span>
@@ -218,13 +460,17 @@ function HealthPanel({ t, useHealth, diagnose, fix }: HealthPanelProps) {
               </Tooltip>
               <span className={css.score}>{score}</span>
               <span className={css.scoreMeta}>
-                <span>{t('health.environment', { name: report.environment })}</span>
+                <span>
+                  {t('health.environment', { name: report.environment })}
+                  {report.environment === current ? '' : ` · ${t('health.foreignTag')}`}
+                </span>
                 <span>{t('health.generatedAt', { at: formatRelative(t, report.generatedAt) })}</span>
               </span>
             </div>
             <div className={css.layerGrid}>
               {LAYER_ORDER.map((layer) => {
-                const count = report.counts[layer]
+                // 计数缺失按 0 显示：这一格只是总览，不该让缺一个字段的载荷毁掉整页。
+                const count = report.counts[layer] ?? 0
                 return (
                   <div key={layer} className={css.layerCell}>
                     <span className={css.layerName}>{t(LAYER_LABEL[layer])}</span>
@@ -234,85 +480,54 @@ function HealthPanel({ t, useHealth, diagnose, fix }: HealthPanelProps) {
               })}
             </div>
             {issues.length === 0 ? <p className={css.ok} role="status">{t('health.empty')}</p> : null}
-            <ul className={css.issues}>
-              {issues.map((issue) => {
-                const open = openIds.has(issue.id)
-                const confirming = confirmingId === issue.id
-                const fixing = fixingId === issue.id
-                return (
-                  <li key={issue.id} className={css.issue}>
+            {groups.length === 0 ? (
+              <ul className={css.issues}>{issues.map(renderIssue)}</ul>
+            ) : (
+              <>
+                <p className={css.hint} role="status">
+                  {t('health.grouped', { groups: groups.length, count: issues.length })}
+                </p>
+                {buckets.map(bucket => (
+                  <section key={bucket.group.key} className={css.group}>
                     <DisclosureRow
-                      icon={SEVERITY_ICON[issue.severity]}
-                      title={issue.title}
-                      open={open}
+                      icon={SEVERITY_ICON[bucket.group.severity] ?? <IconInfoOutline14 />}
+                      title={bucket.group.exampleTitle ?? bucket.group.code}
+                      open={openGroups.has(bucket.group.key)}
                       expandable
                       expandOnRowClick
-                      onToggle={() => {
-                        setOpenIds((previous) => {
-                          const next = new Set(previous)
-                          if (next.has(issue.id)) next.delete(issue.id)
-                          else next.add(issue.id)
-                          return next
-                        })
-                      }}
+                      onToggle={() => { toggleGroup(bucket.group.key) }}
                       collapsedContent={(
                         <span className={css.issueMeta}>
-                          <Tag tone={SEVERITY_TONE[issue.severity]}>{t(SEVERITY_LABEL[issue.severity])}</Tag>
-                          <Tag tone="quiet">{t(LAYER_LABEL[issue.layer])}</Tag>
-                          <code className={css.issueCode}>{issue.code}</code>
+                          <Tag tone="warning">{t('health.groupCount', { count: bucket.items.length })}</Tag>
+                          <Tag tone={severityToneOf(bucket.group.severity)}>
+                            {t(severityLabelKey(bucket.group.severity) ?? 'severity.report-only')}
+                          </Tag>
+                          <code className={css.issueCode}>{bucket.group.code}</code>
+                          {bucket.group.scopes.slice(0, MAX_SCOPE_TAGS).map(entry => (
+                            <Tag key={entry.scope} tone="neutral">{entry.scope}</Tag>
+                          ))}
+                          {bucket.group.scopes.length <= MAX_SCOPE_TAGS ? null : (
+                            <Tooltip label={bucket.group.scopes.map(entry => entry.scope).join(' · ')}>
+                              <span className={css.metaLabel}>
+                                {t('health.groupMoreScopes', { count: bucket.group.scopes.length - MAX_SCOPE_TAGS })}
+                              </span>
+                            </Tooltip>
+                          )}
                         </span>
                       )}
                     >
-                      <div className={css.issueBody}>
-                        <p className={css.issueDetail}>{issue.detail}</p>
-                        {issue.subjects.length === 0 ? null : (
-                          <p className={css.subjects}>
-                            <span className={css.metaLabel}>{t('health.subjects')}</span>
-                            {issue.subjects.map(subject => <Tag key={subject} tone="neutral">{subject}</Tag>)}
-                          </p>
-                        )}
-                        <div className={css.evidenceBlock}>
-                          <span className={css.metaLabel}>{t('health.evidence')}</span>
-                          <ul className={css.evidence}>
-                            {issue.evidence.map((item, index) => (
-                              <li key={`${issue.id}-${String(index)}`} className={css.evidenceRow}>
-                                <Tag tone="quiet">{EVIDENCE_KIND[item.kind]}</Tag>
-                                <code className={css.evidenceAt}>{item.at}</code>
-                                <span className={css.evidenceNote}>{item.note}</span>
-                              </li>
-                            ))}
-                          </ul>
-                        </div>
-                        <div className={css.issueActions}>
-                          {issue.fix === undefined ? <Tag tone="quiet">{t('health.reportOnly')}</Tag> : (
-                            <Button
-                              variant={issue.severity === 'safe-fix' ? 'primary' : 'outline'}
-                              size="sm"
-                              disabled={fixing || fixingId !== undefined}
-                              title={issue.fix.summary}
-                              onClick={() => {
-                                if (issue.severity === 'safe-fix' || confirming) {
-                                  setConfirmingId(undefined)
-                                  fix(issue)
-                                  return
-                                }
-                                setConfirmingId(issue.id)
-                              }}
-                            >
-                              {fixing
-                                ? t('health.fixing')
-                                : issue.severity === 'safe-fix'
-                                  ? t('health.fixSafe')
-                                  : confirming ? t('common.confirm') : t('health.fixConfirm')}
-                            </Button>
-                          )}
-                        </div>
-                      </div>
+                      <ul className={css.issues}>{bucket.items.map(renderIssue)}</ul>
                     </DisclosureRow>
-                  </li>
-                )
-              })}
-            </ul>
+                  </section>
+                ))}
+                {rest.length === 0 ? null : (
+                  <details className={css.jsonDetails}>
+                    <summary className={css.jsonSummary}>{t('health.groupRest', { count: rest.length })}</summary>
+                    <ul className={css.issues}>{rest.map(renderIssue)}</ul>
+                  </details>
+                )}
+              </>
+            )}
             {report.skipped.length === 0 ? null : (
               <div className={css.skipped}>
                 <span className={css.metaLabel}>{t('health.skipped')}</span>
@@ -394,6 +609,7 @@ function EnvironmentsPanel({ t, useEnvironments, actions }: EnvironmentsPanelPro
   const loading = useEnvironments(state => state.loading)
   const busy = useEnvironments(state => state.busy)
   const error = useEnvironments(state => state.error)
+  const errorKey = useEnvironments(state => state.errorKey)
   const notice = useEnvironments(state => state.notice)
   const backup = useEnvironments(state => state.backup)
   const diff = useEnvironments(state => state.diff)
@@ -461,7 +677,12 @@ function EnvironmentsPanel({ t, useEnvironments, actions }: EnvironmentsPanelPro
       </div>
       <p className={css.hint}>{t('env.intro')}</p>
       {busy === undefined ? null : <p className={css.hint} role="status">{t('env.busy', { name: busy })}</p>}
-      {error === undefined ? null : <p className={css.error} role="status">{t('env.failed', { message: error })}</p>}
+      {error === undefined && errorKey === undefined ? null : (
+        <p className={css.error} role="status">
+          {t('env.failed', { message: errorKey === undefined ? error ?? '' : t(errorKey) })}
+        </p>
+      )}
+      {environments.length === 0 && loading ? <p className={css.hint} role="status">{t('common.loading')}</p> : null}
       {environments.length === 0 && !loading ? <p className={css.hint}>{t('env.empty')}</p> : null}
       <ul className={css.envList}>
         {environments.map((environment) => {
@@ -854,16 +1075,28 @@ export function ConfigPanel({ t, useConfig, actions }: ConfigPanelProps) {
   const writable = useConfig(state => state.writable)
   const value = useConfig(state => state.value)
   const draft = useConfig(state => state.draft)
+  const incomplete = useConfig(state => state.incomplete)
   const dirty = useConfig(state => state.dirty)
   const saving = useConfig(state => state.saving)
   const failed = useConfig(state => state.failed)
   const saved = useConfig(state => state.saved)
 
-  if (status === 'unavailable' || draft === undefined) {
+  // 三种状态都必须是"能读的界面"：官方宿主的 settings 快照可能尚在加载、可能没有这个
+  // 命名空间、也可能只给出残缺文档。draft 是归一后的值（见 shared.ts 的 ConfigController），
+  // 所以下面表单里的每个字段都一定有确定值——这一页永远不会渲染成空白。
+  if (status === 'unavailable') {
     return (
       <section className={css.section}>
         <h3 className={css.sectionTitle}>{t('config.title')}</h3>
         <p className={css.hint} role="status">{t('config.unavailable')}</p>
+      </section>
+    )
+  }
+  if (draft === undefined) {
+    return (
+      <section className={css.section}>
+        <h3 className={css.sectionTitle}>{t('config.title')}</h3>
+        <p className={css.hint} role="status">{t('config.loading')}</p>
       </section>
     )
   }
@@ -872,17 +1105,23 @@ export function ConfigPanel({ t, useConfig, actions }: ConfigPanelProps) {
     <section className={css.section}>
       <h3 className={css.sectionTitle}>{t('config.title')}</h3>
       <p className={css.hint}>{t('config.intro')}</p>
+      {incomplete ? <p className={css.warn} role="status">{t('config.incomplete')}</p> : null}
       {writable ? null : <p className={css.warn} role="status">{t('config.readOnly')}</p>}
       {failed ? <p className={css.error} role="status">{t('config.saveFailed')}</p> : null}
 
       <fieldset className={css.group} disabled={!writable}>
         <legend className={css.groupTitle}>{t('config.qualityGate')}</legend>
-        <Switch
-          checked={draft.qualityGate.enabled}
-          label={t('config.qualityGate.enabled')}
-          title={t('config.qualityGate.enabledHint')}
-          onChange={(next) => { actions.editConfigField(['qualityGate', 'enabled'], next) }}
-        />
+        {/* 官方 Switch 只画开关本体，可见标签由调用方给（ui-primitives/Switch.tsx 的契约），
+            所以每一行都要自带 label——否则用户看到一排无法分辨的拨杆。 */}
+        <div className={css.fieldRow}>
+          <span className={css.metaLabel}>{t('config.qualityGate.enabled')}</span>
+          <Switch
+            checked={draft.qualityGate.enabled}
+            label={t('config.qualityGate.enabled')}
+            title={t('config.qualityGate.enabledHint')}
+            onChange={(next) => { actions.editConfigField(['qualityGate', 'enabled'], next) }}
+          />
+        </div>
         <div className={css.fieldRow}>
           <span className={css.metaLabel}>{t('config.qualityGate.mode')}</span>
           <PmSelect
@@ -902,22 +1141,27 @@ export function ConfigPanel({ t, useConfig, actions }: ConfigPanelProps) {
         <legend className={css.groupTitle}>{t('config.diagnostics')}</legend>
         <p className={css.hint}>{t('config.diagnostics.hint')}</p>
         {LAYER_ORDER.map((layer) => (
-          <Switch
-            key={layer}
-            checked={draft.diagnostics[layer]}
-            label={t(DIAGNOSTIC_LABEL[layer])}
-            onChange={(next) => { actions.editConfigField(['diagnostics', layer], next) }}
-          />
+          <div key={layer} className={css.fieldRow}>
+            <span className={css.metaLabel}>{t(DIAGNOSTIC_LABEL[layer])}</span>
+            <Switch
+              checked={draft.diagnostics[layer]}
+              label={t(DIAGNOSTIC_LABEL[layer])}
+              onChange={(next) => { actions.editConfigField(['diagnostics', layer], next) }}
+            />
+          </div>
         ))}
       </fieldset>
 
       <fieldset className={css.group} disabled={!writable}>
         <legend className={css.groupTitle}>{t('config.marketplace')}</legend>
-        <Switch
-          checked={draft.marketplace.enabled}
-          label={t('config.marketplace.enabled')}
-          onChange={(next) => { actions.editConfigField(['marketplace', 'enabled'], next) }}
-        />
+        <div className={css.fieldRow}>
+          <span className={css.metaLabel}>{t('config.marketplace.enabled')}</span>
+          <Switch
+            checked={draft.marketplace.enabled}
+            label={t('config.marketplace.enabled')}
+            onChange={(next) => { actions.editConfigField(['marketplace', 'enabled'], next) }}
+          />
+        </div>
         <div className={css.fieldRow}>
           <span className={css.metaLabel}>{t('config.marketplace.cacheTtlMinutes')}</span>
           <Input
@@ -931,6 +1175,36 @@ export function ConfigPanel({ t, useConfig, actions }: ConfigPanelProps) {
               if (Number.isFinite(next) && next >= 1) actions.editConfigField(['marketplace', 'cacheTtlMinutes'], next)
             }}
           />
+        </div>
+        <div className={css.fieldRow}>
+          <span className={css.metaLabel}>{t('config.marketplace.timeoutMs')}</span>
+          <Input
+            type="number"
+            min={1000}
+            max={120000}
+            step={1000}
+            value={String(draft.marketplace.timeoutMs)}
+            aria-label={t('config.marketplace.timeoutMs')}
+            onChange={(event) => {
+              const next = Number(event.target.value)
+              // 与官方 schema 同界（src/settings.ts: 1000..120000）：界面先挡一次，
+              // 免得用户敲一个会被 settings 服务拒绝的值而只看到"保存失败"。
+              if (Number.isFinite(next) && next >= 1_000 && next <= 120_000) {
+                actions.editConfigField(['marketplace', 'timeoutMs'], next)
+              }
+            }}
+          />
+        </div>
+        <div className={css.field}>
+          <span className={css.metaLabel}>{t('config.marketplace.indexUrl')}</span>
+          <Input
+            type="text"
+            value={draft.marketplace.indexUrl}
+            placeholder={t('config.marketplace.indexUrlPlaceholder')}
+            aria-label={t('config.marketplace.indexUrl')}
+            onChange={(event) => { actions.editConfigField(['marketplace', 'indexUrl'], event.target.value) }}
+          />
+          <span className={css.hint}>{t('config.marketplace.indexUrlHint')}</span>
         </div>
       </fieldset>
 

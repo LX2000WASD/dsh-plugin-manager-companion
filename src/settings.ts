@@ -147,17 +147,42 @@ export interface ConfigHandle {
  * @param ctx - 本插件的 host 上下文。
  * @returns 配置句柄；官方 settings 服务不可用时返回默认配置的只读句柄。
  */
+/**
+ * 官方 settings 服务尚不可用时的**只读**降级句柄。
+ *
+ * 为什么需要它：settings 服务可能**晚于**本插件装配（服务挂载顺序不保证），
+ * 而配置句柄会被各模块长期持有。装配层先拿这个，等服务出现再换成真句柄。
+ *
+ * `update` 刻意**抛错**而不是静默返回默认值——静默丢写是最糟的失败形态：
+ * 用户改了配置、界面回显成功、实际什么都没发生（实测踩过，见 CONTEXT.md）。
+ *
+ * @returns 只读句柄；任何写入尝试都抛出可读错误。
+ */
+export function fallbackConfigHandle(): ConfigHandle {
+  return {
+    current: () => DEFAULT_CONFIG,
+    watch: () => () => {},
+    update: () => Promise.reject(new Error(
+      '配置服务（settings）尚未就绪；写入被拒绝而不是丢弃——请稍后重试',
+    )),
+  }
+}
+
+/**
+ * 注册本插件的 settings 命名空间。
+ *
+ * **调用方必须保证 ctx 上 settings 已可用**（装配层用 ctx.inject(['settings'], …) 保证）。
+ * 这里保留缺失分支只为防御：真的走到它说明装配层接线错了，此时给只读句柄并记日志，
+ * 而不是让整个插件装配失败。
+ *
+ * @param ctx - settings 服务已就绪的上下文。
+ * @returns 配置句柄。
+ */
 export function registerConfig(ctx: Context): ConfigHandle {
   const settings = ctx.get('settings')
   if (settings === undefined) {
-    // 无 settings 服务（例如极简宿主）：用默认配置继续，功能可用性由各能力
-    // 自己探测。这里绝不抛错——插件必须能在任何宿主上加载。
-    ctx.logger?.info?.('plugin-manager-companion: settings service unavailable, using defaults')
-    return {
-      current: () => DEFAULT_CONFIG,
-      watch: () => () => {},
-      update: async () => DEFAULT_CONFIG,
-    }
+    ctx.logger?.warn?.('plugin-manager-companion: settings 服务未就绪，配置降级为只读——装配层应改用 ctx.inject(["settings"])')
+    return fallbackConfigHandle()
   }
   const scope = settings.register(SETTINGS_NAMESPACE, ConfigSchema)
   return {

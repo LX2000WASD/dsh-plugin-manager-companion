@@ -25,7 +25,7 @@ import { findPluginMatches } from "./match.ts"
 import { registerGuard } from "./guard.ts"
 import { registerCompanionTools } from "./tools.ts"
 import { BODY_LIMIT_DEFAULT, JobRegistry, ROUTE_PREFIX, isJsonPost, isTrustedRequest, readJsonBody, sendJson, type Envelope } from "./rest.ts"
-import { registerConfig, type CompanionConfig, type ConfigHandle } from "./settings.ts"
+import { fallbackConfigHandle, registerConfig, type CompanionConfig, type ConfigHandle } from "./settings.ts"
 import type { DiagnosticLayer, DiagnosticReport, EnvironmentInfo, EnvironmentResult, GatedInstallResult, KindListResult, MarketplaceResult } from "./types.ts"
 import type { IncomingMessage, ServerResponse } from "node:http"
 
@@ -102,7 +102,9 @@ export async function gatedInstall(
   const targetName = environmentName ?? runtime?.capabilities.environmentName ?? ""
   let gate
   try {
-    gate = await inspectPackage(pathEnvironmentDir(targetName), packageName, config)
+    // 传 ctx：质量门据此拿官方 installAnchor 作为解析根。
+    // 不传的话官方 peer 与 bundle 行会被判成缺包——实测踩过（173 条误报的同一根因）。
+    gate = await inspectPackage(pathEnvironmentDir(targetName), packageName, config, ctx)
   } catch (error) {
     // 扫描本身失败时不放行：宁可回滚也不让未经校验的包留在环境里。
     await manager.removeBundle(packageName)
@@ -164,6 +166,24 @@ function currentEnvironment(deps: OpDependencies): EnvironmentInfo | undefined {
  * @param deps - 依赖。
  * @returns 分析目标。
  */
+/**
+ * 解析一次诊断的目标环境。
+ *
+ * 指定了名字就在环境列表里找它——找不到时**报错**而不是悄悄退回当前环境：
+ * 用户以为在诊断 A 环境、实际诊断的是 B，是最糟的一类静默错误。
+ *
+ * @param deps - 依赖。
+ * @param name - 请求的环境名；省略即当前环境。
+ * @returns 诊断目标。
+ * @throws {Error} 指定的环境不存在时。
+ */
+function targetEnvironment(deps: OpDependencies, name: string | undefined): EnvironmentInfo {
+  if (name === undefined || name.length === 0) return analysisTarget(deps)
+  const found = listEnvironments(deps.ctx).find(env => env.name === name)
+  if (found === undefined) throw new Error(`环境不存在：${name}`)
+  return found
+}
+
 function analysisTarget(deps: OpDependencies): EnvironmentInfo {
   return currentEnvironment(deps) ?? {
     name: "", dir: "", current: true, builtin: false,
@@ -197,6 +217,10 @@ export async function handleOp(
 
 async function dispatch(op: string, body: Record<string, unknown>, deps: OpDependencies): Promise<unknown> {
   const config = deps.config()
+  // 长操作一律走这个包装：REST 契约规定首包是 `{ jobId }`，不是裸 id。
+  // （裸 id 会让客户端把它当成结果——实测导致体检页把字符串当报告读，整页崩空白）
+  const asJob = (task: () => Promise<unknown>): { readonly jobId: string } =>
+    ({ jobId: deps.jobs.start(task) })
   switch (op) {
     case "capabilities":
       return { capabilities: deps.capabilities(), config }
@@ -210,12 +234,18 @@ async function dispatch(op: string, body: Record<string, unknown>, deps: OpDepen
       return await deps.configUpdate(patch as Partial<CompanionConfig>)
     }
 
-    case "diagnose":
-      return await deps.jobs.start(async () =>
-        await analyzeEnvironment(deps.ctx, analysisTarget(deps), config))
+    case "diagnose": {
+      // 诊断目标可指定环境：用户要的是"对当前环境做到极致，再用同一能力管理其他环境"。
+      // 省略时诊断当前环境；指定时用同一引擎、同一配置，只是换一个 EnvironmentInfo。
+      // 注意：官方 pluginManager Remote 只覆盖**当前**环境，所以对其他环境的写操作走 fix 的
+      // needs-manual / operations 路径——诊断本身与作用域无关，可以放心跨环境。
+      const requested = typeof body["environment"] === "string" ? body["environment"] : undefined
+      return asJob(async () =>
+        await analyzeEnvironment(deps.ctx, targetEnvironment(deps, requested), config))
+    }
 
     case "install":
-      return await deps.jobs.start(async () =>
+      return asJob(async () =>
         await gatedInstall(deps.ctx, config, requireString(body, "spec"),
           typeof body["environment"] === "string" ? body["environment"] : undefined))
 
@@ -244,7 +274,7 @@ async function dispatch(op: string, body: Record<string, unknown>, deps: OpDepen
     case "copyPlugins": {
       const names = body["names"]
       if (!Array.isArray(names)) throw new Error("字段 names 必须是数组")
-      return await deps.jobs.start(async () => await copyPlugins(
+      return asJob(async () => await copyPlugins(
         requireString(body, "from"), requireString(body, "to"), names.map(String),
       ))
     }
@@ -256,7 +286,7 @@ async function dispatch(op: string, body: Record<string, unknown>, deps: OpDepen
       return backupDiff(body["backup"] as never, requireString(body, "target"))
 
     case "backupRestore":
-      return await deps.jobs.start(async () =>
+      return asJob(async () =>
         await backupRestore(body["backup"] as never, requireString(body, "target")))
 
     case "marketplace": {
@@ -296,7 +326,7 @@ async function dispatch(op: string, body: Record<string, unknown>, deps: OpDepen
     }
 
     case "uninstallKind":
-      return await deps.jobs.start(async () => {
+      return asJob(async () => {
         const repo = requireString(body, "repo")
         const records = await loadKindRecords()
         const record = records.get(repo)
@@ -312,7 +342,7 @@ async function dispatch(op: string, body: Record<string, unknown>, deps: OpDepen
     case "fix": {
       const action = requireString(body, "action")
       const target = typeof body["target"] === "string" ? body["target"] : undefined
-      return await deps.jobs.start(async () => await applyFix(action, target, {
+      return asJob(async () => await applyFix(action, target, {
         ctx: deps.ctx,
         environmentName: () => deps.capabilities().environmentName,
         install: async (spec) => await gatedInstall(deps.ctx, config, spec),
@@ -376,8 +406,19 @@ export function registerRoutes(ctx: Context, deps: OpDependencies): (() => void)
  */
 export function apply(ctx: Context): void {
   const capabilities = probeOfficialCapabilities(ctx)
-  const config = registerConfig(ctx)
   const jobs = new JobRegistry()
+
+  // 配置句柄先用只读降级版：settings 服务可能晚于本插件装配（挂载顺序不保证）。
+  // 实测踩过 ctx.get("settings") 在 apply 时取不到就**永久降级**——descriptor 里永远
+  // 不出现本命名空间、写入被静默丢弃。改用 ctx.inject 等服务就绪再注册。
+  let config: ConfigHandle = fallbackConfigHandle()
+  ctx.inject(['settings'], (settingsCtx: Context) => {
+    settingsCtx.effect(() => {
+      config = registerConfig(settingsCtx)
+      return () => { config = fallbackConfigHandle() }
+    }, 'plugin-manager-companion: settings namespace')
+  })
+
   runtime = { capabilities, config, jobs }
 
   // 能力缺失如实记账，不假装健康：诊断页会把这些原因直接呈现给用户。

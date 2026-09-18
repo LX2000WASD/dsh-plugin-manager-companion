@@ -109,7 +109,17 @@ export interface DiagnosticIssue {
   readonly evidence: readonly DiagnosticEvidence[]
   /** 可执行的修复；`report-only` 时为 undefined。 */
   readonly fix?: DiagnosticFix
+  /** 归属包名；无法归属时为空串。 */
+  readonly scope?: string
 }
+
+/**
+ * 一条发现的作用域：它归属哪个包。
+ *
+ * 用于把同一 code 的大量命中聚合成可折叠的组——干净环境不该出现，但真出问题时
+ * 163 条同类命中必须能被读懂。缺省为空串（无法归属时）。
+ * @deprecated 用 DiagnosticIssue.scope（每条发现自带）。
+ */
 
 /** 一条证据：指回文件行或运行时对象。 */
 export interface DiagnosticEvidence {
@@ -118,6 +128,34 @@ export interface DiagnosticEvidence {
   readonly at: string
   /** 说明这条证据证明了什么。 */
   readonly note: string
+}
+
+/**
+ * 一组同类发现的聚合视图。
+ *
+ * 设计意图：逐条 `issues` **一条不少**（证据与行号都留着），`groups` 只提供
+ * 可折叠的计数与来源说明——折了信息但不丢信息。界面默认展开组、按需下钻到条目。
+ */
+export interface DiagnosticGroup {
+  /** 稳定组键：层级 + 类别 + 严重级别 + 作用域。 */
+  readonly key: string
+  readonly layer: DiagnosticLayer
+  readonly code: string
+  readonly severity: DiagnosticSeverity
+  /** 该组的命中条数。 */
+  readonly count: number
+  /** 组内命中的包及各自条数（判定不出归属的发现不计入）。 */
+  readonly scopes: readonly DiagnosticScopeCount[]
+  /** 组内涉及的对象（去重、有上限）。 */
+  readonly subjects: readonly string[]
+  /** 组内第一条的标题，供折叠态展示。 */
+  readonly exampleTitle?: string
+}
+
+/** 一个作用域在某一组里的命中条数。 */
+export interface DiagnosticScopeCount {
+  readonly scope: string
+  readonly count: number
 }
 
 /** 一次完整诊断的结果。 */
@@ -129,6 +167,12 @@ export interface DiagnosticReport {
   /** 各层的问题数，便于 UI 直接渲染总览。 */
   readonly counts: Readonly<Record<DiagnosticLayer, number>>
   readonly issues: readonly DiagnosticIssue[]
+  /**
+   * 同类发现的聚合组（层级+类别+严重级别+作用域）。
+   *
+   * 各组 `count` 之和恒等于 `issues.length`——折了信息但不丢信息。
+   */
+  readonly groups?: readonly DiagnosticGroup[]
   /** 诊断过程中跳过的检查及原因（能力缺失时如实告知，不假装健康）。 */
   readonly skipped: readonly DiagnosticSkip[]
 }

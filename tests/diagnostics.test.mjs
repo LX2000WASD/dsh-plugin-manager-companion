@@ -11,12 +11,18 @@ import assert from 'node:assert/strict'
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { analyzeEnvironment, scanCode, tokenize, locatePatchRows } from '../dist/diagnostics.js'
+import {
+  analyzeEnvironment, installAnchorRoots, installedPackageDir, scanCode, specifierResolves,
+  tokenize, locatePatchRows,
+} from '../dist/diagnostics.js'
 
 let home
 let envDir
 let patchPath
 let brokenDir
+let installDir
+let installAnchor
+let reverseDir
 
 /** 写 JSON 文件（自动建目录）。 */
 async function writeJson(file, value) {
@@ -73,7 +79,12 @@ function loaderEntry(id, name, state, disabled = false) {
   return { id, options: { name }, disabled, fiber: { state } }
 }
 
-const ENV = () => ({
+/**
+ * demo 环境。installAnchor 省略即 launcher 没给锚点的降级形态（要记 skipped，不静默判缺包）。
+ * @param installAnchor - dsh 应用包的 package.json 路径。
+ * @returns EnvironmentInfo（带或不带锚点）。
+ */
+const ENV = (installAnchor) => ({
   name: 'demo',
   dir: envDir,
   current: false,
@@ -81,6 +92,7 @@ const ENV = () => ({
   bundles: [],
   dependencies: ['p1', 'p2', '@deepseek-ai/cordis'],
   runs: [],
+  ...(installAnchor === undefined ? {} : { installAnchor }),
 })
 
 const CONFIG = {
@@ -150,6 +162,36 @@ before(async () => {
     '    - id: disabled-row',
     '      name: gamma-pkg',
     '      disabled: true',
+    '',
+  ].join('\n'))
+
+  // 安装锚点：官方包与 bundle 本体由**安装侧**提供，profile 的 node_modules 里没有它们。
+  // 只有把它纳入解析根，这些行才不会被判成孤儿（实测干净环境 163 条 orphan-row 全是这么来的）。
+  installDir = join(home, 'runtime', 'node_modules', '@deepseek-ai', 'dsh')
+  installAnchor = join(installDir, 'package.json')
+  await writeJson(installAnchor, { name: '@deepseek-ai/dsh', version: '0.1.6-alpha.2' })
+  await writeJson(join(home, 'runtime', 'node_modules', '@deepseek-ai', 'dsh-base', 'package.json'),
+    { name: '@deepseek-ai/dsh-base', version: '0.1.6-alpha.2' })
+  await writeText(join(home, 'runtime', 'node_modules', '@deepseek-ai', 'official-lib', 'sub.js'),
+    'export const sub = 1\n')
+  await writeJson(join(home, 'runtime', 'node_modules', '@deepseek-ai', 'official-lib', 'package.json'),
+    { name: '@deepseek-ai/official-lib', version: '1.0.0' })
+
+  // 反向证明用的 profile：patch 引用安装锚点里也没有的包 —— 该报的必须照样报。
+  reverseDir = join(profiles, 'reverse')
+  await writeJson(join(reverseDir, 'package.json'), {
+    name: 'dsh-profile-reverse', private: true, dependencies: { p1: '1.0.0' },
+    dsh: { profile: { bundles: [] } },
+  })
+  // p1 与它的依赖声明都在这个 profile 里 -> 必须解析得到（用来证明反向用例不是无差别报错）
+  await writeJson(join(reverseDir, 'node_modules', 'p1', 'package.json'),
+    { name: 'p1', version: '1.0.0' })
+  await writeText(join(reverseDir, 'cordis.patch.yml'), [
+    '- insert:',
+    '    - id: really-missing',
+    "      name: '@deepseek-ai/truly-not-installed'",
+    '    - id: profile-local',
+    '      name: p1',
     '',
   ].join('\n'))
 })
@@ -323,6 +365,83 @@ describe('diagnostics · 五层诊断', () => {
       assert.ok(issue.detail.length > 10, issue.code + ' 的 detail 太短')
       assert.ok(issue.evidence.length > 0, issue.code + ' 没有证据')
     }
+  })
+})
+
+
+describe('diagnostics · 安装锚点解析根（误报治理）', () => {
+  it('安装锚点解析根按官方口径取自 createRequire(anchor).resolve.paths', () => {
+    const roots = installAnchorRoots(installAnchor)
+    assert.ok(Array.isArray(roots) && roots.length > 0, '锚点应当解析出模块根：' + JSON.stringify(roots))
+    assert.ok(roots.includes(join(home, 'runtime', 'node_modules')),
+      '锚点自己的 node_modules 必须在解析根里：' + JSON.stringify(roots))
+    assert.ok(roots.every(root => root.endsWith('node_modules')), '解析根只保留 node_modules 位置')
+    assert.equal(installAnchorRoots(join(home, 'runtime', 'no-such-package.json')), null,
+      '锚点不存在时必须如实返回 null，不能假装解析成功')
+    assert.equal(installAnchorRoots(undefined), null, '没有锚点就是 null')
+  })
+
+  it('官方包（安装侧提供）不再被误报成孤儿、缺包、缺 peer', async () => {
+    const report = await analyzeEnvironment(makeCtx({ profileContext: {} }), ENV(installAnchor), CONFIG)
+    const orphans = report.issues.filter(issue => issue.code === 'orphan-row')
+    assert.deepEqual(orphans.map(issue => issue.subjects[0]), ['@org/not-installed'],
+      '只剩 fixture 里那个真正解析不到的包：' + JSON.stringify(report.issues.map(issue => issue.code)))
+    assert.deepEqual(report.issues.filter(issue => issue.code === 'undeclared-dependency'), [],
+      'bundles 里的官方包由安装侧提供，不该报 声明了但没装')
+    assert.deepEqual(report.issues.filter(issue => issue.code === 'missing-peer'), [],
+      'peer 由安装侧满足，不该报缺失')
+    assert.ok(installedPackageDir(envDir, '@deepseek-ai/dsh-base', installAnchor),
+      '安装侧的包必须能在解析根里找到')
+    assert.equal(specifierResolves(envDir, '@deepseek-ai/official-lib/sub', installAnchor), true,
+      '锚点里的包连同它的子路径都要解析得到')
+    assert.equal(specifierResolves(envDir, '@deepseek-ai/official-lib/sub', undefined), false,
+      '没有锚点时按 profile 解析：同一个说明符解析不到（这正是修前的误报根源）')
+  })
+
+  it('反向证明：锚点里真没有的包照样报 orphan-row（不是把检查做哑）', async () => {
+    const env = { name: 'reverse', dir: reverseDir, current: false, builtin: false, bundles: [], dependencies: ['p1'], runs: [], installAnchor }
+    const report = await analyzeEnvironment(makeCtx({ profileContext: {} }), env, CONFIG)
+    const orphans = report.issues.filter(issue => issue.code === 'orphan-row')
+    assert.equal(orphans.length, 1, '只该报真正解析不到的那一行：' + JSON.stringify(orphans.map(issue => issue.subjects)))
+    assert.ok(orphans[0].subjects.includes('@deepseek-ai/truly-not-installed'))
+    assert.match(orphans[0].detail, /安装锚点/, 'detail 要说清查过哪些解析根：' + orphans[0].detail)
+    assert.ok(!orphans.some(issue => issue.subjects.some(name => name === 'p1')),
+      'profile 本地能解析的行不该混进来')
+    assert.equal(orphans[0].fix.action, 'remove-row')
+  })
+
+  it('依赖闭包跨到安装锚点：loader 树上、却只由锚点提供的包不算"挂着但不在闭包里"', async () => {
+    const ctx = makeCtx({
+      profileContext: {},
+      loader: { entries: () => [loaderEntry('base-row', '@deepseek-ai/dsh-base', 2)] },
+    })
+    const report = await analyzeEnvironment(ctx, ENV(installAnchor), CONFIG)
+    assert.deepEqual(report.issues.filter(issue => issue.code === 'loaded-not-declared'), [],
+      '闭包必须能跨过安装锚点：' + JSON.stringify(report.issues.map(issue => issue.code)))
+    assert.ok(report.issues.every(issue => issue.code !== 'failed-fiber' && issue.code !== 'pending-fiber'),
+      '相位 2 = active，不该报 fiber 问题')
+  })
+
+  it('launcher 没给锚点时退回 profile 解析并如实记 skipped', async () => {
+    const report = await analyzeEnvironment(makeCtx({ profileContext: {} }), ENV(), CONFIG)
+    assert.ok(report.skipped.some(item => item.check === 'install-anchor'),
+      '省略锚点时必须记 skipped：' + JSON.stringify(report.skipped.map(item => item.check)))
+  })
+})
+
+describe('diagnostics · 噪声治理', () => {
+  it('同一 code 的同类命中给出可折叠的组（组计数之和等于逐条总数）', async () => {
+    const report = await analyzeEnvironment(makeCtx({ profileContext: {} }), ENV(installAnchor), CONFIG)
+    assert.ok(Array.isArray(report.groups), '报告必须带 groups（客户端据此折叠）')
+    const total = report.groups.reduce((sum, group) => sum + group.count, 0)
+    assert.equal(total, report.issues.length, '一条不少：组计数之和必须等于逐条总数')
+    const duplicate = report.groups.find(group => group.code === 'duplicate-row-id')
+    assert.ok(duplicate, '应有一个 duplicate-row-id 组：' + JSON.stringify(report.groups))
+    assert.equal(duplicate.count, 1)
+    assert.deepEqual(duplicate.scopes, [{ scope: 'dsh-profile-demo', count: 1 }],
+      '组要说明命中归属哪个包（demo profile 的 patch 与其 package.json 同目录）')
+    assert.ok(duplicate.key.startsWith('composition:duplicate-row-id:safe-fix:dsh-profile-demo'))
+    assert.ok(duplicate.exampleTitle.includes('alpha'), '组要带一条样例标题：' + duplicate.exampleTitle)
   })
 })
 

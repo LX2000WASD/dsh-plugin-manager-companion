@@ -8,7 +8,7 @@
 | op | 请求体 | 成功返回 | 长操作 |
 |---|---|---|---|
 | `capabilities` | `{}` | `{ capabilities, config }` | |
-| `diagnose` | `{ layers?: DiagnosticLayer[] }` | `DiagnosticReport` | job |
+| `diagnose` | `{ layers?: DiagnosticLayer[], environment?: string }` | `DiagnosticReport` | job |
 | `fix` | `{ action: string, target?: string }` | `FixOutcome` | job |
 | `install` | `{ spec: string, enable?: boolean, answers?: Record<string,string> }` | `GatedInstallResult` | job |
 | `listEnvironments` | `{}` | `EnvironmentInfo[]` | |
@@ -74,3 +74,25 @@ node_modules 实体、凭据、缓存都不进来——备份的价值是可重�
 `needs-manual` 目前覆盖两条：`remove-duplicate-row` 与 `remove-row`。它们要求改
 `cordis.patch.yml` 的**结构**（删行），而官方只有行级 `setPluginEnabled`，没有删行能力。
 我们自己写这个文件会引入"两个写者并发改同一份组合"——那正是本仓库要消除的事故形态。
+## `diagnose` 的诊断目标
+
+`environment` 省略即**当前环境**；指定则用同一引擎诊断该环境（用户要的"用同一能力管理其他环境"）。
+
+- 指定的环境不存在 → 返回 `operation-failed`，**绝不悄悄退回当前环境**：
+  用户以为在诊断 A、实际诊断 B，是最糟的一类静默错误。
+- 报告里的 `environment` 字段是**实际**被诊断的环境名。界面必须以它为准，
+  而不是请求时传的名字——界面要展示事实，不是展示意图。
+- 官方 `pluginManager` Remote 只覆盖**当前**环境。所以对其他环境的报告只做判断，
+  不提供一键修复（客户端据此把修复按钮收起来并说明理由）。
+
+## 长操作的首包形状（钉死）
+
+**所有** job 化的 op 首包一律是 `{ "jobId": "<id>" }`，不是裸 id 字符串。
+
+这条踩过坑：host 曾直接透传 `JobRegistry.start()` 的返回值（裸字符串），
+客户端按契约判形状后把字符串当成了最终结果，于是 `report.counts` 读字符串属性、
+整个体检页被官方 SlotErrorBoundary 接住渲染成**空白**。
+单测与 SSR 全绿也发现不了——只有真实浏览器能暴露（详见 docs/private/visual-audit.md）。
+
+客户端的 `runJob` 同时接受两种形状作为**防御**，但契约以 `{ jobId }` 为准，
+`tests/index.test.mjs` 的 `jobIdOf()` 刻意**不接受**裸字符串。

@@ -140,3 +140,9 @@
   display: flex;
   justify-content: flex-end;
 }
+
+/* 触底哨兵：零高度、不占位，只给 IntersectionObserver 一个可观察的位置。 */
+.sentinel {
+  flex: 1;
+  height: 0;
+}

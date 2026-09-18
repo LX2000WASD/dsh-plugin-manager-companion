@@ -80,6 +80,21 @@ function makeJobs() {
 }
 
 /** 等一个 job 落定。 */
+/**
+ * 从首包取 jobId。
+ *
+ * 契约（docs/REST-CONTRACT.md）：长操作的首包是 `{ jobId }`，**不是裸 id**。
+ * 这里刻意不接受裸字符串——测试要钉契约，而不是容忍漂移。
+ *
+ * @param started - 首包的值。
+ * @returns job id。
+ */
+function jobIdOf(started) {
+  assert.equal(typeof started, "object", "长操作首包必须是对象 { jobId }")
+  assert.equal(typeof started.jobId, "string", "首包必须带 string 类型的 jobId")
+  return started.jobId
+}
+
 async function settle(deps, id) {
   for (let i = 0; i < 200; i += 1) {
     const status = await handleOp("job", { id }, deps)
@@ -136,8 +151,8 @@ test('diagnose 是长操作：返回 jobId，随后可从 job op 取到报告', 
   const deps = makeDeps()
   const started = await handleOp("diagnose", {}, deps)
   assert.equal(started.ok, true)
-  assert.equal(typeof started.value, "string")
-  const settled = await settle(deps, started.value)
+  const jobId = jobIdOf(started.value)
+  const settled = await settle(deps, jobId)
   assert.equal(settled.error, undefined)
   const report = settled.result
   assert.equal(report.environment, "demo-env")
@@ -152,7 +167,7 @@ test('diagnose 是长操作：返回 jobId，随后可从 job op 取到报告', 
 test('诊断在官方能力缺失时如实记 skipped，不假装健康', async () => {
   const deps = makeDeps()
   const started = await handleOp("diagnose", {}, deps)
-  const settled = await settle(deps, started.value)
+  const settled = await settle(deps, jobIdOf(started.value))
   const report = settled.result
   // 本桩件的 capabilities 里 manager=false / inventory=false，运行时层必然跳过。
   assert.ok(report.skipped.length > 0, "能力缺失时必须有 skipped 记录")
@@ -163,8 +178,7 @@ test('fix op 走 job，并把 needs-manual 如实透出（不报成失败）', a
   const deps = makeDeps()
   const started = await handleOp("fix", { action: "remove-duplicate-row", target: "row-a" }, deps)
   assert.equal(started.ok, true)
-  assert.equal(typeof started.value, "string")
-  const settled = await settle(deps, started.value)
+  const settled = await settle(deps, jobIdOf(started.value))
   assert.equal(settled.error, undefined)
   assert.equal(settled.result.status, "needs-manual")
   assert.equal(settled.result.action, "remove-duplicate-row")
@@ -180,7 +194,7 @@ test('fix op 缺 action 时报错并指出字段名', async () => {
 test('fix op 对未知动作返回 failed 而不是静默成功', async () => {
   const deps = makeDeps()
   const started = await handleOp("fix", { action: "no-such-action" }, deps)
-  const settled = await settle(deps, started.value)
+  const settled = await settle(deps, jobIdOf(started.value))
   assert.equal(settled.result.status, "failed")
 })
 

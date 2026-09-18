@@ -11,6 +11,9 @@
  * 官方复用：安装流程本身由官方 Remote 编排（inspect → installBundle(enabled:false) → 本门 →
  *   removeBundle / setBundleEnabled），本模块只提供第 3 步的静态判定，不参与写路径。
  *   包入口解析、import 扫描、行号定位与 diagnostics.ts 共用同一套实现，避免两处口径漂移。
+ * 解析根：与诊断同源——profile 层 → 共享兜底层 → **安装锚点**（官方包与 bundle 本体由安装侧
+ *   提供，只看 profile 会把 peer 与 bundle 行全判成缺包）。installAnchor 省略时退回 profile 解析，
+ *   调用方应当把 ctx.get('profileContext').installAnchor 递进来。
  * 前提检查：旧前提是"装完只看一个入口就够"——实测不够（C-1）；旧实现还用自建 bash 探测
  *   patch 行名，现在改为读原始 patch 文本定位行 + Node 侧解析，不再自建第二套解析器。
  *
@@ -22,9 +25,10 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { isBuiltin } from 'node:module'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
+import type { Context } from '@deepseek-ai/cordis'
 import {
   OFFICIAL_DEP_ALLOWED, installedPackageDir, isLoaderProvided, locatePatchRows,
-  packageEntryFiles, scanPackage, specifierResolves,
+  packageEntryFiles, readInstallAnchor, scanPackage, specifierResolves,
 } from './diagnostics.ts'
 import type { CompanionConfig, QualityGateConfig } from './settings.ts'
 
@@ -60,13 +64,20 @@ export interface QualityGateResult {
  * @param envDir - profile 环境目录（解析锚点，也是包所在 node_modules 的父目录）。
  * @param packageName - 已安装的包名。
  * @param config - 本插件配置；同时接受 CompanionConfig 与单独的 qualityGate 段。
+ * @param ctxOrAnchor - host Context（从 ctx.get('profileContext') 取安装锚点），
+ *   或直接给 dsh 应用包的 package.json 路径；都不给时只按 profile 与共享兜底层解析，
+ *   安装侧提供的包会被判成缺包。
  * @returns 判定结果；问题为空即 ok。
  */
 export async function inspectPackage(
   envDir: string,
   packageName: string,
   config: CompanionConfig | QualityGateConfig,
+  ctxOrAnchor?: Context | string,
 ): Promise<QualityGateResult> {
+  const installAnchor = typeof ctxOrAnchor === 'string'
+    ? ctxOrAnchor
+    : ctxOrAnchor === undefined ? undefined : readInstallAnchor(ctxOrAnchor)
   const gate = normalizeQualityGateConfig(config)
   const issues: string[] = []
   const notes: string[] = []
@@ -82,7 +93,7 @@ export async function inspectPackage(
     return { ok: false, issues: ['包名不合法：' + JSON.stringify(packageName)], notes }
   }
 
-  const pkgDir = installedPackageDir(envDir, packageName)
+  const pkgDir = installedPackageDir(envDir, packageName, installAnchor)
   if (pkgDir === undefined) {
     return {
       ok: false,
@@ -138,14 +149,14 @@ export async function inspectPackage(
         + '挂载后必然 ERR_MODULE_NOT_FOUND（未声明依赖 pnpm 根本不会安装）。')
       continue
     }
-    if (!specifierResolves(pkgDir, spec) && !specifierResolves(envDir, spec)) {
+    if (!specifierResolves(pkgDir, spec, installAnchor) && !specifierResolves(envDir, spec, installAnchor)) {
       issues.push('声明了但没装：' + spec + '（声明于本包 package.json），'
         + '在 ' + at(hit.file, hit.line) + ' 被导入，但 profile 与共享兜底层里都解析不到它——'
         + '挂载后必然 ERR_MODULE_NOT_FOUND。')
     }
   }
 
-  issues.push(...bundleRowIssues(envDir, pkgDir, packageName))
+  issues.push(...bundleRowIssues(envDir, pkgDir, packageName, installAnchor))
   return { ok: issues.length === 0, issues, notes }
 }
 
@@ -159,9 +170,15 @@ export async function inspectPackage(
  * @param envDir - profile 环境目录（解析锚点）。
  * @param pkgDir - 包目录。
  * @param packageName - 包名。
+ * @param installAnchor - dsh 应用包的 package.json（解析根，见 inspectPackage）。
  * @returns 面向用户的问题清单（可能为空）。
  */
-function bundleRowIssues(envDir: string, pkgDir: string, packageName: string): string[] {
+function bundleRowIssues(
+  envDir: string,
+  pkgDir: string,
+  packageName: string,
+  installAnchor?: string,
+): string[] {
   const issues: string[] = []
   const manifest = readManifest(join(pkgDir, 'package.json'))
   const bundle = asRecord(manifest?.['dsh'])?.['bundle']
@@ -180,7 +197,7 @@ function bundleRowIssues(envDir: string, pkgDir: string, packageName: string): s
     const at = patchLabel + ':' + row.line
     if (name.startsWith('cordis:')) continue
     if (name === packageName || name.startsWith(packageName + '/')) {
-      if (!specifierResolves(envDir, name)) {
+      if (!specifierResolves(envDir, name, installAnchor)) {
         issues.push('bundle patch 行指向自身子路径 ' + name + '（' + at + '），但该子路径解析不到：'
           + '要么文件不存在，要么没写进 exports。挂载这一行会让 profile 起不来。')
       }
@@ -194,9 +211,9 @@ function bundleRowIssues(envDir: string, pkgDir: string, packageName: string): s
       continue
     }
     if (isLoaderProvided(name)) continue
-    if (!specifierResolves(envDir, name)) {
-      issues.push('bundle patch 行 ' + at + ' 挂载 ' + name + '，但它在 profile 与共享兜底层里都解析不到：'
-        + '挂载这一行会让整个 profile 起不来（这也是本地安装的 bundle 依赖漏装时的典型症状）。')
+    if (!specifierResolves(envDir, name, installAnchor)) {
+      issues.push('bundle patch 行 ' + at + ' 挂载 ' + name + '，但它在 profile、共享兜底层与安装锚点下都'
+        + '解析不到：挂载这一行会让整个 profile 起不来（这也是本地安装的 bundle 依赖漏装时的典型症状）。')
     }
   }
   return issues

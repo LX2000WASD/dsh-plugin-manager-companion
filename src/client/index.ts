@@ -71,6 +71,7 @@ export function apply(ctx: ClientContext): void {
     },
     diagnose: healthFace.diagnose,
     fix: healthFace.fix,
+    setDiagnosticTarget: healthFace.setDiagnosticTarget,
     refreshEnvironments: environmentsFace.refreshEnvironments,
     startEnvironment: environmentsFace.startEnvironment,
     stopEnvironment: environmentsFace.stopEnvironment,

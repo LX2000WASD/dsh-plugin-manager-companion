@@ -12,7 +12,7 @@
  *   也不自建 pnpm：安装走自有 install op（内部是官方 Remote 的禁用态安装 + 回滚）。
  */
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Button, IconChevronDownOutline14, IconChevronUpOutline14, IconGlobeOutline14, IconRefreshOutline14,
   IconSearchOutline16, Input, Modal, Tag, Toast, Tooltip,
@@ -39,6 +39,24 @@ export type MarketplacePageProps = CompanionSlotProps<'settings.section', Market
 const KINDS: readonly MarketItemKind[] = ['cordis-plugin', 'skill', 'agent-preset', 'unknown']
 
 /**
+ * 首屏渲染的条目数。
+ *
+ * 为什么必须有这个数：索引现在约 1.4 万条，全量渲染实测 **222,209 个 DOM 节点 /
+ * 34.8MB HTML / 滚动高度 238 万 px**，输入一次搜索要数秒才稳定——真实浏览器里已经不可用。
+ * 120 张卡片（约 2,000 节点）足够盖住首屏并留出滚动冗余。
+ */
+const RENDER_BATCH = 120
+
+/**
+ * 单页渲染的硬上限。
+ *
+ * 依据同一份测量：约 16 个 DOM 节点/卡片，1200 张 ≈ 2 万节点，仍是可交互的量级；
+ * 再往上翻页不如让用户用搜索/筛选把结果缩小。到达上限后不再提供"加载更多"，
+ * 改为明确提示（用户必须知道还有没有更多，而不是按钮点了没反应）。
+ */
+const RENDER_MAX = 1_200
+
+/**
  * 渲染插件市场页。
  *
  * @param props - 字典座位、市场状态选择器与市场动作。
@@ -51,6 +69,7 @@ export function MarketplacePage({
   const result = useMarketplace((state: MarketplaceState) => state.result)
   const loading = useMarketplace((state: MarketplaceState) => state.loading)
   const error = useMarketplace((state: MarketplaceState) => state.error)
+  const errorKey = useMarketplace((state: MarketplaceState) => state.errorKey)
   const query = useMarketplace((state: MarketplaceState) => state.query)
   const category = useMarketplace((state: MarketplaceState) => state.category)
   const kind = useMarketplace((state: MarketplaceState) => state.kind)
@@ -62,6 +81,8 @@ export function MarketplacePage({
   const [descending, setDescending] = useState(true)
   const [target, setTarget] = useState<MarketItem>()
   const [toast, setToast] = useState<{ text: string; seq: number }>()
+  const [limit, setLimit] = useState(RENDER_BATCH)
+  const sentinel = useRef<HTMLDivElement | null>(null)
 
   // 落地即读索引（缓存优先）；用户点刷新才绕过缓存。
   useEffect(() => { if (result === undefined) loadMarketplace(false) }, [loadMarketplace, result])
@@ -92,6 +113,30 @@ export function MarketplacePage({
     return hits === null ? sortRows(scoped, toolbar.sort, toolbar.descending) : hits.map(hit => hit.item)
   }, [result, category, kind, query, toolbar.sort, toolbar.descending])
 
+  // 搜索 / 筛选 / 排序 / 索引刷新都会换一批结果：渲染量必须回到首屏水平，
+  // 否则"切换一次就把一万多条全倒出来"，等于窗口形同虚设。
+  useEffect(() => {
+    setLimit(RENDER_BATCH)
+  }, [query, category, kind, toolbar.sort, toolbar.descending, result])
+
+  const shown = rows.length > limit ? rows.slice(0, limit) : rows
+  const remaining = rows.length - shown.length
+
+  // 触底自动再放一批；观察器不可用（旧浏览器/测试环境）或已达上限时，
+  // footer 里的"加载更多"按钮是兜底入口——两条路都必须有，避免"滚了没反应"。
+  useEffect(() => {
+    if (remaining <= 0 || limit >= RENDER_MAX || typeof IntersectionObserver === 'undefined') return
+    const node = sentinel.current
+    if (node === null) return
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some(entry => entry.isIntersecting)) {
+        setLimit(previous => Math.min(previous + RENDER_BATCH, RENDER_MAX))
+      }
+    }, { rootMargin: '400px' })
+    observer.observe(node)
+    return () => { observer.disconnect() }
+  }, [remaining, limit])
+
   const closeInstall = (): void => { setTarget(undefined); dismissInstallNotice() }
 
   return (
@@ -109,7 +154,11 @@ export function MarketplacePage({
         </Button>
       </div>
       <p className={css.intro}>{t('market.intro')}</p>
-      {error === undefined ? null : <p className={css.error} role="status">{t('market.failed', { message: error })}</p>}
+      {error === undefined && errorKey === undefined ? null : (
+        <p className={css.error} role="status">
+          {t('market.failed', { message: errorKey === undefined ? error ?? '' : t(errorKey) })}
+        </p>
+      )}
 
       <div className={css.filters}>
         <Input
@@ -178,9 +227,9 @@ export function MarketplacePage({
         </div>
       )}
 
-      {rows.length === 0 ? <p className={css.intro}>{t('market.empty')}</p> : (
+      {result === undefined && loading ? <p className={css.intro} role="status">{t('common.loading')}</p> : rows.length === 0 ? <p className={css.intro}>{t('market.empty')}</p> : (
         <ul className={css.list}>
-          {rows.map((item) => {
+          {shown.map((item) => {
             const tags = tagsOf(item)
             const overflow = tags.length - 8
             return (
@@ -230,6 +279,30 @@ export function MarketplacePage({
             )
           })}
         </ul>
+      )}
+      {rows.length <= RENDER_BATCH ? null : (
+        <div className={css.rowBetween} role="status">
+          <span className={css.meta}>
+            {remaining > 0
+              ? t('market.window', { loaded: shown.length, total: rows.length })
+              : t('market.windowAll', { total: rows.length })}
+          </span>
+          {remaining <= 0 || limit >= RENDER_MAX ? null : (
+            <>
+              <div ref={sentinel} className={css.sentinel} aria-hidden="true" />
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => { setLimit(previous => Math.min(previous + RENDER_BATCH, RENDER_MAX)) }}
+              >
+                {t('market.loadMore')}
+              </Button>
+            </>
+          )}
+          {remaining > 0 && limit >= RENDER_MAX
+            ? <span className={css.metaLabel}>{t('market.windowCap')}</span>
+            : null}
+        </div>
       )}
 
       <Modal

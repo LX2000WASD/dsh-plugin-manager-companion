@@ -40,6 +40,7 @@ export function KindsPage({ t, useKinds, loadKinds, uninstallKind }: KindsPagePr
   const orphans = useKinds((state: KindsState) => state.orphans)
   const loading = useKinds((state: KindsState) => state.loading)
   const error = useKinds((state: KindsState) => state.error)
+  const errorKey = useKinds((state: KindsState) => state.errorKey)
   const busy = useKinds((state: KindsState) => state.busy)
   const notice = useKinds((state: KindsState) => state.notice)
   const [target, setTarget] = useState<InstalledKind>()
@@ -65,7 +66,12 @@ export function KindsPage({ t, useKinds, loadKinds, uninstallKind }: KindsPagePr
         </Button>
       </div>
       <p className={css.intro}>{t('kinds.intro')}</p>
-      {error === undefined ? null : <p className={css.error} role="status">{t('kinds.failed', { message: error })}</p>}
+      {error === undefined && errorKey === undefined ? null : (
+        <p className={css.error} role="status">
+          {t('kinds.failed', { message: errorKey === undefined ? error ?? '' : t(errorKey) })}
+        </p>
+      )}
+      {records.length === 0 && loading ? <p className={css.intro} role="status">{t('common.loading')}</p> : null}
       {records.length === 0 && !loading ? <p className={css.intro}>{t('kinds.empty')}</p> : null}
 
       <ul className={css.list}>

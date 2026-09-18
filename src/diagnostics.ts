@@ -12,6 +12,14 @@
  *   （patch 层栈与合并语义的唯一权威口径）、@deepseek-ai/dsh-host-plugin-inventory
  *   （运行时 fiber 事实，经 official.ts 的 readRuntimeInventory 降级封装）、
  *   Node 的 createRequire 真实解析（只用于判定"能解析"；判定"不能解析"走文件与 exports 探测）。
+ *
+ * 解析根（2026-09-19 修复的误报根因）：一个 profile 只装自己的依赖，官方包（@deepseek-ai/*）
+ *   与 bundle 本体都不在 profile 的 node_modules 里，它们由**安装锚点**提供。只按
+ *   profile 目录解析会把官方包的每一行都判成孤儿（实测干净环境 163 条 orphan-row 全部是误报）。
+ *   因此解析根纳入 ctx.get('profileContext').installAnchor，口径与官方 profile.ts 的
+ *   packageDirFromAnchor 一致：createRequire(anchor).resolve.paths(name)，先 realpath 锚点
+ *   （pnpm 的 bin shim 路径不是安装目录的兄弟目录，不 realpath 会一个包都解析不到）。
+ *   锚点拿不到时退回 profile 解析并在 skipped 里如实说明，绝不静默当成"包不存在"。
  * 前提检查：旧实现的前提是"官方只有只读清单，所以诊断必须自己扫 patch 文本、自己猜绑定关系"。
  *   0.1.6 之后该前提消失：官方提供 composeEntries（与 boot 同一次 applyEntryPatches 调用）与
  *   readPluginInventory。自己再实现一遍 patch 合并只会与官方漂移，因此事实来源是
@@ -27,7 +35,7 @@
  * 本模块不写任何文件、不调 pnpm、不注册服务。
  */
 
-import { existsSync, readFileSync, readdirSync, statSync, type Dirent } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, realpathSync, statSync, type Dirent } from 'node:fs'
 import { createRequire, isBuiltin } from 'node:module'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -36,7 +44,7 @@ import { profilesRoot, readEnvironmentManifest, type EnvironmentManifest } from 
 import { readRuntimeInventory } from './official.ts'
 import type { CompanionConfig, DiagnosticsConfig } from './settings.ts'
 import type {
-  DiagnosticEvidence, DiagnosticFix, DiagnosticIssue, DiagnosticLayer, DiagnosticReport,
+  DiagnosticEvidence, DiagnosticFix, DiagnosticGroup, DiagnosticIssue, DiagnosticLayer, DiagnosticReport, DiagnosticScopeCount,
   DiagnosticSeverity, DiagnosticSkip, EnvironmentInfo,
 } from './types.ts'
 
@@ -57,6 +65,13 @@ const SCAN_FILE_BUDGET = 1200
 
 /** 依赖闭包 BFS（只读 manifest）的包数上限。 */
 const CLOSURE_MAX_PACKAGES = 400
+
+/**
+ * 安装锚点 → Node 解析根（每个锚点只算一次；诊断会解析上百个说明符）。
+ *
+ * 锚点拿不到的包**不进**这张表，调用方据此区分"没有锚点"与"锚点里没有这个包"。
+ */
+const installPathCache = new Map<string, readonly string[]>()
 
 /**
  * 官方包里允许作为**普通 dependencies** 声明的那几个。
@@ -159,6 +174,18 @@ export interface PackageScan {
 // ── 对外入口 ────────────────────────────────────────────────────────────
 
 /**
+ * 诊断目标环境：EnvironmentInfo 加上可选的安装锚点。
+ *
+ * 锚点不是"环境的事实"而是**启动这次诊断的 dsh 安装**的事实，所以调用方可以在环境对象上
+ * 原样透传（EnvironmentInfo 兼容这个类型）；不传时引擎自己从 ctx.get('profileContext') 取。
+ * 两种来源都没有时按"没有锚点"处理并记 skipped，绝不静默当成"包不存在"。
+ */
+export interface DiagnosticTargetEnvironment extends EnvironmentInfo {
+  /** 启动这次诊断的 dsh 安装的 package.json 绝对路径（官方 ProfileContext.installAnchor）。 */
+  readonly installAnchor?: string
+}
+
+/**
  * 对一个环境做完整诊断。
  *
  * 五层依次执行，任何一层失败只影响它自己：该层的失败原因写进 report.skipped，
@@ -167,11 +194,11 @@ export interface PackageScan {
  * @param ctx - host 上下文；只用 ctx.get()（官方能力探测）与 ctx.logger。
  * @param env - 被诊断环境（EnvironmentInfo，来自环境列表）。
  * @param config - 本插件配置；同时接受 CompanionConfig 与单独的 diagnostics 段。
- * @returns 报告：分层问题数 + 问题清单 + 跳过项。
+ * @returns 报告：分层问题数 + 按 code/作用域聚合的组 + 逐条问题清单 + 跳过项。
  */
 export async function analyzeEnvironment(
   ctx: Context,
-  env: EnvironmentInfo,
+  env: DiagnosticTargetEnvironment,
   config: CompanionConfig | DiagnosticsConfig,
 ): Promise<DiagnosticReport> {
   const diagnostics = normalizeDiagnosticsConfig(config)
@@ -183,7 +210,12 @@ export async function analyzeEnvironment(
     skipped.push({ check: 'environment-dir', reason: '环境目录不存在：' + env.dir })
   }
 
-  const facts = collectStaticFacts(env, diagnostics, skipped)
+  // 解析根要安装锚点：调用方透传优先，其次问官方 profileContext（launcher 一定会提供它）。
+  // 锚点的语义是"当前进程所属的 dsh 安装"（官方 ProfileContext 同理）：它的模块根排在
+  // profile 自己的 node_modules **之后**，所以诊断别的 profile 时，那个 profile 装了什么
+  // 仍然优先命中，锚点只补上安装侧提供的那部分（官方包、bundle 本体）。
+  const installAnchor = env.installAnchor ?? readInstallAnchor(ctx)
+  const facts = collectStaticFacts({ ...env, installAnchor }, diagnostics, skipped)
   const composition = await readComposition(ctx, env, facts)
   skipped.push(...composition.skips)
 
@@ -237,12 +269,86 @@ export async function analyzeEnvironment(
     })
   }
 
-  return {
+
+  // 噪声治理：同一 code 的发现按「作用域 + 严重级别」归组，让 163 条同类命中也能被人读懂。
+  // 逐条发现一条不少（证据与行号仍在 issues 里），groups 只提供可折叠的计数与来源说明。
+  const withIds = issues.map(issue => ({ ...issue, id: uniqueId(issue.id, usedIds) }))
+  const report: DiagnosticReport = {
     environment: env.name,
     generatedAt: new Date().toISOString(),
     counts: countByLayer(issues),
-    issues: issues.map(issue => ({ ...issue, id: uniqueId(issue.id, usedIds) })),
+    issues: withIds,
+    groups: buildGroups(withIds),
     skipped,
+  }
+  return report
+}
+
+// 聚合组的类型是**共享契约**（src/types.ts 的 DiagnosticGroup）：客户端要按它折叠，
+// 所以它必须与报告一起上线。这里只做再导出，保持本模块公开面不变。
+export type { DiagnosticGroup } from './types.ts'
+
+/**
+ * 组键：层级 + 类别 + 严重级别 + 作用域（同一个 code 落在不同包里是不同的问题）。
+ * @param issue - 一条发现。
+ * @returns 稳定组键。
+ */
+export function groupKeyOf(issue: DiagnosticIssue): string {
+  const scope = (issue as { readonly scope?: string }).scope ?? '(no-scope)'
+  return issue.layer + ':' + issue.code + ':' + issue.severity + ':' + scope
+}
+
+/**
+ * 按组键聚合发现；组按问题数降序、同数按组键升序，结果确定性可测。
+ * @param issues - 逐条发现（在报告里已带唯一 id）。
+ * @returns 组列表；每组给出计数、归属包计数与样例标题。
+ */
+export function buildGroups(issues: readonly DiagnosticIssue[]): DiagnosticGroup[] {
+  const buckets = new Map<string, DiagnosticIssue[]>()
+  for (const issue of issues) {
+    const key = groupKeyOf(issue)
+    const list = buckets.get(key) ?? []
+    list.push(issue)
+    buckets.set(key, list)
+  }
+  const groups: DiagnosticGroup[] = []
+  for (const [key, list] of buckets) {
+    const first = list[0]
+    if (first === undefined) continue
+    const counters = new Map<string, number>()
+    for (const issue of list) {
+      const scope = (issue as { readonly scope?: string }).scope
+      if (scope === undefined) continue
+      counters.set(scope, (counters.get(scope) ?? 0) + 1)
+    }
+    groups.push({
+      key,
+      layer: first.layer,
+      code: first.code,
+      severity: first.severity,
+      count: list.length,
+      scopes: [...counters].map(([scope, count]) => ({ scope, count })),
+      subjects: [...new Set(list.flatMap(issue => issue.subjects))].slice(0, 50),
+      ...(first.title.length > 0 ? { exampleTitle: first.title } : {}),
+    })
+  }
+  groups.sort((left, right) => right.count - left.count || left.key.localeCompare(right.key))
+  return groups
+}
+
+/**
+ * 官方 ProfileContext 的安装锚点（launcher 之外的上下文没有它）。
+ * @param ctx - host 上下文。
+ * @returns package.json 绝对路径；拿不到时 undefined。
+ */
+export function readInstallAnchor(ctx: Context): string | undefined {
+  try {
+    const profileContext = ctx.get('profileContext') as { readonly installAnchor?: string } | undefined
+    const anchor = profileContext?.installAnchor
+    return typeof anchor === 'string' && anchor.length > 0 ? anchor : undefined
+  } catch {
+    // ctx.get 在服务缺失时可能抛错：拿不到锚点按 undefined 处理，由调用方记 skipped。
+    return undefined
   }
 }
 
@@ -295,13 +401,17 @@ interface StaticFacts {
   /** 包名 → 自身 manifest。 */
   readonly manifests: ReadonlyMap<string, Record<string, unknown>>
   readonly edges: readonly DependencyEdge[]
+  /** 启动这个环境的 dsh 安装锚点（package.json 绝对路径）；launcher 未提供时省略。 */
+  readonly installAnchor?: string
+  /** 解析得到的安装侧 node_modules 根（锚点不可用或解析不到时为 null）。 */
+  readonly installRoots: readonly string[] | null
   /** 因预算或上限未扫描的包名。 */
   readonly unscanned: readonly string[]
 }
 
 /** 收集静态事实：manifest、两层 node_modules、包扫描、依赖边。 */
 function collectStaticFacts(
-  env: EnvironmentInfo,
+  env: DiagnosticTargetEnvironment,
   config: DiagnosticsConfig,
   skipped: DiagnosticSkip[],
 ): StaticFacts {
@@ -314,7 +424,20 @@ function collectStaticFacts(
     ? new Set<string>()
     : listInstalledNames(fallbackModules)
 
-  const roots = moduleRoots(envDir)
+  // 解析根 = profile 层 + 共享兜底层 + **安装锚点**（官方包由安装侧提供，profile 里没有它们）。
+  const installRoots = installAnchorRoots(env.installAnchor)
+  if (installRoots === null) {
+    skipped.push({
+      check: 'install-anchor',
+      reason: env.installAnchor === undefined
+        ? '没有安装锚点（launcher 的 profileContext 不可用，环境对象也没带 installAnchor）：'
+          + '本次只按 profile 与共享兜底层解析，由安装侧提供的官方包会被判成不存在——'
+          + '这类结论不可信，别拿它当缺包证据。'
+        : '启动这个环境的 dsh 安装锚点读不到或解析不出模块根（' + env.installAnchor + '）：'
+          + '本次只按 profile 与共享兜底层解析，由安装侧提供的官方包会被判成不存在。',
+    })
+  }
+  const roots = moduleRoots(envDir, env.installAnchor)
   const declared = [...new Set([...manifest.dependencies, ...manifest.bundles])]
   const packageDirs = new Map<string, string>()
   const manifests = new Map<string, Record<string, unknown>>()
@@ -362,6 +485,7 @@ function collectStaticFacts(
 
   return {
     envDir, manifest, profileModules, fallbackModules, profileNames, fallbackNames,
+    installAnchor: env.installAnchor, installRoots,
     packageDirs, scans, manifests, edges, unscanned,
   }
 }
@@ -417,6 +541,7 @@ function dependencyLayer(
         + '运行时报 "Cannot read properties of undefined" 这类错。正确做法是改成 peerDependencies'
         + '（peer 由共享兜底层满足），并删掉 profile 里的这份拷贝。',
       subjects: [name, ...owners],
+      scope: name,
       evidence: [
         {
           kind: 'file',
@@ -450,6 +575,7 @@ function dependencyLayer(
         detail: 'package.json 声明了 ' + name + '，但 profile 的 node_modules 与共享兜底层都找不到它。'
           + '任何 import 它的行都会在启动时 ERR_MODULE_NOT_FOUND，并带走整个 profile。',
         subjects: [name],
+        scope: name,
         evidence: [{
           kind: 'file',
           at: line === undefined ? 'package.json' : 'package.json:' + line,
@@ -483,6 +609,7 @@ function dependencyLayer(
             + 'profile 里也没有任何包提供它。这一行在挂载时必然 ERR_MODULE_NOT_FOUND。'
             + unmountedNote(composition, name),
           subjects: [name, spec],
+          scope: name,
           evidence: [{ kind: 'file', at, note: '缺失的 import 位置' }],
           fix: {
             action: 'install-provider',
@@ -500,6 +627,7 @@ function dependencyLayer(
           detail: name + ' 在 ' + at + ' 导入 ' + spec + '：它没有声明该依赖，但 ' + provider
             + ' 恰好装在环境里（传递依赖或 hoisted 布局）。这种"能跑但没写清楚"的依赖会在依赖树变化时突然炸掉。',
           subjects: [name, spec, provider],
+          scope: name,
           evidence: [{ kind: 'file', at, note: '未声明的 import 位置' }],
           id: 'implicit-dependency:' + name + '>' + spec,
         }))
@@ -522,7 +650,7 @@ function peerIssues(name: string, manifest: Record<string, unknown>, facts: Stat
     if (typeof range !== 'string') continue
     const line = text === undefined ? undefined : jsonKeyLine(text, 'peerDependencies', peer)
     const at = line === undefined ? manifestPath : manifestPath + ':' + line
-    const peerDir = findInstalledDir(moduleRoots(facts.envDir), peer)
+    const peerDir = findInstalledDir(moduleRoots(facts.envDir, facts.installAnchor), peer)
     if (peerDir === undefined) {
       issues.push(makeIssue({
         layer: 'dependency',
@@ -532,6 +660,7 @@ function peerIssues(name: string, manifest: Record<string, unknown>, facts: Stat
         detail: name + ' 声明 peerDependencies.' + peer + '，但环境里找不到它。'
           + 'peer 由共享兜底层满足，缺失时该包的运行期契约无法保证。',
         subjects: [name, peer],
+        scope: name,
         evidence: [{ kind: 'file', at, note: 'peer 声明位置' }],
         id: 'missing-peer:' + name + '>' + peer,
       }))
@@ -549,6 +678,7 @@ function peerIssues(name: string, manifest: Record<string, unknown>, facts: Stat
       detail: 'peerDependencies 是运行期契约：版本不满足时官方契约可能已经变化，'
         + '失败点会出现在很远处（序列化、协议、单例假设）。此处只报告，不自动处理。',
       subjects: [name, peer],
+      scope: name,
       evidence: [{ kind: 'file', at, note: 'peer 声明的来源包' }],
       id: 'peer-mismatch:' + name + '>' + peer,
     }))
@@ -676,7 +806,8 @@ function isJsExpression(value: unknown): boolean {
 function bundlePatchFiles(facts: StaticFacts, envDir: string): string[] {
   const files: string[] = []
   for (const bundle of facts.manifest.bundles) {
-    const dir = facts.packageDirs.get(bundle) ?? findInstalledDir(moduleRoots(envDir), bundle)
+    const dir = facts.packageDirs.get(bundle)
+      ?? findInstalledDir(moduleRoots(envDir, facts.installAnchor), bundle)
     if (dir === undefined) continue
     const manifest = facts.manifests.get(bundle) ?? readJsonFile(join(dir, 'package.json'))
     const declared = asRecord(asRecord(manifest?.['dsh'])?.['bundle'])?.['patch']
@@ -719,6 +850,7 @@ function compositionLayer(
         + 'duplicate loader entry id，**整个 profile 无法启动**。保留一行、删掉其余重复行即可恢复；'
         + '两行内容不同时先确认要保留哪一份配置。',
       subjects: [id, ...(group === undefined ? [] : [group])],
+      scope: scopeOfPatchFile(rows[0]?.file),
       evidence: [
         ...rows.map((row, index) => ({
           kind: 'file' as const,
@@ -756,25 +888,29 @@ function compositionLayer(
         + '（官方启停开关、后续 patch、行级配置）都无法稳定指向它，重启一次就换了身份。'
         + '给这一行补一个显式 id 即可，没有副作用。',
       subjects: [row.name ?? '(anonymous)', at],
+      scope: scopeOfPatchFile(row.file),
       evidence: [{ kind: 'file', at, note: '缺少显式 id 的 insert 行' }],
       id: 'unaddressable-row:' + at,
     }))
   }
 
   // 3. orphan-row：insert 行的 name 解析不到任何模块。
+  //    解析根包含安装锚点（official 同款 createRequire 口径）：官方包由安装侧提供，
+  //    只看 profile 会把它们的每一行都误报成孤儿，所以结论必须说清**查过哪些根**。
   for (const row of composition.rawRows) {
     const name = row.name
     if (name === undefined || name.length === 0) continue
-    if (rowTargetResolves(env.dir, row.file, name)) continue
+    if (rowTargetResolves(env.dir, row.file, name, facts.installAnchor)) continue
     issues.push(makeIssue({
       layer: 'composition',
       severity: 'confirm-fix',
       code: 'orphan-row',
       title: 'insert 行的模块名解析不到：' + name,
-      detail: 'patch 插入了 name=' + name + ' 的行，但该说明符在 profile 的 node_modules、'
-        + '共享兜底层与相对路径下都解析不到。挂载时 ERR_MODULE_NOT_FOUND 会让这一行失败。'
+      detail: 'patch 插入了 name=' + name + ' 的行，但该说明符在 ' + resolutionRootsNote(env.dir, facts)
+        + ' 下都解析不到。挂载时 ERR_MODULE_NOT_FOUND 会让这一行失败。'
         + '两种修法：把包装进来，或删掉这一行。',
       subjects: [name],
+      scope: scopeOfPatchFile(row.file),
       evidence: [{ kind: 'file', at: relativeTo(env.dir, row.file) + ':' + row.line, note: '解析不到的 insert 行' }],
       fix: {
         action: 'remove-row',
@@ -810,6 +946,7 @@ function compositionLayer(
         + '，但 ' + edge.to + ' 的 loader 行（id=' + target.id + '）是禁用状态：' + reason + '。'
         + '消费者会卡在 pending（注入的服务永远不就绪）或在首次使用时失败。若这是误禁用，重新启用该行即可。',
       subjects: [edge.from, edge.to, target.id],
+      scope: edge.from,
       evidence: [
         { kind: 'file', at: relativeTo(env.dir, edge.file) + ':' + edge.line, note: 'consumer 的 import 位置' },
         { kind: 'official', at: 'loader entry "' + target.id + '"', note: '该行在官方组合结果里是禁用的' },
@@ -825,8 +962,21 @@ function compositionLayer(
   return issues
 }
 
-/** 一个 patch 行里的模块名能否解析到。 */
-function rowTargetResolves(envDir: string, patchFile: string, name: string): boolean {
+/**
+ * 一个 patch 行里的模块名能否解析到。
+ *
+ * @param envDir - 环境目录（解析锚点）。
+ * @param patchFile - 该行所在的 patch 文件（相对名按它的目录解析）。
+ * @param name - 行里的模块名。
+ * @param installAnchor - dsh 应用包的 package.json；官方包由安装侧提供，必须有它才解析得到。
+ * @returns 能否解析到。
+ */
+function rowTargetResolves(
+  envDir: string,
+  patchFile: string,
+  name: string,
+  installAnchor?: string,
+): boolean {
   if (name.startsWith('cordis:')) return true
   if (name.startsWith('file:')) {
     try {
@@ -837,7 +987,7 @@ function rowTargetResolves(envDir: string, patchFile: string, name: string): boo
   }
   if (name.startsWith('.')) return existsSync(resolve(dirname(patchFile), name))
   if (isAbsolute(name)) return existsSync(name)
-  return specifierResolves(envDir, name)
+  return specifierResolves(envDir, name, installAnchor)
 }
 
 /**
@@ -1236,7 +1386,7 @@ function exportsPluginShape(scan: PackageScan | undefined): boolean {
 
 /** 从 profile 的声明依赖出发做有界闭包（只读 manifest，不扫源码）。 */
 function dependencyClosure(facts: StaticFacts): Set<string> {
-  const roots = moduleRoots(facts.envDir)
+  const roots = moduleRoots(facts.envDir, facts.installAnchor)
   const seen = new Set<string>(facts.manifest.bundles)
   const queue = [...facts.manifest.dependencies]
   while (queue.length > 0 && seen.size < CLOSURE_MAX_PACKAGES) {
@@ -1709,36 +1859,92 @@ export function resolveRelativeFile(baseDir: string, spec: string): string | und
 
 // ── 解析与判定工具 ──────────────────────────────────────────────────────
 
-/** 环境的模块解析根（profile 层优先，其次共享兜底层与 Harness home 的 profiles 兜底）。 */
-function moduleRoots(envDir: string): string[] {
+/**
+ * 安装锚点对应的 Node 解析根：**官方同款口径**。
+ *
+ * 官方 @deepseek-ai/dsh-app-boot/profile.ts 的 packageDirFromAnchor 从锚点走
+ * createRequire(anchor).resolve.paths(packageName)，本函数取同一串搜索路径里
+ * 以 node_modules 结尾的那些（Node 会按顺序往上走：包内 → 安装目录 → 祖先目录）。
+ * 官方包里已经存在的路径不再重复放进来。
+ *
+ * 锚点必须先 realpath：pnpm 的 bin shim 指向全局安装目录下的一个符号链接，
+ * 而 Node 用的是**字面路径**，不 realpath 时那条链上一个官方包都解析不到。
+ *
+ * @param installAnchor - dsh 应用包的 package.json 绝对路径（ProfileContext.installAnchor）。
+ * @returns 解析根（按 Node 的查找顺序）；锚点缺失、读不到或解析不出节点时为 null。
+ */
+export function installAnchorRoots(installAnchor: string | undefined): string[] | null {
+  if (installAnchor === undefined || installAnchor.length === 0) return null
+  const cached = installPathCache.get(installAnchor)
+  if (cached !== undefined) return cached.length === 0 ? null : [...cached]
+  const roots: string[] = []
+  try {
+    const anchor = realpathSync(installAnchor)
+    for (const searchPath of createRequire(anchor).resolve.paths('node_modules') ?? []) {
+      if (searchPath.endsWith('node_modules') && !roots.includes(searchPath)) roots.push(searchPath)
+    }
+  } catch {
+    // 锚点不可读或不是可解析的文件路径：如实返回 null，由调用方记 skipped。
+  }
+  installPathCache.set(installAnchor, roots)
+  return roots.length === 0 ? null : roots
+}
+
+/**
+ * 环境的模块解析顺序：profile 层 → 共享兜底层 → Harness home 的 profiles 兜底 → 安装锚点。
+ *
+ * 前三个是 profile 自己的依赖；安装锚点由**安装侧**提供（官方包、bundle 本体与它们携带的
+ * 传递依赖都在这里），缺少它会把官方包的每一行都判成孤儿。
+ *
+ * @param envDir - 环境目录。
+ * @param installAnchor - dsh 应用包的 package.json（可省略）。
+ * @returns 去重后的解析根，按查找优先级排列。
+ */
+export function moduleRoots(envDir: string, installAnchor?: string): string[] {
   const roots = [join(envDir, 'node_modules')]
   const sibling = join(dirname(resolve(envDir)), 'node_modules')
-  if (sibling !== roots[0]) roots.push(sibling)
+  if (!roots.includes(sibling)) roots.push(sibling)
   const shared = join(profilesRoot(), 'node_modules')
   if (!roots.includes(shared)) roots.push(shared)
+  for (const root of installAnchorRoots(installAnchor) ?? []) {
+    if (!roots.includes(root)) roots.push(root)
+  }
   return roots
 }
 
 /**
- * 一个包在某个环境里的安装目录（profile 层优先，其次共享兜底层与 Harness home 的 profiles 兜底）。
+ * 一个包在某个环境里的安装目录（profile 层优先，其次共享兜底层，最后是安装锚点）。
  *
  * 质量门与诊断共用这一套解析顺序，避免两处口径漂移。
  *
  * @param envDir - 环境目录。
  * @param packageName - 包名。
+ * @param installAnchor - dsh 应用包的 package.json；省略时只按 profile 侧解析。
  * @returns 包目录绝对路径；未安装时 undefined。
  */
-export function installedPackageDir(envDir: string, packageName: string): string | undefined {
-  return findInstalledDir(moduleRoots(envDir), packageName)
+export function installedPackageDir(
+  envDir: string,
+  packageName: string,
+  installAnchor?: string,
+): string | undefined {
+  return findInstalledDir(moduleRoots(envDir, installAnchor), packageName)
+}
+
+/** 在解析根里找已安装的包目录（同时回传命中的解析根：调用方要用它作 Node 解析基准）。 */
+function findInstalled(
+  roots: readonly string[],
+  name: string,
+): { readonly dir: string; readonly root: string } | undefined {
+  for (const root of roots) {
+    const dir = join(root, name)
+    if (existsSync(join(dir, 'package.json'))) return { dir, root }
+  }
+  return undefined
 }
 
 /** 在解析根里找已安装的包目录。 */
 function findInstalledDir(roots: readonly string[], name: string): string | undefined {
-  for (const root of roots) {
-    const dir = join(root, name)
-    if (existsSync(join(dir, 'package.json'))) return dir
-  }
-  return undefined
+  return findInstalled(roots, name)?.dir
 }
 
 /** 一个 node_modules 根里直接可见的包名（含 @scope/name）。 */
@@ -1799,28 +2005,41 @@ function providerOf(spec: string, installed: ReadonlyMap<string, string>): strin
  *
  * @param envDir - 环境目录（解析锚点）。
  * @param spec - 裸说明符或带子路径的说明符。
+ * @param installAnchor - dsh 应用包的 package.json；省略时只按 profile 侧解析。
  * @returns 能否解析到模块。
  */
-export function specifierResolves(envDir: string, spec: string): boolean {
+export function specifierResolves(envDir: string, spec: string, installAnchor?: string): boolean {
   if (isBuiltin(spec)) return true
   const pkgName = packageNameOf(spec)
   if (pkgName === undefined) return false
-  const dir = findInstalledDir(moduleRoots(envDir), pkgName)
-  if (dir === undefined) return false
+  const hit = findInstalled(moduleRoots(envDir, installAnchor), pkgName)
+  if (hit === undefined) return false
+  const dir = hit.dir
   const subpath = spec.slice(pkgName.length)
   if (subpath.length === 0) return true
-  try {
-    createRequire(join(envDir, 'package.json')).resolve(spec)
-    return true
-  } catch {
-    // conditional export 可能只给 import 条件，require 解析失败不代表不可用：继续探测。
-  }
+  // 先按真实 Node 解析判真：它认得带 exports 子路径与条件导出的官方包。
+  // 基准点取包自己的 package.json（包内 import 的真实解析起点，link / hoisted 布局都覆盖），
+  // 再退到环境目录（走 profile / 共享兜底 / 安装锚点三层 node_modules）。
+  if (resolvesFrom(join(dir, 'package.json'), spec)) return true
+  if (resolvesFrom(join(envDir, 'package.json'), spec)) return true
+  // 再走文件与 exports 探测（判"不能解析"必须两者都不成立）。
   const relativePath = subpath.replace(/^\/+/, '')
   if (resolveRelativeFile(dir, relativePath) !== undefined) return true
   const manifest = readJsonFile(join(dir, 'package.json'))
   const exportsField = manifest?.['exports']
   if (exportsField !== undefined) return exportsDeclaresSubpath(exportsField, './' + relativePath)
   return false
+}
+
+/** Node 能否从某个基准文件解析出说明符（解析失败只代表这一条路走不通）。 */
+function resolvesFrom(base: string, spec: string): boolean {
+  try {
+    createRequire(base).resolve(spec)
+    return true
+  } catch {
+    // conditional export 可能只给 import 条件，require 解析失败不代表不可用。
+    return false
+  }
 }
 
 /**
@@ -2023,6 +2242,8 @@ function makeIssue(input: {
   readonly evidence: readonly DiagnosticEvidence[]
   readonly fix?: DiagnosticFix
   readonly id: string
+  /** 问题归属的包：客户端按它折叠成组的键（判不出来时省略）。 */
+  readonly scope?: string
 }): DiagnosticIssue {
   return {
     id: input.id,
@@ -2034,7 +2255,34 @@ function makeIssue(input: {
     subjects: input.subjects.filter(subject => subject.length > 0),
     evidence: input.evidence,
     ...(input.fix === undefined ? {} : { fix: input.fix }),
+    ...(input.scope === undefined ? {} : { scope: input.scope }),
   }
+}
+
+/**
+ * patch 文件归属的包名：patch 与它的 package.json 同目录时取那个包名，否则 undefined。
+ *
+ * 只认**同目录**这一种形态：官方 bundle 的 patch（包根下的 cordis.patch.yml）与包内任意
+ * 深度的 patch 都命中；用户写在 profile 目录的 patch 也命中，那时作用域正是 profile 本身，
+ * 与「这一行属于谁」的语义一致，不产生误导。
+ */
+function scopeOfPatchFile(file: string | undefined): string | undefined {
+  if (file === undefined) return undefined
+  const manifest = readJsonFile(join(dirname(file), 'package.json'))
+  const name = manifest?.['name']
+  return typeof name === 'string' && name.length > 0 ? name : undefined
+}
+
+/** 本次解析真正查过的根（写进 detail：结论必须说清查过什么，用户才能判断可信度）。 */
+function resolutionRootsNote(envDir: string, facts: StaticFacts): string {
+  const labels = [
+    relativeTo(envDir, join(facts.envDir, 'node_modules')),
+    relativeTo(envDir, join(dirname(resolve(envDir)), 'node_modules')),
+    'Harness home 的 profiles/node_modules',
+  ]
+  if (facts.installRoots !== null) labels.push('安装锚点提供的模块根（' + facts.installAnchor + '）')
+  else labels.push('安装锚点（不可用，见 skipped 的 install-anchor）')
+  return labels.join('、') + '、以及 patch 文件自身的相对路径'
 }
 
 /** 读文本文件；读不到时 undefined。 */

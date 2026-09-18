@@ -112,3 +112,20 @@ read 默认只返回 2000 行，而该文件超过这个上限 —— 回写把�
 
 事故恢复实例：envManager.ts 被截断后，用 dist/envManager.js（完好的编译产物）+
 env-dev 的原始意图重建；tests/envManager.test.mjs 作为验收依据。
+### 7.4 警惕自证式测试（本轮最贵的一课）
+
+**事故**：host 的 `diagnose` 返回裸 jobId 字符串（违反自家 `docs/REST-CONTRACT.md` 的 `{ jobId }`），
+而 `tests/index.test.mjs` 的 12 个 op 分派用例**全部通过**——因为测试里的 `makeJobs()` 桩件
+返回的也是字符串：**测的是我自己的错误实现，而不是契约**。
+
+后果：真实浏览器里 `report.counts` 读字符串属性抛错 → 官方 SlotErrorBoundary 接住 → **整页空白**。
+单测全绿、SSR 全过，用户看到的是白屏。
+
+**规则**：
+- 桩件要按**契约**建模，不是按实现建模。实现与契约不一致时，测试应当红。
+- 契约里写死了形状的边界（如首包 `{ jobId }`），就写一条**钉形状**的断言，
+  并且刻意**不接受**"宽容"形式（见 `tests/index.test.mjs` 的 `jobIdOf()`）。
+- **单测 + SSR 绿 ≠ 用户能用**。任何"渲染出来"的断言，最终要有一条走真实浏览器的路径
+  （`tools/cdp-shot.mjs` + `tools/e2e-visual.mjs`）。
+- 独立审计者的价值在于**不共享作者的盲区**。作者自查发现不了自己的系统性错误，
+  这不是态度问题，是信息问题。
