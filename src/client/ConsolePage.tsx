@@ -900,7 +900,7 @@ function EnvironmentsPanel({ t, useEnvironments, actions }: EnvironmentsPanelPro
           <TerminalBlock
             command={busy ?? t('env.notice')}
             output={notice}
-            exitCode={error === undefined ? 0 : 1}
+            exitCode={error === undefined && errorKey === undefined ? 0 : 1}
             labels={terminalLabels}
           />
         )}

@@ -274,8 +274,11 @@ async function dispatch(op: string, body: Record<string, unknown>, deps: OpDepen
     case "copyPlugins": {
       const names = body["names"]
       if (!Array.isArray(names)) throw new Error("字段 names 必须是数组")
+      // 必须传 ctx：envManager 从 ctx.profileContext 取官方 installAnchor，
+      // 拿不到锚点就拒绝跨环境包操作（拒绝猜路径是对的）。漏传的后果是**功能完全不可用**，
+      // 实测踩过——见 docs/private/write-path-audit.md。
       return asJob(async () => await copyPlugins(
-        requireString(body, "from"), requireString(body, "to"), names.map(String),
+        requireString(body, "from"), requireString(body, "to"), names.map(String), { ctx: deps.ctx },
       ))
     }
 
@@ -286,8 +289,11 @@ async function dispatch(op: string, body: Record<string, unknown>, deps: OpDepen
       return backupDiff(body["backup"] as never, requireString(body, "target"))
 
     case "backupRestore":
+      // 同样必须传 ctx（见 copyPlugins 的注释）。注意这条自测容易漏过：
+      // 差异为空时会**在取锚点之前**提前返回"没有需要恢复的内容"，所以只有真的
+      // 有东西要恢复时才会暴露缺锚点。
       return asJob(async () =>
-        await backupRestore(body["backup"] as never, requireString(body, "target")))
+        await backupRestore(body["backup"] as never, requireString(body, "target"), { ctx: deps.ctx }))
 
     case "marketplace": {
       const marketConfig = config.marketplace
