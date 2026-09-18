@@ -1960,6 +1960,25 @@ function objectFieldString(
 }
 
 /**
+ * 这条裸说明符看起来**可能**是一个真模块名吗（扫描器的输入过滤）。
+ *
+ * 为什么需要它：打包产物会把模板字面量拆成 "字面量 + ${…} 表达式"，字面量部分于是成了
+ * **无插值的反引号字符串**，被词法器当成 string 记号收集，形如 " || token.value === "、
+ * ") {\n  if (next?.kind === "。这些片段被当成说明符后，会给"这个包导入了不存在的依赖"这类
+ * 结论提供假输入（实测：CLI 逃生口路径上 9 条假 missing-import）。
+ *
+ * 判据只做"合法裸说明符"的形状检查：首字符字母或数字，其余字母/数字/._-~/%@+ 或查询串，
+ * 且不含空白与控制字符。npm 包名本来就不允许空白与这些符号，因此被丢弃的必然是打包碎片；
+ * 相对路径与绝对路径走的是另外的分支（由调用方先判），本函数只作用于裸说明符。
+ *
+ * @param spec - 说明符。
+ * @returns 是否可能是模块名（false 表示应当丢弃）。
+ */
+export function isPlausibleSpecifier(spec: string): boolean {
+  if (spec.length === 0) return false
+  return /^@?[a-z0-9][a-z0-9._\-~/@%+?=&:]*$/i.test(spec)
+}
+/**
  * 扫描一个已安装包：入口 → 相对 import 可达文件（有界 BFS）。
  *
  * @param pkgDir - 包目录绝对路径。
@@ -2016,6 +2035,10 @@ export function scanPackage(
         continue
       }
       if (hit.spec.startsWith('/') || isBuiltin(hit.spec)) continue
+      // 输入过滤（不是判定口径）：打包器会把模板字面量拆成 `${…}` 片段，字面量部分会变成
+      // 无插值的反引号字符串被词法器当成 string 记号收集。含空白/控制字符的裸说明符在 Node 里
+      // 本来就不可能解析（ERR_INVALID_MODULE_SPECIFIER），丢弃它们不会掩盖真依赖。
+      if (!isPlausibleSpecifier(hit.spec)) continue
       imports.push({ spec: hit.spec, file: current.file, line: hit.line, kind: hit.kind })
     }
     for (const hit of result.services) services.push({ name: hit.name, file: current.file, line: hit.line })

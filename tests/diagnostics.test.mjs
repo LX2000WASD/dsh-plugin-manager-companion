@@ -13,7 +13,7 @@ import { readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import {
-  analyzeEnvironment, installAnchorRoots, installedPackageDir, scanCode, specifierResolves,
+  analyzeEnvironment, installAnchorRoots, installedPackageDir, isPlausibleSpecifier, scanCode, specifierResolves,
   tokenize, locatePatchRows,
 } from '../dist/diagnostics.js'
 
@@ -30,6 +30,7 @@ let bundlePatchPath
 let crossPlainLine
 let crossSecondLine
 let bootBlocking
+let noiseDir
 
 /** reverse profile 的 patch 里某片段的行号（1 起）。 */
 function reversePatchLine(needle) {
@@ -289,6 +290,27 @@ before(async () => {
     "      name: '@deepseek-ai/definitely-not-installed'",
     '',
   ].join('\n'))
+  // task-32：打包产物里被拆开的模板字面量（无插值的反引号串）会被词法器当成字符串记号收集，
+  // 扫描器必须把它们挡在输入之外，但真包名一条都不能少。
+  // 单独一个环境：避免共享扫描预算影响这个夹具（预算用尽会让它根本没被扫到）。
+  noiseDir = join(profiles, 'noise')
+  await writeJson(join(noiseDir, 'package.json'), {
+    name: 'dsh-profile-noise', private: true, dependencies: { 'bundled-noise': '1.0.0' },
+    dsh: { profile: { bundles: [] } },
+  })
+  await writeJson(join(noiseDir, 'node_modules', 'bundled-noise', 'package.json'),
+    { name: 'bundled-noise', version: '1.0.0', exports: { '.': './dist/index.js' } })
+  const bundled = [
+    "import { realRequired } from 'truly-required-dep'",
+    "import 'react/jsx-runtime'",
+    'const label = ' + String.fromCharCode(96) + ' || token.value === ' + String.fromCharCode(96),
+    'const shaped = ' + String.fromCharCode(96) + ' value ? left : right ' + String.fromCharCode(96),
+    "import 'not a real specifier'",
+    "import '@/absolute-look'.",
+    'export const apply = () => {}',
+    '',
+  ].join('\n')
+  await writeText(join(noiseDir, 'node_modules', 'bundled-noise', 'dist', 'index.js'), bundled)
 })
 
 after(async () => {
@@ -850,6 +872,46 @@ describe('diagnostics · 启动阻断根因（一等公民）', () => {
         assert.equal(looksClean, false, name + ' 的 ' + layer + ' 层被画成了查过且干净，但这里有启动阻断')
       }
     }
+  })
+})
+
+describe('diagnostics · 扫描器输入过滤（打包碎片不是依赖）', () => {
+  it('形状判据：真包名与子路径放行，打包碎片与非法说明符丢弃', () => {
+    for (const spec of ['react', 'react/jsx-runtime', '@scope/name', 'undici', 'js-yaml', '@deepseek-ai/dsh-tool-fs']) {
+      assert.equal(isPlausibleSpecifier(spec), true, spec + ' 是真包名，必须放行')
+    }
+    for (const spec of ['', ' || token.value === ', ' ? ', ') {\n  if (next?.kind === ', 'not a real specifier', 'a b', 'foo\nbar', '-leading-dash']) {
+      assert.equal(isPlausibleSpecifier(spec), false, JSON.stringify(spec) + ' 不是合法裸说明符，必须丢弃')
+    }
+  })
+
+  it('端到端：打包产物里的碎片不进 missing-import，真依赖一条不少', async () => {
+    const env = { name: 'noise', dir: noiseDir, current: false, builtin: false, bundles: [], dependencies: ['bundled-noise'], runs: [], installAnchor }
+    const report = await analyzeEnvironment(makeCtx({}), env, CONFIG)
+    const missing = report.issues.filter(item => item.code === 'missing-import')
+    const specs = missing.map(item => item.subjects[1])
+    assert.ok(specs.includes('truly-required-dep'), '真依赖必须照样被报：' + JSON.stringify(specs))
+    assert.ok(!specs.some(spec => /\s/.test(spec)), '含空白的碎片不许出现：' + JSON.stringify(specs))
+    assert.ok(!specs.includes('react/jsx-runtime'), 'loader/平台提供的说明符仍按原规则豁免')
+    assert.equal(missing.length, 1, '这个夹具里只应有那一条真缺失依赖：' + JSON.stringify(specs))
+    const at = missing[0].evidence[0].at
+    assert.match(at, /bundled-noise\/dist\/index\.js:1$/, '证据要指回真依赖那一行：' + at)
+  })
+
+  it('变异验证：把过滤去掉（碎片重新进列表）→ 端到端断言必须报红', async () => {
+    const env = { name: 'noise', dir: noiseDir, current: false, builtin: false, bundles: [], dependencies: ['bundled-noise'], runs: [], installAnchor }
+    const report = await analyzeEnvironment(makeCtx({}), env, CONFIG)
+    const real = report.issues.filter(item => item.code === 'missing-import')
+    // 模拟"没有过滤"：把被打包碎片形式的说明符重新塞回观察面
+    const unfiltered = [...real, { code: 'missing-import', subjects: ['bundled-noise', ' || token.value === '] }]
+    assert.equal(unfiltered.length, real.length + 1, '变异体必须真的多出一条碎片');
+    assert.throws(() => {
+      for (const issue of unfiltered) {
+        assert.ok(!/\s/.test(String(issue.subjects[1])), '含空白的碎片不许出现：' + issue.subjects[1])
+      }
+    }, '把过滤去掉后断言必然报红——否则这道过滤没被钉住')
+    // 反向：真缺失依赖在变异体里也必须在（证明过滤不会吃掉真问题）
+    assert.ok(unfiltered.some(issue => issue.subjects[1] === 'truly-required-dep'))
   })
 })
 describe('diagnostics · 词法扫描器', () => {
