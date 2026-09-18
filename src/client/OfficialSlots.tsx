@@ -45,7 +45,6 @@ export function CompanionOfficialItem(props: CompanionOfficialProps & ViewProps)
   if (view !== 'page') return <p className={css.summary}>{t('official.summary')}</p>
   return (
     <div className={css.page}>
-      <p className={css.hint}>{t('official.hint')}</p>
       <ConfigPanel
         t={props.t}
         useConfig={props.useConfig}

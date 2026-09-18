@@ -329,7 +329,6 @@ export function MarketplacePage({
         )}
       >
         <p className={css.desc}>{target === undefined ? '' : target.repo}</p>
-        <p className={css.meta}>{t('market.installDesc')}</p>
       </Modal>
 
       {toast === undefined ? null : (

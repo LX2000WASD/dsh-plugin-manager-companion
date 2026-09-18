@@ -659,7 +659,9 @@ describe('客户端渲染健壮性（残缺载荷不许变成空白页）', () =
       const away = renderSafely(reg.component, propsFor(face, makeT(dicts)))
       assert.equal(away.error, undefined)
       assert.ok(away.html.includes('诊断目标：other（不是当前环境）'), '要说清报告属于谁：' + away.html.slice(0, 400))
-      assert.ok(away.html.includes('官方写通道只覆盖当前环境'), '要说明为什么没有修复按钮')
+      // 断言「页面说明了为什么没有修复按钮」，但不钉死某个句子：DESIGN §12 之后的文案标准要求这类说明
+      // 只用一行用户视角的后果（task-12），所以按新句子断言，意图不变。
+      assert.ok(away.html.includes('只能诊断，不能修改'), '要说明为什么没有修复按钮（用户视角：只能诊断）')
       assert.ok(!away.html.includes('安装 foo'), '非当前环境不得给出会改错环境的按钮')
       assert.ok(away.html.includes('仅报告'), '改为如实标注仅报告')
     } finally { stub.restore() }

@@ -89,7 +89,6 @@ export function ConsolePage({
   return (
     <div className={css.page}>
       <h2 className={css.heading}>{t('console.title')}</h2>
-      <p className={css.intro}>{t('console.intro')}</p>
       <div className={css.tabs} role="tablist" aria-label={t('console.tabs')}>
         {tabs.map((tab, index) => {
           const selected = tab.id === active
@@ -1104,7 +1103,6 @@ export function ConfigPanel({ t, useConfig, actions }: ConfigPanelProps) {
   return (
     <section className={css.section}>
       <h3 className={css.sectionTitle}>{t('config.title')}</h3>
-      <p className={css.hint}>{t('config.intro')}</p>
       {incomplete ? <p className={css.warn} role="status">{t('config.incomplete')}</p> : null}
       {writable ? null : <p className={css.warn} role="status">{t('config.readOnly')}</p>}
       {failed ? <p className={css.error} role="status">{t('config.saveFailed')}</p> : null}

@@ -89,10 +89,21 @@ const outDir = argv.out ?? envFile.OUT ?? '/tmp/vis-e2e'
 const logPath = argv.log ?? envFile.LOG ?? '/tmp/pm.log'
 const token = argv.token ?? envFile.TOKEN ?? process.env.PM_TOKEN ?? tokenFromLog(logPath)
 
-/** 断言阈值（--self-test 用：把 --min-content 调到不可能满足的值即可验证退出码 1）。 */
-const MIN_CONTENT = numberArg(argv['min-content'], 80)
-/** 子页阈值更严：空壳只有 ~150 字，真实子页内容 255~695 字（P0 空白时是 0）。 */
-const MIN_SUBPAGE_CONTENT = numberArg(argv['min-subpage-content'], 200)
+/**
+ * 断言阈值（--self-test 用：把 --min-content 调到不可能满足的值即可验证退出码 1）。
+ *
+ * 这两个数是「这一页有没有渲染出内容」的闸（P0 空白页时内容区是 0），不是「内容量」指标——
+ * 所以不能用它们惩罚文案精炼。2026-09-19 按 DESIGN §12 清掉解释性段落后重测，optionsLen 前值 → 现值：
+ *   一级页  插件市场 23157→23138，环境控制台 154→90，技能与预设 81→68
+ *   子页    体检 320→256，环境 673→689，设置 316→205
+ * 旧值 80 在改动前只剩 1 字余量（技能与预设 81）——它其实把「空态页的文案长度」当成了内容量。
+ * 最小合法一级页还随 profile 数据浮动（技能与预设空态两次实测 68 / 57），所以取 40（与 app-shell
+ * 的「非错误页」下限同一量级），留出约 30% 余量；空白页是 0，闸不会失效。
+ * 基线与理由见 docs/private/visual-audit.md §10.1。
+ */
+const MIN_CONTENT = numberArg(argv['min-content'], 40)
+/** 子页阈值更严（控件更多）：内容区空白是 0，新文案下最小的子页是「设置」205 字。 */
+const MIN_SUBPAGE_CONTENT = numberArg(argv['min-subpage-content'], 150)
 const MAX_DOM_NODES = numberArg(argv['max-dom-nodes'], 150_000)
 const MAX_TEXT_LENGTH = numberArg(argv['max-text-length'], 4_000_000)
 const MAX_HTML_LENGTH = numberArg(argv['max-html-length'], 12_000_000)

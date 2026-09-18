@@ -14,8 +14,3 @@
   color: var(--dsw-alias-label-primary);
 }
 
-.hint {
-  margin: 0;
-  font-size: 12px;
-  color: var(--dsw-alias-label-tertiary);
-}
