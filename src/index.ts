@@ -17,7 +17,7 @@ import { DEFAULT_ENVIRONMENT_TEMPLATE, backupDiff, backupExport, backupRestore, 
 import { loadKindRecords, presetsRoot, pruneGhostRecords, removeKindDir, removeKindRecord, skillsRoot } from "./kinds.ts"
 import { buildInstalledIndex, cachedMarketplace, invalidateInstalledIndex, registryItems } from "./marketplace.ts"
 import { probeOfficialCapabilities, requireManager, type OfficialCapabilities } from "./official.ts"
-import { environmentDir as pathEnvironmentDir, OUR_PACKAGE_NAME } from "./paths.ts"
+import { environmentDir as pathEnvironmentDir, OUR_PACKAGE_NAME, readEnvironmentManifest } from "./paths.ts"
 import { inspectPackage } from "./qualityGate.ts"
 import { applyFix } from "./fix.ts"
 import { loadRegistryIndex } from "./registry.ts"
@@ -28,6 +28,8 @@ import { BODY_LIMIT_DEFAULT, JobRegistry, ROUTE_PREFIX, isJsonPost, isTrustedReq
 import { fallbackConfigHandle, registerConfig, type CompanionConfig, type ConfigHandle } from "./settings.ts"
 import type { DiagnosticLayer, DiagnosticReport, EnvironmentInfo, EnvironmentResult, GatedInstallResult, KindListResult, MarketplaceResult } from "./types.ts"
 import type { IncomingMessage, ServerResponse } from "node:http"
+import { existsSync, lstatSync, readlinkSync } from "node:fs"
+import { join } from "node:path"
 
 /** 本插件对外的服务名。绝不用 pluginManager —— 那是官方的。 */
 export const SERVICE_NAME = "companion"
@@ -56,6 +58,102 @@ export function currentRuntime(): CompanionRuntime | undefined {
 }
 
 // ── 质量门编排 ────────────────────────────────────────────────────────────
+
+/**
+ * 当前环境目录：官方事实（profileContext.dir）优先。
+ *
+ * @param ctx - host 上下文。
+ * @param fallbackDir - 拿不到官方 profileContext 时的回退目录。
+ * @returns 环境目录。
+ */
+function currentProfileDir(ctx: Context, fallbackDir: string | null): string | null {
+  const profileContext = ctx.get('profileContext') as { dir?: string } | undefined
+  return profileContext?.dir ?? fallbackDir
+}
+
+/**
+ * 环境目录；拿不到（名字为空、名字不安全）时返回 null —— 核对路径不允许抛异常。
+ *
+ * @param name - 环境名。
+ * @returns 目录或 null。
+ */
+function environmentDirOrNull(name: string): string | null {
+  try {
+    return name.length === 0 ? null : pathEnvironmentDir(name)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 回滚动作自己的结局（官方 ChangeResult.application）。
+ *
+ * 官方 change() 把失败折进结果而不是抛异常，所以「调用过 removeBundle」不等于
+ * 「回滚成功」——标题必须按官方回报的 application 写，不能默认成功。
+ *
+ * @param removed - 官方 removeBundle 的返回值。
+ * @returns 标题片段。
+ */
+function rollbackHeadline(removed: { application?: string; error?: { code?: string; diagnostic?: string } }): string {
+  if (removed.application === 'failed') {
+    return '回滚失败（' + (removed.error?.code ?? 'unknown')
+      + (removed.error?.diagnostic === undefined ? '' : ' —— ' + removed.error.diagnostic) + '）'
+  }
+  return '已回滚'
+}
+
+/**
+ * 一次回滚之后的**磁盘真实状态**。
+ *
+ * 为什么不写死「已回滚，环境未被改动」：官方 removeBundle 走的是 pnpm remove，本机
+ * 实测（官方 add 之后紧接官方 remove，两次 exitCode 都是 0）：
+ *   - package.json 的 dependencies 与 dsh.profile.bundles 都被清干净；
+ *   - <profile>/node_modules/<name> 这个 link:/file: 安装产生的**符号链接原地留下**。
+ * 官方 installBundle 失败时也只恢复 RESTORED_FILES = package.json + pnpm-lock.yaml
+ * （官方注释原话：downloaded files can stay），同样不碰 node_modules。
+ * 官方没有清理这个链接的通道，我们也不 rm 不是自己创建的链接 —— 只能如实陈述。
+ *
+ * rolledBack 的取值因此收紧为「磁盘上确实没有留下痕迹」：有残留时返回 false，
+ * 客户端据此不再弹「环境未被改动」。
+ *
+ * @param dir - 环境目录。
+ * @param name - 包名。
+ * @returns 状态行与「是否干净」。
+ */
+function rollbackState(dir: string | null, name: string): { lines: string[]; clean: boolean } {
+  if (dir === null || !existsSync(join(dir, 'package.json'))) {
+    return {
+      lines: ['回滚状态未核对：读不到该环境的 package.json，无法确认清单是否回到原状。'],
+      clean: false,
+    }
+  }
+  const manifest = readEnvironmentManifest(dir)
+  if (manifest.broken !== undefined) {
+    return {
+      lines: ['package.json 解析失败（' + manifest.broken + '），无法核对依赖与层栈是否回滚。'],
+      clean: false,
+    }
+  }
+  const declared = manifest.dependencies.includes(name)
+  const layered = manifest.bundles.includes(name)
+  const manifestLine = declared || layered
+    ? 'package.json：依赖声明' + (declared ? '仍在' : '已移除') + '，层栈' + (layered ? '仍含 ' + name : '已不含 ' + name) + '。'
+    : 'package.json：依赖声明与层栈都已回滚，没有留下 ' + name + '。'
+  const entry = join(dir, 'node_modules', name)
+  let leftover: string | null = null
+  try {
+    const stat = lstatSync(entry)
+    leftover = stat.isSymbolicLink()
+      ? 'node_modules：仍留有 ' + name + ' 的符号链接（-> ' + readlinkSync(entry) + '）。官方 pnpm 通道不会清掉路径安装留下的链接，需要时请手工删除它。'
+      : 'node_modules：仍留有 ' + name + ' 的' + (stat.isDirectory() ? '目录' : '文件') + '。需要时请手工删除它。'
+  } catch {
+    // lstat 失败 = 没有残留，这是正常路径。
+  }
+  return {
+    lines: [manifestLine, leftover ?? 'node_modules：没有留下 ' + name + ' 的目录或链接。'],
+    clean: !declared && !layered && leftover === null,
+  }
+}
 
 /**
  * 受质量门保护的安装。
@@ -107,20 +205,26 @@ export async function gatedInstall(
     gate = await inspectPackage(pathEnvironmentDir(targetName), packageName, config, ctx)
   } catch (error) {
     // 扫描本身失败时不放行：宁可回滚也不让未经校验的包留在环境里。
-    await manager.removeBundle(packageName)
+    const removed = await manager.removeBundle(packageName)
+    const state = rollbackState(currentProfileDir(ctx, environmentDirOrNull(targetName)), packageName)
     return {
       ok: false,
-      output: `质量门无法完成扫描，已回滚：${error instanceof Error ? error.message : String(error)}`,
-      packageName, gateIssues: [], rolledBack: true,
+      output: `质量门无法完成扫描，${rollbackHeadline(removed)}：${error instanceof Error ? error.message : String(error)}`
+        + '\n' + state.lines.join('\n'),
+      packageName, gateIssues: [], rolledBack: state.clean,
     }
   }
   if (!gate.ok && config.qualityGate.mode === "block") {
-    await manager.removeBundle(packageName)
+    const removed = await manager.removeBundle(packageName)
     invalidateInstalledIndex(targetName)
+    // 文案只陈述核对过的真实状态：manifest 与 node_modules 各说各的，不写「环境未被改动」。
+    const state = rollbackState(currentProfileDir(ctx, environmentDirOrNull(targetName)), packageName)
     return {
       ok: false,
-      output: `质量检查未通过，已回滚 ${packageName}：\n` + gate.issues.map(i => "  - " + i).join("\n"),
-      packageName, gateIssues: gate.issues, rolledBack: true,
+      output: `质量检查未通过，${rollbackHeadline(removed)} ${packageName}：\n`
+        + gate.issues.map(i => "  - " + i).join("\n")
+        + '\n' + state.lines.join('\n'),
+      packageName, gateIssues: gate.issues, rolledBack: state.clean,
     }
   }
   await manager.setBundleEnabled(packageName, true)

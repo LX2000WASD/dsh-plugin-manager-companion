@@ -8,7 +8,7 @@
  */
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
+import { lstatSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -230,6 +230,79 @@ test('环境名不安全时被拒（路径逃逸防线）', async () => {
   assert.equal(result.ok, true)
   assert.equal(result.value.ok, false)
   assert.equal(result.value.code, "invalid-name")
+})
+
+/** 造一份 P4 用的 manager 桩件：installBundle 复刻官方 add 的真实磁盘效果（依赖 + link: 符号链接）。 */
+function makeRollbackManager(envDir, packageName, sourceDir, { removeLink }) {
+  const readManifest = () => JSON.parse(readFileSync(join(envDir, 'package.json'), 'utf8'))
+  const writeManifest = (manifest) => writeFileSync(join(envDir, 'package.json'), JSON.stringify(manifest, undefined, 2) + '\n')
+  return {
+    inspect: async () => ({ status: 'ok' }),
+    installBundle: async () => {
+      const manifest = readManifest()
+      manifest.dependencies = { ...(manifest.dependencies ?? {}), [packageName]: 'link:' + sourceDir }
+      writeManifest(manifest)
+      mkdirSync(join(envDir, 'node_modules'), { recursive: true })
+      symlinkSync(sourceDir, join(envDir, 'node_modules', packageName))
+      return { application: 'applied', bundle: packageName, stage: 'install', target: packageName, changed: true }
+    },
+    setBundleEnabled: async () => ({ application: 'applied', stage: 'enable', target: packageName, changed: true }),
+    // 官方 removeBundle 的实测行为：清单清干净，路径安装的符号链接留在磁盘上。
+    removeBundle: async () => {
+      const manifest = readManifest()
+      if (manifest.dependencies !== undefined) delete manifest.dependencies[packageName]
+      writeManifest(manifest)
+      if (removeLink) rmSync(join(envDir, 'node_modules', packageName), { force: true })
+      return { application: 'applied', stage: 'remove', target: packageName, changed: true }
+    },
+  }
+}
+
+function installDeps(envDir, manager) {
+  return makeDeps({
+    ctx: {
+      get(name) {
+        if (name === 'pluginManager') return manager
+        if (name === 'profileContext') {
+          return { name: 'demo-env', dir: envDir, installAnchor: '/anchor/package.json', cwd: '/tmp', home: home }
+        }
+        return undefined
+      },
+    },
+  })
+}
+
+test('P4: 回滚后如实陈述磁盘状态——留下链接时不再说「环境未被改动」', async () => {
+  const envDir = join(home, 'profiles', 'demo-env')
+  const pkg = 'dsh-probe-bundle-bad'
+  const sourceDir = join(home, 'probe-bad-src')
+  mkdirSync(sourceDir, { recursive: true })
+  // 质量门必然拦截：该包在 node_modules 下只有链接、没有可读的 package.json。
+  const deps = installDeps(envDir, makeRollbackManager(envDir, pkg, sourceDir, { removeLink: false }))
+  const settled = await settle(deps, jobIdOf((await handleOp('install', { spec: './probe-bad', environment: 'demo-env' }, deps)).value))
+  const result = settled.result
+  assert.equal(result.ok, false)
+  // 磁盘前提：残留确实在（官方 pnpm remove 之后链接仍在）
+  assert.equal(lstatSync(join(envDir, 'node_modules', pkg)).isSymbolicLink(), true, '测试前提：残留链接真的在磁盘上')
+  // 文案必须与磁盘一致：manifest 说清了、残留说清了、断言「未改动」消失
+  assert.match(result.output, /package\.json：依赖声明与层栈都已回滚/)
+  assert.match(result.output, /node_modules：仍留有 dsh-probe-bundle-bad 的符号链接/)
+  assert.match(result.output, /手工删除/)
+  assert.doesNotMatch(result.output, /环境未被改动/)
+  assert.equal(result.rolledBack, false, '有残留时不得声称已完整回滚')
+})
+
+test('P4: 回滚干净时（没有残留）才报 rolledBack=true 并说明无残留', async () => {
+  const envDir = join(home, 'profiles', 'demo-env')
+  const pkg = 'dsh-probe-bundle-clean'
+  const sourceDir = join(home, 'probe-clean-src')
+  mkdirSync(sourceDir, { recursive: true })
+  const deps = installDeps(envDir, makeRollbackManager(envDir, pkg, sourceDir, { removeLink: true }))
+  const settled = await settle(deps, jobIdOf((await handleOp('install', { spec: './probe-clean', environment: 'demo-env' }, deps)).value))
+  const result = settled.result
+  assert.equal(result.ok, false)
+  assert.match(result.output, /node_modules：没有留下 dsh-probe-bundle-clean 的目录或链接/)
+  assert.equal(result.rolledBack, true)
 })
 
 after(() => {
