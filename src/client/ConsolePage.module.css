@@ -166,6 +166,12 @@
   background: var(--dsw-alias-bg-layer-1);
 }
 
+.layerSkipped {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .layerName {
   font-size: 13px;
   color: var(--dsw-alias-label-secondary);
@@ -200,6 +206,13 @@
   font-family: var(--dsw-font-family-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
   font-size: 12px;
   color: var(--dsw-alias-label-secondary);
+}
+
+/* 机器码是一个整体：允许在连字符处断行会把它读成两个词（undeclared- / dependency）。 */
+.issueCode {
+  white-space: nowrap;
+  overflow-wrap: normal;
+  word-break: keep-all;
 }
 
 .issueBody {
@@ -263,7 +276,18 @@
 
 .issueActions {
   display: flex;
+  align-items: center;
   justify-content: flex-end;
+  gap: 8px;
+}
+
+/* 修复动作的说明：行内小字，不悬停也能看到。 */
+
+.fixSummary {
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-tertiary);
+  text-align: right;
 }
 
 /* 环境子页 */

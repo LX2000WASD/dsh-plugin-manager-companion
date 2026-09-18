@@ -22,7 +22,7 @@ import {
   type MenuEntry, type TerminalBlockLabels,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { SnapshotSelectorHook, TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
-import type { DiagnosticGroup, DiagnosticIssue } from '../types.ts'
+import type { DiagnosticGroup, DiagnosticIssue, DiagnosticLayer } from '../types.ts'
 import { NS } from './locales.ts'
 import { PmSelect } from './pmSelect.tsx'
 import {
@@ -254,25 +254,28 @@ function IssueRow({
             {foreign || issue.fix === undefined
               ? <Tag tone="quiet">{t('health.reportOnly')}</Tag>
               : (
-                <Button
-                  variant={issue.severity === 'safe-fix' ? 'primary' : 'outline'}
-                  size="sm"
-                  disabled={fixing || busy}
-                  title={issue.fix.summary}
-                  onClick={() => {
-                    if (issue.severity === 'safe-fix' || confirming) {
-                      onFix()
-                      return
-                    }
-                    onConfirm()
-                  }}
-                >
-                  {fixing
-                    ? t('health.fixing')
-                    : issue.severity === 'safe-fix'
-                      ? t('health.fixSafe')
-                      : confirming ? t('common.confirm') : t('health.fixConfirm')}
-                </Button>
+                <>
+                  {/* 改什么必须不悬停就看得见：这是知情同意的一部分。 */}
+                  <span className={css.fixSummary}>{issue.fix.summary}</span>
+                  <Button
+                    variant={issue.severity === 'safe-fix' ? 'primary' : 'outline'}
+                    size="sm"
+                    disabled={fixing || busy}
+                    onClick={() => {
+                      if (issue.severity === 'safe-fix' || confirming) {
+                        onFix()
+                        return
+                      }
+                      onConfirm()
+                    }}
+                  >
+                    {fixing
+                      ? t('health.fixing')
+                      : issue.severity === 'safe-fix'
+                        ? t('health.fixSafe')
+                        : confirming ? t('common.confirm') : t('health.fixConfirm')}
+                  </Button>
+                </>
               )}
           </div>
         </div>
@@ -313,6 +316,22 @@ function HealthPanel({
   const requestedEnvironments = useRef(false)
 
   const issues = report?.issues ?? []
+  /**
+   * 层 → 该层"根本没查"的原因。
+   *
+   * 判据只用引擎显式给出的 `skip.layers`：层归属是引擎的事实，客户端按 check 字符串形状去猜
+   * 是隐式耦合，引擎一改名就会静默退回"显示 0"——正好把"没查画成没问题"带回来。
+   * 非层级跳过（install-anchor 等）不设 layers，因此不会把任何格子标成未查。
+   */
+  const skippedLayers = useMemo(() => {
+    const map = new Map<DiagnosticLayer, string[]>()
+    for (const skip of report?.skipped ?? []) {
+      for (const layer of skip.layers ?? []) {
+        map.set(layer, [...(map.get(layer) ?? []), skip.reason])
+      }
+    }
+    return map
+  }, [report])
   const groups = report?.groups ?? []
   const score = useMemo(() => healthScore(issues), [issues])
   // 当前环境名：profile 列表是唯一权威；列表还没读到时退到官方能力探针给的名字。
@@ -477,10 +496,21 @@ function HealthPanel({
               {LAYER_ORDER.map((layer) => {
                 // 计数缺失按 0 显示：这一格只是总览，不该让缺一个字段的载荷毁掉整页。
                 const count = report.counts[layer] ?? 0
+                const skipReasons = skippedLayers.get(layer)
                 return (
                   <div key={layer} className={css.layerCell}>
                     <span className={css.layerName}>{t(LAYER_LABEL[layer])}</span>
-                    <Tag tone={count === 0 ? 'quiet' : 'warning'}>{String(count)}</Tag>
+                    {skipReasons === undefined ? (
+                      <Tag tone={count === 0 ? 'quiet' : 'warning'}>{String(count)}</Tag>
+                    ) : (
+                      <span className={css.layerSkipped}>
+                        {/* 有计数也有跳过：数字照给，但不能只给数字——那会被读成"查完了"。 */}
+                        {count === 0 ? null : <Tag tone="warning">{String(count)}</Tag>}
+                        <Tooltip label={skipReasons.join(' · ')}>
+                          <Tag tone="neutral">{t('health.layerSkipped')}</Tag>
+                        </Tooltip>
+                      </span>
+                    )}
                   </div>
                 )
               })}

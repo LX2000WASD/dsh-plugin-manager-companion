@@ -455,3 +455,87 @@ describe('环境子页与设置子页：控件唯一、归因准确、作用域�
     assert.ok(!/未被改动|unchanged/.test(zh + en), '客户端不该复述"环境未被改动"这类结论（事实归 host 的 output）')
   })
 })
+
+describe('体检页：跳过层如实标注、修复说明行内可见（task-27）', () => {
+  /** 一份各层计数为 0 的报告；跳过信息按用例给。 */
+  const reportWith = (skipped, counts = {}) => ({
+    environment: 'pm-web',
+    generatedAt: '2026-09-19T03:00:00.000Z',
+    counts: { dependency: 0, composition: 0, runtime: 0, consistency: 0, ecosystem: 0, ...counts },
+    issues: [],
+    skipped,
+  })
+  /** 渲染「体检」子页（默认子页就是它）。 */
+  const renderHealth = (report) => {
+    const shim = shimReact({ tabId: 'health' })
+    const { entry, face, t } = boot({ react: shim.react })
+    face.hooks.health.update((draft) => { draft.report = report })
+    shim.reset()
+    const html = renderToStaticMarkup(React.createElement(entry.component, propsFor(face, t)))
+    // 层计数格那一段：从 grid 起截一段窗口，足够覆盖五格。
+    const start = html.indexOf('layerGrid')
+    assert.ok(start >= 0, '没找到层计数格：' + html.slice(0, 200))
+    return { html, grid: html.slice(start, start + 2500) }
+  }
+
+  it('跳过的层显示「未查」而不是 0（生态层被配置关掉时）', () => {
+    const { grid } = renderHealth(reportWith([{ check: 'ecosystem-layer', reason: '配置里关闭了该层', layers: ['ecosystem'] }]))
+    assert.ok(grid.includes('未查'), '跳过的层必须显示「未查」：' + grid.slice(0, 400))
+    assert.ok(grid.includes('配置里关闭了该层'), '跳过原因要能读到（挂在提示里）')
+  })
+
+  it('没被跳过的层不显示「未查」（不能把"查过且没问题"一起标脏）', () => {
+    const { grid } = renderHealth(reportWith([]))
+    assert.ok(!grid.includes('未查'), '没有跳过就不该出现未查')
+  })
+
+  it('一次跳过废掉多层时，多层一起标未查（runtime + consistency）', () => {
+    const { grid } = renderHealth(reportWith([{ check: 'runtime-inventory', reason: 'Loader 不可用', layers: ['runtime', 'consistency'] }]))
+    assert.equal(grid.split('未查').length - 1, 2, '两层都要标未查：' + grid.slice(0, 400))
+  })
+
+  it('非层级跳过（没有 layers）不标任何层', () => {
+    const { grid } = renderHealth(reportWith([{ check: 'install-anchor', reason: '取不到安装锚点' }]))
+    assert.ok(!grid.includes('未查'), '非层级跳过不代表整层没查：' + grid.slice(0, 400))
+  })
+
+  it('既有计数又有跳过时，数字与「未查」同时呈现（数字不能被读成"查完了"）', () => {
+    const { grid } = renderHealth(reportWith(
+      [{ check: 'composition-layer', reason: '该层执行失败：boom', layers: ['composition'] }],
+      { composition: 3 },
+    ))
+    const cell = grid.slice(Math.max(0, grid.indexOf('未查') - 400), grid.indexOf('未查') + 40)
+    assert.ok(cell.includes('3'), '有计数就必须给数字：' + cell.slice(0, 400))
+    assert.ok(cell.includes('未查'), '同时要标明这一层没查完')
+  })
+
+  it('修复动作的说明行内可见（不再只挂在悬停 title 上）', () => {
+    const summary = '重新安装 pkg，或删掉这条声明'
+    const shim = shimReact({ tabId: 'health' })
+    const { entry, face, t } = boot({ react: shim.react })
+    face.hooks.health.update((draft) => {
+      draft.report = {
+        environment: 'pm-web', generatedAt: '2026-09-19T03:00:00.000Z',
+        counts: { dependency: 1, composition: 0, runtime: 0, consistency: 0, ecosystem: 0 },
+        issues: [{
+          id: 'i1', layer: 'dependency', severity: 'confirm-fix', code: 'undeclared-dependency',
+          title: '声明了但没装：pkg', detail: 'detail', subjects: ['pkg'],
+          evidence: [{ kind: 'file', at: 'package.json:12', note: '声明位置' }],
+          fix: { action: 'install-dependency', target: 'pkg', summary },
+        }],
+        skipped: [],
+      }
+    })
+    shim.reset()
+    const html = renderToStaticMarkup(React.createElement(entry.component, propsFor(face, t)))
+    assert.ok(html.includes(summary), '说明必须是可见文本：' + html.slice(0, 300))
+    assert.ok(!html.includes('data-title="' + summary + '"'), '说明不得只挂在 title 上（不悬停也要看得到）')
+  })
+
+  it('组头/条目的 code 标签整体不折行（CSS 层护栏）', () => {
+    const css = readFileSync('src/client/ConsolePage.module.css', 'utf8')
+    const rule = /\.issueCode\s*\{([^}]*)\}/.exec(css)
+    assert.ok(rule !== null, '.issueCode 必须有独立规则（否则会跟着 .evidenceAt 一起可断行）')
+    assert.ok(/white-space:\s*nowrap/.test(rule[1]), '.issueCode 必须是 nowrap：' + String(rule[1]))
+  })
+})
