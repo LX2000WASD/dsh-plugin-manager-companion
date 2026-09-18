@@ -393,6 +393,15 @@
   align-items: flex-start;
 }
 
+/* 选中模板的层栈：官方包名，原样显示，不做文案化。 */
+
+.templateBundles {
+  font-family: var(--dsw-font-family-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 12px;
+  color: var(--dsw-alias-label-tertiary);
+  word-break: break-all;
+}
+
 .configFooter {
   display: flex;
   align-items: center;

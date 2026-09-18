@@ -26,6 +26,7 @@ import type { DiagnosticGroup, DiagnosticIssue } from '../types.ts'
 import { NS } from './locales.ts'
 import { PmSelect } from './pmSelect.tsx'
 import {
+  callOp,
   DIAGNOSTIC_LABEL, LAYER_LABEL, LAYER_ORDER,
   evidenceKindOf, formatRelative, healthScore, issueInGroup, layerLabelKey, severityLabelKey, severityToneOf,
   type CompanionSlotProps, type ConfigFace, type ConfigState, type ConsoleFace,
@@ -438,7 +439,13 @@ function HealthPanel({
       ) : null}
       {error === undefined && errorKey === undefined ? null : (
         <p className={css.error} role="status">
-          {t('health.failed', { message: errorKey === undefined ? error ?? '' : t(errorKey) })}
+          {/*
+            归因要准：修复动作失败说成「体检失败」会把责任指错地方。
+            判据只用控制器已有的两个事实——诊断开跑时会清掉 notice，而修复无论成败都会写 notice，
+            所以"有 error 同时 notice 被写过"就一定是修复失败，不需要新增状态。
+          */}
+          {(notice === undefined ? t('health.failed', { message: errorKey === undefined ? error ?? '' : t(errorKey) })
+            : t('health.fixFailed', { message: errorKey === undefined ? error ?? '' : t(errorKey) }))}
         </p>
       )}
       {capabilities === undefined || capabilities.missing.length === 0 ? null : (
@@ -549,6 +556,21 @@ function HealthPanel({
   )
 }
 
+/**
+ * 官方模板清单的投影（op `environmentTemplates`）。
+ *
+ * 模板名与层栈都来自官方 PROFILE_TEMPLATES，客户端**不维护模板表**：抄一份名字表迟早与
+ * 官方漂移，而漂移的后果实测过——留空的模板会建出一个没有 web 层、必然起不来的环境。
+ */
+interface EnvironmentTemplateList {
+  /** 官方默认模板（后端给，不是客户端猜的）。 */
+  readonly default: string
+  readonly templates: readonly {
+    readonly name: string
+    readonly bundles: readonly string[]
+  }[]
+}
+
 /** 环境卡片上可用的对话框。 */
 type EnvironmentDialog =
   | { readonly kind: 'none' }
@@ -615,6 +637,8 @@ function EnvironmentsPanel({ t, useEnvironments, actions }: EnvironmentsPanelPro
   const [dialog, setDialog] = useState<EnvironmentDialog>({ kind: 'none' })
   const [draftName, setDraftName] = useState('')
   const [draftTemplate, setDraftTemplate] = useState('')
+  const [templates, setTemplates] = useState<EnvironmentTemplateList>()
+  const [templateError, setTemplateError] = useState<string>()
   const [copyTarget, setCopyTarget] = useState('')
   const [copyNames, setCopyNames] = useState('')
   const [exportTarget, setExportTarget] = useState('')
@@ -650,6 +674,30 @@ function EnvironmentsPanel({ t, useEnvironments, actions }: EnvironmentsPanelPro
 
   const closeDialog = (): void => { setDialog({ kind: 'none' }) }
 
+  /**
+   * 打开新建对话框，并按需读一次官方模板清单（只读、读完缓存）。
+   *
+   * 清单读不到时不猜模板名：创建请求省掉 `template` 字段，由后端落到官方默认模板
+   * （能起得来的那个），并在这里如实说明清单没读到。
+   */
+  const openCreate = (): void => {
+    setDraftName('')
+    setDialog({ kind: 'create' })
+    if (templates !== undefined) return
+    void (async () => {
+      try {
+        const list = await callOp<EnvironmentTemplateList>('environmentTemplates', {})
+        setTemplates(list)
+        setDraftTemplate(list.default)
+        setTemplateError(undefined)
+      } catch (loadError) {
+        setTemplateError(loadError instanceof Error ? loadError.message : String(loadError))
+      }
+    })()
+  }
+
+  const selectedTemplate = templates?.templates.find(template => template.name === draftTemplate)
+
   return (
     <section className={css.section}>
       <div className={css.rowBetween}>
@@ -668,7 +716,7 @@ function EnvironmentsPanel({ t, useEnvironments, actions }: EnvironmentsPanelPro
             variant="outline"
             size="sm"
             icon={<IconPlusOutline16 />}
-            onClick={() => { setDraftName(''); setDraftTemplate(''); setDialog({ kind: 'create' }) }}
+            onClick={() => { openCreate() }}
           >
             {t('env.create')}
           </Button>
@@ -789,13 +837,6 @@ function EnvironmentsPanel({ t, useEnvironments, actions }: EnvironmentsPanelPro
               if (file !== undefined) actions.loadBackup(file)
               event.target.value = ''
             }}
-          />
-          <PmSelect
-            label={t('env.backupExport')}
-            placeholder={t('env.selectEnv')}
-            value={exportTarget ?? ''}
-            options={targets}
-            onChange={(id) => { setExportTarget(id) }}
           />
         </div>
         {backup === undefined ? <p className={css.hint}>{t('env.backupNone')}</p> : (
@@ -919,7 +960,11 @@ function EnvironmentsPanel({ t, useEnvironments, actions }: EnvironmentsPanelPro
               variant="primary"
               size="md"
               disabled={draftName.trim() === ''}
-              onClick={() => { actions.createEnvironment(draftName.trim(), draftTemplate.trim()); closeDialog() }}
+              onClick={() => {
+                const template = draftTemplate.trim()
+                actions.createEnvironment(draftName.trim(), template === '' ? undefined : template)
+                closeDialog()
+              }}
             >
               {t('env.doCreate')}
             </Button>
@@ -930,10 +975,22 @@ function EnvironmentsPanel({ t, useEnvironments, actions }: EnvironmentsPanelPro
           <span className={css.metaLabel}>{t('env.name')}</span>
           <Input value={draftName} onChange={(event) => { setDraftName(event.target.value) }} aria-label={t('env.name')} />
         </label>
-        <label className={css.field}>
+        <div className={css.field}>
           <span className={css.metaLabel}>{t('env.template')}</span>
-          <Input value={draftTemplate} onChange={(event) => { setDraftTemplate(event.target.value) }} aria-label={t('env.template')} placeholder={t('env.templateAuto')} />
-        </label>
+          <PmSelect
+            label={t('env.template')}
+            placeholder={t('env.templateAuto')}
+            value={draftTemplate}
+            options={(templates?.templates ?? []).map(template => ({ id: template.name, label: template.name }))}
+            onChange={(id) => { setDraftTemplate(id) }}
+          />
+          {selectedTemplate === undefined ? null : (
+            <code className={css.templateBundles}>{selectedTemplate.bundles.join(' · ')}</code>
+          )}
+          {templateError === undefined ? null : (
+            <p className={css.error} role="status">{t('env.templateLoadFailed', { message: templateError })}</p>
+          )}
+        </div>
       </Modal>
 
       <Modal
@@ -1103,6 +1160,7 @@ export function ConfigPanel({ t, useConfig, actions }: ConfigPanelProps) {
   return (
     <section className={css.section}>
       <h3 className={css.sectionTitle}>{t('config.title')}</h3>
+      <p className={css.hint}>{t('config.scope')}</p>
       {incomplete ? <p className={css.warn} role="status">{t('config.incomplete')}</p> : null}
       {writable ? null : <p className={css.warn} role="status">{t('config.readOnly')}</p>}
       {failed ? <p className={css.error} role="status">{t('config.saveFailed')}</p> : null}
