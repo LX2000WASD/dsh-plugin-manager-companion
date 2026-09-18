@@ -817,6 +817,47 @@ function bundlePatchFiles(facts: StaticFacts, envDir: string): string[] {
   return files
 }
 
+/**
+ * 非致命但仍存在的 id 重名：同一个 id 出现在**不同的顶层 group 或不同 patch 文件**里。
+ *
+ * 实测（本机 0.1.6-alpha.2）：两处都启用时 profile 照常启动——官方 loader 的重复检查是
+ * per-group 的（Group.update() 只扫自己那一份 insert 列表）。但按 id 定位的东西（官方启停开关、
+ * 逐行配置、我们的 fix target）都会指向其中一行，另一行不可达，所以如实报、给建议，不给修复动作。
+ *
+ * @param env - 被诊断环境。
+ * @param rows - 同一个 id 的全部原始行（按文件顺序、按列表分组后仍多于一处）。
+ * @param facts - 静态事实（判断 patch 归属走哪条处置通道）。
+ * @returns 一条 report-only 发现。
+ */
+function crossGroupDuplicateIssue(
+  env: EnvironmentInfo,
+  rows: readonly RawRow[],
+  facts: StaticFacts,
+): DiagnosticIssue {
+  const id = rows[0]?.id ?? ''
+  const places = [...new Set(rows.map(row => relativeTo(env.dir, row.file) + ':' + row.line))]
+  const first = rows[0]
+  return makeIssue({
+    layer: 'composition',
+    severity: 'report-only',
+    code: 'duplicate-row-id-across-groups',
+    title: '同一个行 id 出现在不同的 insert 列表里：' + id,
+    detail: 'id ' + id + ' 在 ' + places.join('、') + ' 各出现一次，但它们不在同一个 insert 列表里，'
+      + '因此不会触发官方 loader 的 duplicate loader entry id 检查——实测这种组合 profile 能正常启动。'
+      + '仍然建议改掉：按 id 定位的操作（官方启停开关、逐行配置）只能命中其中一行，另一行不可达。'
+      + '修法：给其中一行换一个 id，或删掉不再需要的那一行。'
+      + (first === undefined ? '' : manualEditSteps(env, first, id, facts.packageDirs, true, 'either')),
+    subjects: [id],
+    scope: scopeOfPatchFile(rows[0]?.file),
+    evidence: rows.map(row => ({
+      kind: 'file' as const,
+      at: relativeTo(env.dir, row.file) + ':' + row.line,
+      note: '第 ' + (rows.indexOf(row) + 1) + ' 处（name=' + (row.name ?? '未命名') + '）',
+    })),
+    id: 'duplicate-row-id-across-groups:' + id,
+  })
+}
+
 /** L2：行 id 重复、被禁用依赖、孤立行、无显式 id 的行。 */
 function compositionLayer(
   env: EnvironmentInfo,
@@ -825,31 +866,56 @@ function compositionLayer(
 ): DiagnosticIssue[] {
   const issues: DiagnosticIssue[] = []
 
-  // 1. duplicate-row-id：同一 group 路径下同一个显式 id 出现多次。
-  //    官方 loader 的 Group.update() 对同一组内的重复 id 直接抛
-  //    TypeError("duplicate loader entry id: <id>")，整个 profile 起不来。
-  const byGroup = new Map<string, RawRow[]>()
+  // 1. duplicate-row-id：**同一个 insert 列表**里同一个显式 id 出现多次。
+  //    官方 loader 的 Group.update() 只对自己那一份 insert 列表查重，命中即抛
+  //    TypeError(duplicate loader entry id)，整个 profile 起不来（真机实测：exit=1，
+  //    服务器从未开始监听）。所以判定的分组口径必须与那条 insert 列表对齐：按
+  //    **patch 文件 + 顶层 group** 分组；把不同文件、不同 group 的同名行并成一组会误判为致命
+  //    ——实测那种组合能正常启动，走 crossGroupDuplicateIssue 如实报。
+  const byList = new Map<string, RawRow[]>()
   for (const row of composition.rawRows) {
     if (row.id === undefined) continue
-    const key = (row.group ?? '') + '|' + row.id
-    const list = byGroup.get(key) ?? []
+    const key = row.file + '|' + (row.group ?? '') + '|' + row.id
+    const list = byList.get(key) ?? []
     list.push(row)
-    byGroup.set(key, list)
+    byList.set(key, list)
   }
-  for (const rows of byGroup.values()) {
+  // 同一个 id **跨多个 insert 列表**：单独如实报（非致命，见 crossGroupDuplicateIssue）。
+  //    只报跨列表的那种：同一个列表里的重复已经在下面按致命处理，两个都报会把一条问题说成两条。
+  const spread = new Map<string, RawRow[][]>()
+  for (const rows of byList.values()) {
+    const id = rows[0]?.id ?? ''
+    const lists = spread.get(id) ?? []
+    lists.push([...rows])
+    spread.set(id, lists)
+  }
+  for (const lists of spread.values()) {
+    if (lists.length < 2) continue
+    issues.push(crossGroupDuplicateIssue(env, lists.flat(), facts))
+  }
+  for (const rows of byList.values()) {
     if (rows.length < 2) continue
     const id = rows[0]?.id ?? ''
     const group = rows[0]?.group
+    const first = rows[0]
+    if (first === undefined) continue
     issues.push(makeIssue({
       layer: 'composition',
-      severity: 'safe-fix',
+      // 不是 safe-fix：这条没有可自动执行的动作（我们不代写 patch），必须用户自己确认后再动手。
+      severity: 'confirm-fix',
       code: 'duplicate-row-id',
       title: 'loader 行 id 重复：' + id,
       detail: 'id ' + id + ' 在' + (group === undefined ? '同一个 insert 列表里' : ' group ' + group + ' 下')
-        + '出现了 ' + rows.length + ' 次。官方 loader 挂载时对同组重复 id 直接抛 '
-        + 'duplicate loader entry id，**整个 profile 无法启动**。保留一行、删掉其余重复行即可恢复；'
-        + '两行内容不同时先确认要保留哪一份配置。',
+        + '出现了 ' + rows.length + ' 次，而官方 loader 的重复检查正是按这份 insert 列表做的：'
+        + '挂载这一层时直接抛 TypeError（duplicate loader entry id: ' + id + '），'
+        + '**整个 profile 起不来**——不是这一行加载失败，而是启动阶段就停在 plugin tree failed to load，'
+        + 'HTTP 服务从未开始监听。保留第一处、删掉其余 ' + (rows.length - 1) + ' 处重复行即可恢复。'
+        + manualEditSteps(env, first, id, facts.packageDirs, rowReachedComposition(composition, first)),
       subjects: [id, ...(group === undefined ? [] : [group])],
+      extra: {
+        operation: '删除 ' + relativeTo(env.dir, first.file) + ' 第 ' + first.line + ' 行起的 id=' + id
+          + ' 的重复 insert 行，只保留第一处，然后重启该环境',
+      },
       scope: scopeOfPatchFile(rows[0]?.file),
       evidence: [
         ...rows.map((row, index) => ({
@@ -866,7 +932,9 @@ function compositionLayer(
       fix: {
         action: 'remove-duplicate-row',
         target: id,
-        summary: '保留第一处 id ' + id + ' 的行，删除其余 ' + (rows.length - 1) + ' 处重复行',
+        summary: '这一层会让整个 profile 起不来；请手工保留第一处 id=' + id + '（'
+          + first.file + ':' + first.line + '），删除其余 ' + (rows.length - 1)
+          + ' 处后重启该环境（我们不代写 patch 文件）',
       },
       id: 'duplicate-row-id:' + id,
     }))
@@ -897,25 +965,38 @@ function compositionLayer(
   // 3. orphan-row：insert 行的 name 解析不到任何模块。
   //    解析根包含安装锚点（official 同款 createRequire 口径）：官方包由安装侧提供，
   //    只看 profile 会把它们的每一行都误报成孤儿，所以结论必须说清**查过哪些根**。
+  //    后果的写法有实测依据：一行解析不到不是这一行失败，而是整个 profile 起不来
+  //    （探针实测 exit=1、停在 plugin tree failed to load、HTTP 服务从未监听；
+  //    同一行若 disabled、或它所在的 group 被禁用，则照常启动——所以措辞写成条件式，不夸大）。
   for (const row of composition.rawRows) {
     const name = row.name
     if (name === undefined || name.length === 0) continue
     if (rowTargetResolves(env.dir, row.file, name, facts.installAnchor)) continue
+    const rowId = row.id ?? name
+    const at = relativeTo(env.dir, row.file) + ':' + row.line
     issues.push(makeIssue({
       layer: 'composition',
       severity: 'confirm-fix',
       code: 'orphan-row',
       title: 'insert 行的模块名解析不到：' + name,
       detail: 'patch 插入了 name=' + name + ' 的行，但该说明符在 ' + resolutionRootsNote(env.dir, facts)
-        + ' 下都解析不到。挂载时 ERR_MODULE_NOT_FOUND 会让这一行失败。'
-        + '两种修法：把包装进来，或删掉这一行。',
+        + ' 下都解析不到。后果不是这一行加载失败：只要这一行被启用（它的 group 也启用），'
+        + '挂载时就是 ERR_MODULE_NOT_FOUND 直接打断 plugin tree，**整个 profile 起不来**'
+        + '（真机实测：进程 exit=1，HTTP 服务从未开始监听；同一行写成 disabled，或它所在的 group 被禁用时'
+        + ' profile 照常启动）。' + manualEditSteps(env, row, rowId, facts.packageDirs,
+        rowReachedComposition(composition, row))
+        + '另一条路是把包装进来（' + name + '），装好再重启该环境。',
       subjects: [name],
       scope: scopeOfPatchFile(row.file),
-      evidence: [{ kind: 'file', at: relativeTo(env.dir, row.file) + ':' + row.line, note: '解析不到的 insert 行' }],
+      extra: {
+        operation: '删除 ' + at + ' 的 insert 行（id=' + rowId + '）后重启该环境；或先安装 ' + name,
+      },
+      evidence: [{ kind: 'file', at, note: '解析不到的 insert 行（启用即致命）' }],
       fix: {
         action: 'remove-row',
-        target: row.id ?? name,
-        summary: '删掉 name=' + name + ' 的 insert 行，或先安装 ' + name,
+        target: rowId,
+        summary: '这一行会让整个 profile 起不来；请手工删除 ' + row.file + ':' + row.line
+          + ' 的 id=' + rowId + ' 行后重启该环境（我们不代写 patch 文件）',
       },
       id: 'orphan-row:' + name,
     }))
@@ -1363,6 +1444,22 @@ function consistencyLayer(
     }
   }
   return issues
+}
+
+/**
+ * 这一行有没有真的进到官方组合结果里（决定"照这里删"这句话能不能确定地说）。
+ *
+ * 行定位器是文本扫描（见 locatePatchRows）：判"同名同 id 的行确实在最终组合里"是可靠的，
+ * 反过来（没找到）不能证明那一行不存在，只能说明我们无法确认——此时的指示要降一档语气。
+ *
+ * @param composition - 官方组合结果（不可用时它的 rows 为空数组）。
+ * @param row - 文本扫描到的原始行。
+ * @returns 组合结果里有没有匹配的行（无显式 id 时按 name 匹配）。
+ */
+function rowReachedComposition(composition: CompositionFacts, row: RawRow): boolean {
+  return composition.rows.some(candidate => row.id === undefined
+    ? candidate.name === row.name
+    : candidate.id === row.id)
 }
 
 /** loader 行是否属于某个 bundle 提供的包。 */
@@ -2244,6 +2341,8 @@ function makeIssue(input: {
   readonly id: string
   /** 问题归属的包：客户端按它折叠成组的键（判不出来时省略）。 */
   readonly scope?: string
+  /** 附加的机器可读事实（目前只有需要人工改 patch 时的可复制操作文本）。 */
+  readonly extra?: { readonly operation?: string }
 }): DiagnosticIssue {
   return {
     id: input.id,
@@ -2256,7 +2355,80 @@ function makeIssue(input: {
     evidence: input.evidence,
     ...(input.fix === undefined ? {} : { fix: input.fix }),
     ...(input.scope === undefined ? {} : { scope: input.scope }),
+    ...(input.extra === undefined ? {} : { extra: input.extra }),
   }
+}
+
+/**
+ * 这两类问题的处置主通道：改用户自己那份 cordis.patch.yml，还是动 bundle（官方通道）。
+ *
+ * 判据只有一条事实：patch 文件在不在这个 profile 的 dsh.profile.bundles 里——在，说明它随
+ * bundle 升级被覆盖，改它只是临时救急；不在，它就是用户自己的补丁层，改了长期有效。
+ *
+ * @param envDir - 环境目录。
+ * @param patchFile - patch 文件绝对路径。
+ * @param bundleDirs - 各 bundle 的安装目录（来自 StaticFacts 的 packageDirs）。
+ * @returns 主通道标签。
+ */
+function mainCaseOf(
+  envDir: string,
+  patchFile: string,
+  bundleDirs: ReadonlyMap<string, string>,
+): 'profile-patch' | 'bundle' {
+  // 环境目录下、但不在 node_modules 里 = 用户自己那份 cordis.patch.yml：改它才算改到这个 profile 的组合。
+  // envDir/node_modules 里的包（profile 本地装的 bundle、link 安装的插件）自带的 patch 一律算包自带，
+  // 随包升级会被覆盖，长期处置要走官方通道。
+  if (isInside(envDir, patchFile) && !isInside(join(envDir, 'node_modules'), patchFile)) return 'profile-patch'
+  // 环境外、又归属某个已安装包（bundle 自带的那一层，或其它包里的 patch）：随包升级被覆盖，
+  // 只能临时救急；长期处置要走官方通道。
+  for (const dir of new Set(bundleDirs.values())) {
+    if (isInside(dir, patchFile)) return 'bundle'
+  }
+  return 'bundle'
+}
+
+/**
+ * 需要人工删行时的可照着做的三要素：文件路径、行 id、删完做什么。
+ *
+ * 为什么不给按钮：删除 patch 行要求改 cordis.patch.yml 的结构，官方只有行级启停、没有删行能力，
+ * 我们自己写这个文件会引入两个写者并发改同一份组合（见 docs/CODE-POLICY 与 DESIGN 的写路径红线），
+ * 所以这里只给位置与内容，由用户自己动手。
+ *
+ * @param env - 被诊断环境。
+ * @param row - 要处理的那一行（文本扫描结果，带文件与行号）。
+ * @param id - 该行的 id（无显式 id 时由调用方回退成 name）。
+ * @param bundleDirs - 各 bundle 的安装目录（判断 patch 归属走哪条处置通道）。
+ * @param applied - 这一行是否已在官方组合结果里确认到（决定指示是否降一档语气）。
+ * @param edit - 怎么改：删除多余的重复行，还是给其中一行换掉 id（跨列表重名的场景）。
+ * @returns 追加到 detail 末尾的处置说明。
+ */
+function manualEditSteps(
+  env: EnvironmentInfo,
+  row: RawRow,
+  id: string,
+  bundleDirs: ReadonlyMap<string, string>,
+  applied: boolean,
+  edit: 'delete' | 'rename' | 'either' = 'delete',
+): string {
+  const at = relativeTo(env.dir, row.file) + ':' + row.line
+  const main = mainCaseOf(env.dir, row.file, bundleDirs)
+  const steps = '【怎么修】要改的文件：' + row.file + '，问题行在第 '
+    + row.line + ' 行起（报告里的 ' + at + ' 就是这一处）。要动的就是 id=' + id
+    + ' 那一行（连同它缩进内的附属键：name、config 等）。' + (edit === 'delete'
+      ? '删掉多余的那几行后保存。'
+      : '给其中一行换一个不会撞的 id，或删掉不再需要的那一行，然后保存。')
+    + '改完**重启该环境**（patch 只在启动时读，不重启不生效）。'
+  const recovery = '如果这个环境已经起不来：用 dsh --profile ' + (env.name.length > 0 ? env.name : '<环境名>')
+    + ' --patch <一份空 patch.yml> 先把它拉起来，再按上面的位置改。'
+  const uncertain = applied
+    ? ''
+    : '（注意：本次没有在官方组合结果里确认到这个 id，可能这个 patch 层当前没生效——'
+      + '请按报出的文件与行号自己核对一遍再动手。）'
+  return steps + uncertain + (main === 'profile-patch'
+    ? '这份 patch 就是这个环境自己的 cordis.patch.yml。' + recovery
+    : '这个文件来自安装的包（bundle 自带的那一层，随包升级会被覆盖）：长期处置走官方通道——'
+      + '在官方插件页的已安装列表里把对应的组合包取消勾选（或卸载），由官方改组合层栈，我们不代写；'
+      + '只想先让环境起来，可以按上面的行号临时删掉那一行（重新安装或升级该包后会被放回）。' + recovery)
 }
 
 /**

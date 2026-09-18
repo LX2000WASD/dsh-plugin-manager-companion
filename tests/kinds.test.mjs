@@ -13,10 +13,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   __resetKindCacheForTests, __setHomeForTests, addBlockedRepo, blockedReposFile, cacheRoot,
-  detectRepoType, findPluginRoots, findPresetRoots, findSkillRoots, installPreset, installSkill,
-  isBlockedRepo, isUnderRoot, kindRecordsFile, loadBlockedRepos, loadKindRecords, looksLikeDshPlugin,
-  normalizeRepoRef, pruneGhostRecords, removeBlockedRepo, removeKindRecord, rmRetry, safeDirName,
-  saveKindRecord, skillDisplayName, slugDirName,
+  canonicalKindKey, detectRepoType, findKindRecord, findOrphanKindDirs, findPluginRoots, findPresetRoots,
+  findSkillRoots, installPreset, installSkill, isBlockedRepo, isUnderRoot, kindDirsOf, kindRecordsFile,
+  loadBlockedRepos, loadKindRecords, looksLikeDshPlugin, normalizeRepoRef, presetsRoot, pruneGhostRecords,
+  removeBlockedRepo, removeKindDir, removeKindRecord, rmRetry, safeDirName, saveKindRecord, skillDisplayName,
+  skillsRoot, slugDirName,
 } from '../dist/kinds.js'
 import {
   DENIAL_REASON, PLUGIN_RULE_SECTION, createPluginGuard, isDshPluginMutation, isProfilePackageMutation,
@@ -24,10 +25,23 @@ import {
 } from '../dist/guard.js'
 import { writeOwnerMarker, presetDigest } from '../dist/presets.js'
 
+/** 换行符（夹具文本里用）。 */
+const nl = String.fromCharCode(10)
+
 /** 夹具根目录。 */
 let fixture
 /** 假的 Harness home（记录文件与落地根都落在这里）。 */
 let home
+
+/** 目录是否存在。 */
+async function exists(path) {
+  try {
+    await stat(path)
+    return true
+  } catch {
+    return false
+  }
+}
 
 /** 写一个文件，自动建父目录。 */
 async function put(path, text) {
@@ -392,5 +406,144 @@ describe('guard：裸命令拦截与提示段', () => {
     const bare = { get: () => undefined, logger: { info: () => {} } }
     assert.equal(registerPluginGuard(bare), null)
     assert.equal(registerPluginRulePrompt(bare), null)
+  })
+})
+describe('P10：仓库名含大写字母时的卸载寻址', () => {
+  /** 每条用例一个干净世界：清缓存 + 清落地根 + 清记录文件。 */
+  async function cleanWorld() {
+    __setHomeForTests(home)
+    for (const dir of [skillsRoot(), presetsRoot(), cacheRoot()]) {
+      await rm(dir, { recursive: true, force: true })
+    }
+    __resetKindCacheForTests()
+  }
+
+  it('记录体保留原始大小写，键是小写；卸载查表必须容忍两者', async () => {
+    await cleanWorld()
+    const repoRoot = join(fixture, 'mixed-case-skill')
+    await mkdir(repoRoot, { recursive: true })
+    await writeFile(join(repoRoot, 'SKILL.md'), skillManifest('probe-skill-mixed'), 'utf8')
+    const repo = 'WriteAudit/Probe-Skill-Mixed'
+    const outcome = await installSkill(repoRoot, repo)
+    assert.deepEqual([...outcome.names], ['probe-skill-mixed'])
+
+    // 落盘事实：键归一化成小写，记录体的 repo 原样保留（展示名）。
+    const onDisk = JSON.parse(await readFile(kindRecordsFile(), 'utf8'))
+    assert.deepEqual(Object.keys(onDisk.records), [canonicalKindKey(repo)])
+    assert.equal(onDisk.records[canonicalKindKey(repo)].repo, repo)
+    assert.equal(canonicalKindKey(repo), 'writeaudit/probe-skill-mixed')
+
+    // 客户端回传的是记录体里的 repo（原样大小写）——这正是卸载 op 的查表输入。
+    const records = await loadKindRecords()
+    const byDisplayName = records.get(repo)
+    assert.notEqual(byDisplayName, undefined, '按展示名（原样大小写）必须查得到记录')
+    assert.equal(byDisplayName.kind, 'skill')
+    assert.equal(byDisplayName.repo, repo, '记录体仍是展示用的原始大小写')
+    // 其它等价拼写同样命中：小写键、全大写、URL 形态。
+    assert.notEqual(records.get(canonicalKindKey(repo)), undefined)
+    assert.notEqual(records.get('WRITEAUDIT/PROBE-SKILL-MIXED'), undefined)
+    assert.notEqual(records.get('https://github.com/writeaudit/probe-skill-mixed.git'), undefined)
+    assert.equal(records.has(repo), true)
+    // 遍历仍是一条记录（不能因为宽容而让列表出现两份）。
+    assert.equal([...records.values()].length, 1)
+
+    // 显式入口给出真实键与应清理目录。
+    const found = await findKindRecord(repo)
+    assert.equal(found.key, canonicalKindKey(repo))
+    assert.deepEqual(kindDirsOf(found.record, skillsRoot()), outcome.dirs)
+
+    // 走卸载 op 的完整序列：查表 → 删目录 → 删记录。
+    const opRecord = records.get(repo)
+    for (const dir of kindDirsOf(opRecord, skillsRoot())) await removeKindDir(skillsRoot(), dir)
+    assert.equal(await removeKindRecord(repo), true)
+    assert.equal(await exists(join(skillsRoot(), 'probe-skill-mixed')), false)
+    assert.equal(await findKindRecord(repo), undefined)
+    assert.equal([...(await loadKindRecords()).values()].length, 0)
+  })
+
+  it('预设卸载同样对大小写宽容（含 dirs 精确清理）', async () => {
+    await cleanWorld()
+    const repoRoot = join(fixture, 'mixed-case-preset')
+    await mkdir(repoRoot, { recursive: true })
+    await writeFile(join(repoRoot, 'agent.cordis.yml'), '- []' + nl, 'utf8')
+    const repo = 'WriteAudit/Probe-Preset-Mixed'
+    const outcome = await installPreset(repoRoot, repo)
+    const records = await loadKindRecords()
+    const record = records.get(repo)
+    assert.notEqual(record, undefined)
+    assert.equal(record.kind, 'agent-preset')
+    assert.deepEqual(kindDirsOf(record, presetsRoot()), outcome.dirs)
+    for (const dir of kindDirsOf(record, presetsRoot())) await removeKindDir(presetsRoot(), dir)
+    assert.equal(await removeKindRecord(repo), true)
+    assert.equal(await exists(join(presetsRoot(), 'dsh-foo')), false)
+  })
+
+  it('kindDirsOf 拒绝越界目录（宁少删不越界）', async () => {
+    await cleanWorld()
+    const outside = await mkdtemp(join(tmpdir(), 'dshpmc-outside-'))
+    const record = { kind: 'skill', repo: 'owner/repo', dir: outside, installedAt: new Date().toISOString(), dirs: [outside] }
+    assert.deepEqual(kindDirsOf(record, skillsRoot()), [])
+    await rm(outside, { recursive: true, force: true })
+  })
+})
+
+describe('孤儿目录扫描（orphans 不再恒为空）', () => {
+  async function cleanWorld() {
+    __setHomeForTests(home)
+    for (const dir of [skillsRoot(), presetsRoot(), cacheRoot()]) {
+      await rm(dir, { recursive: true, force: true })
+    }
+    __resetKindCacheForTests()
+  }
+
+  it('列出未被任何记录认领的目录，跳过点目录 / 文件 / 更深层', async () => {
+    await cleanWorld()
+    // 被认领的两个安装
+    const skillRepo = join(fixture, 'orphan-skill')
+    await mkdir(skillRepo, { recursive: true })
+    await writeFile(join(skillRepo, 'SKILL.md'), skillManifest('claimed-skill'), 'utf8')
+    await installSkill(skillRepo, 'owner/claimed-repo')
+    const presetRepo = join(fixture, 'orphan-preset')
+    await mkdir(presetRepo, { recursive: true })
+    await writeFile(join(presetRepo, 'agent.cordis.yml'), '- []' + nl, 'utf8')
+    await installPreset(presetRepo, 'owner/claimed-preset')
+
+    // 残留：没有记录的技能目录（手工放置 / 卸载失败留下的），以及点目录、文件、更深层
+    await mkdir(join(skillsRoot(), 'leftover-skill'), { recursive: true })
+    await mkdir(join(presetsRoot(), 'leftover-preset'), { recursive: true })
+    await mkdir(join(skillsRoot(), '.hidden-dir'), { recursive: true })
+    await writeFile(join(skillsRoot(), 'README.md'), 'not a directory', 'utf8')
+    await mkdir(join(skillsRoot(), 'claimed-skill', 'nested'), { recursive: true })
+
+    const orphans = await findOrphanKindDirs()
+    assert.deepEqual(orphans, [join(presetsRoot(), 'leftover-preset'), join(skillsRoot(), 'leftover-skill')].sort())
+  })
+
+  it('卸载只删掉记录、留下目录时，该目录会作为孤儿报出来', async () => {
+    await cleanWorld()
+    const dir = join(skillsRoot(), 'half-state')
+    await mkdir(dir, { recursive: true })
+    await saveKindRecord('owner/half-state', {
+      kind: 'skill', repo: 'owner/half-state', dir, installedAt: new Date().toISOString(), dirs: [dir],
+    })
+    assert.deepEqual(await findOrphanKindDirs(), [])
+    await removeKindRecord('owner/half-state')
+    assert.deepEqual(await findOrphanKindDirs(), [dir])
+  })
+
+  it('旧记录（无 dirs、dir 指向根）不会把同 slug 的主目录误报成孤儿', async () => {
+    await cleanWorld()
+    await mkdir(join(skillsRoot(), 'pack'), { recursive: true })
+    await mkdir(join(skillsRoot(), 'pack-other'), { recursive: true })
+    // 旧包的记录形态：没有 dirs，dir 是根（多目录安装只记根）。
+    await saveKindRecord('owner/pack', {
+      kind: 'skill', repo: 'owner/pack', dir: skillsRoot(), installedAt: new Date().toISOString(),
+    })
+    assert.deepEqual(await findOrphanKindDirs(), [join(skillsRoot(), 'pack-other')])
+  })
+
+  it('根不存在时返回空数组，不抛', async () => {
+    await cleanWorld()
+    assert.deepEqual(await findOrphanKindDirs(), [])
   })
 })

@@ -9,6 +9,7 @@
 import { describe, it, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
+import { readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import {
@@ -23,6 +24,19 @@ let brokenDir
 let installDir
 let installAnchor
 let reverseDir
+let reversePatchPath
+let bundleDir
+let bundlePatchPath
+let crossPlainLine
+let crossSecondLine
+
+/** reverse profile 的 patch 里某片段的行号（1 起）。 */
+function reversePatchLine(needle) {
+  const lines = readFileSync(reversePatchPath, 'utf8').split('\n')
+  const index = lines.findIndex(line => line.includes(needle))
+  assert.ok(index >= 0, 'reverse fixture 里找不到 ' + needle)
+  return index + 1
+}
 
 /** 写 JSON 文件（自动建目录）。 */
 async function writeJson(file, value) {
@@ -179,6 +193,7 @@ before(async () => {
 
   // 反向证明用的 profile：patch 引用安装锚点里也没有的包 —— 该报的必须照样报。
   reverseDir = join(profiles, 'reverse')
+  reversePatchPath = join(reverseDir, 'cordis.patch.yml')
   await writeJson(join(reverseDir, 'package.json'), {
     name: 'dsh-profile-reverse', private: true, dependencies: { p1: '1.0.0' },
     dsh: { profile: { bundles: [] } },
@@ -194,6 +209,48 @@ before(async () => {
     '      name: p1',
     '',
   ].join('\n'))
+  // 需要人工动手的两条诊断（orphan-row / duplicate-row-id）：
+  // ① bundle 自带的 patch 里也有一个解析不到的行（用来钉「bundle 通道」的措辞与三要素）；
+  // ② 跨 insert 列表的同名 id（实测不致命，必须与致命的那种区分开）。
+  bundleDir = join(profiles, 'bundle-holder', 'node_modules', 'probe-bundle')
+  bundlePatchPath = join(bundleDir, 'cordis.patch.yml')
+  await writeJson(join(profiles, 'bundle-holder', 'package.json'), {
+    name: 'dsh-profile-bundle-holder', private: true, dependencies: {},
+    dsh: { profile: { bundles: ['probe-bundle'] } },
+  })
+  await writeJson(join(bundleDir, 'package.json'), {
+    name: 'probe-bundle', version: '1.0.0', exports: { '.': './index.js' },
+    dsh: { bundle: { patch: './cordis.patch.yml' } },
+  })
+  await writeText(join(bundleDir, 'index.js'), 'export const apply = () => {}\n')
+  await writeText(bundlePatchPath, [
+    '- insert:',
+    '    - id: bundle-bad-row',
+    "      name: '@nope/never-installed-anywhere'",
+    '',
+  ].join('\n'))
+
+  // reverse profile 追加：同列表重复 id（致命）+ 跨列表同名 id（不致命）。
+  await writeText(reversePatchPath, [
+    '- insert:',
+    '    - id: really-missing',
+    "      name: '@deepseek-ai/truly-not-installed'",
+    '    - id: profile-local',
+    '      name: p1',
+    '    - id: fatal-dup',
+    '      name: p1',
+    '    - id: fatal-dup',
+    '      name: p1',
+    '    - id: cross-both',
+    '      name: p1',
+    '- id: another-group',
+    '  insert:',
+    '    - id: cross-both',
+    '      name: p1',
+    '',
+  ].join('\n'))
+  crossPlainLine = reversePatchLine('- id: cross-both')
+  crossSecondLine = reversePatchLine('    - id: cross-both')
 })
 
 after(async () => {
@@ -222,8 +279,9 @@ describe('diagnostics · 五层诊断', () => {
     const issue = issueOf(report, 'duplicate-row-id')
     assert.ok(issue, '应检出 duplicate-row-id')
     assert.equal(issue.layer, 'composition')
-    assert.equal(issue.severity, 'safe-fix')
-    assert.ok(issue.fix, 'safe-fix 必须给出 fix')
+    // 这条需要用户自己删 patch 行（我们不代写该文件），因此不是能自动跑完的 safe-fix。
+    assert.equal(issue.severity, 'confirm-fix')
+    assert.ok(issue.fix, '有一键入口，但执行结果是 needs-manual')
     assert.equal(issue.fix.action, 'remove-duplicate-row')
     assert.equal(issue.fix.target, 'alpha')
     const fileEvidence = issue.evidence.filter(item => item.kind === 'file').map(item => item.at)
@@ -440,8 +498,99 @@ describe('diagnostics · 噪声治理', () => {
     assert.equal(duplicate.count, 1)
     assert.deepEqual(duplicate.scopes, [{ scope: 'dsh-profile-demo', count: 1 }],
       '组要说明命中归属哪个包（demo profile 的 patch 与其 package.json 同目录）')
-    assert.ok(duplicate.key.startsWith('composition:duplicate-row-id:safe-fix:dsh-profile-demo'))
+    assert.ok(duplicate.key.startsWith('composition:duplicate-row-id:confirm-fix:dsh-profile-demo'),
+      '组键要带上严重级别：' + duplicate.key)
     assert.ok(duplicate.exampleTitle.includes('alpha'), '组要带一条样例标题：' + duplicate.exampleTitle)
+  })
+})
+
+
+describe('diagnostics · 需人工处理的提示（后果 + 三要素）', () => {
+  /** 三要素：完整文件路径、行 id、删完做什么（重启）。 */
+  function assertActionable(text, { file, id, expectRestart = true }) {
+    assert.ok(text.includes(file), '要给出文件路径 ' + file + '：' + text)
+    assert.ok(text.includes(id), '要给出要动的行 id ' + id + '：' + text)
+    if (expectRestart) assert.match(text, /重启该环境/, '要说明删完要重启该环境：' + text)
+  }
+
+  it('orphan-row：说清后果是整个 profile 起不来，并给出文件+行 id+重启', async () => {
+    const env = { name: 'reverse', dir: reverseDir, current: false, builtin: false, bundles: [], dependencies: ['p1'], runs: [], installAnchor }
+    const report = await analyzeEnvironment(makeCtx({ profileContext: {} }), env, CONFIG)
+    const issue = report.issues.find(candidate => candidate.code === 'orphan-row')
+    assert.ok(issue, '应检出 orphan-row')
+    assert.match(issue.detail, /整个 profile 起不来/, '后果必须与事实等重：' + issue.detail)
+    assert.match(issue.detail, /ERR_MODULE_NOT_FOUND/)
+    assert.doesNotMatch(issue.detail, /会让这一行失败/, '旧的低估措辞必须消失')
+    // 报告里给的是环境相对的 cordis.patch.yml（证据可点回源），detail 里同时给绝对路径
+    assertActionable(issue.detail, { file: reversePatchPath, id: 'really-missing' })
+    assertActionable(issue.fix.summary, { file: 'cordis.patch.yml:' + reversePatchLine('    - id: really-missing'), id: 'really-missing' })
+    assert.ok(issue.evidence.some(item => item.at === 'cordis.patch.yml:' + reversePatchLine('    - id: really-missing')),
+      '证据要指回那一行：' + JSON.stringify(issue.evidence))
+    assert.match(issue.extra.operation, /重启该环境/, '机器可读的操作文本也要带后续动作')
+  })
+
+  it('变异验证：把行号从 fix.summary 去掉，钉住的断言必须报红', async () => {
+    const env = { name: 'reverse', dir: reverseDir, current: false, builtin: false, bundles: [], dependencies: ['p1'], runs: [], installAnchor }
+    const report = await analyzeEnvironment(makeCtx({ profileContext: {} }), env, CONFIG)
+    const issue = report.issues.find(candidate => candidate.code === 'orphan-row')
+    const lineOfRow = reversePatchLine('    - id: really-missing')
+    const mutated = issue.fix.summary.replace('cordis.patch.yml:' + lineOfRow, 'cordis.patch.yml')
+    assert.notEqual(mutated, issue.fix.summary, '变异体必须真的改掉了行号')
+    assert.throws(() => assertActionable(mutated, { file: 'cordis.patch.yml:' + lineOfRow, id: 'really-missing' }),
+      '去掉行号后断言必须失败——否则说明这条钉子是空的')
+    assert.ok(!mutated.includes('cordis.patch.yml:' + lineOfRow), '变异后不该再出现行号')
+  })
+
+  it('duplicate-row-id：同列表重复说清是致命，并给出文件+行 id+重启', async () => {
+    const env = { name: 'reverse', dir: reverseDir, current: false, builtin: false, bundles: [], dependencies: ['p1'], runs: [], installAnchor }
+    const report = await analyzeEnvironment(makeCtx({ profileContext: {} }), env, CONFIG)
+    const issue = report.issues.find(candidate => candidate.code === 'duplicate-row-id')
+    assert.ok(issue, '应检出 duplicate-row-id')
+    assert.equal(issue.severity, 'confirm-fix', '这条没有可自动执行的动作，不能标成 safe-fix')
+    assert.match(issue.detail, /整个 profile 起不来/)
+    assert.match(issue.detail, /duplicate loader entry id/)
+    assertActionable(issue.detail, { file: reversePatchPath, id: 'fatal-dup' })
+    assertActionable(issue.fix.summary,
+      { file: 'cordis.patch.yml:' + reversePatchLine('    - id: fatal-dup'), id: 'fatal-dup' })
+  })
+
+  it('跨 insert 列表的同名 id：不报成致命，改报 report-only 的 id 重名', async () => {
+    const env = { name: 'reverse', dir: reverseDir, current: false, builtin: false, bundles: [], dependencies: ['p1'], runs: [], installAnchor }
+    const report = await analyzeEnvironment(makeCtx({ profileContext: {} }), env, CONFIG)
+    const fatal = report.issues.find(candidate => candidate.code === 'duplicate-row-id')
+    assert.ok(!fatal.subjects.includes('cross-both'), '跨列表的那一对不能被判成致命：' + JSON.stringify(fatal.subjects))
+    const across = report.issues.find(candidate => candidate.code === 'duplicate-row-id-across-groups')
+    assert.ok(across, '跨列表重名要如实报出来：' + JSON.stringify(report.issues.map(candidate => candidate.code)))
+    assert.equal(across.severity, 'report-only')
+    assert.equal(across.fix, undefined, 'report-only 不给修复动作')
+    assert.match(across.detail, /不会触发官方 loader 的/, '要如实写明不致命')
+    assert.match(across.detail, /能正常启动/)
+    assert.ok(across.detail.includes('cordis.patch.yml:' + crossPlainLine),
+      '要指回第一处：' + across.detail)
+    assert.ok(across.detail.includes('cordis.patch.yml:' + crossSecondLine),
+      '要指回第二处：' + across.detail)
+  })
+
+  it('bundle 自带的 patch：处置走官方通道，同时照样给文件+行 id+重启', async () => {
+    const env = { name: 'bundle-holder', dir: join(home, 'profiles', 'bundle-holder'), current: false, builtin: false, bundles: ['probe-bundle'], dependencies: [], runs: [], installAnchor }
+    const report = await analyzeEnvironment(makeCtx({ profileContext: {} }), env, CONFIG)
+    const issue = report.issues.find(candidate => candidate.code === 'orphan-row')
+    assert.ok(issue, '应检出 orphan-row：' + JSON.stringify(report.issues.map(candidate => candidate.code)))
+    assertActionable(issue.detail, { file: bundlePatchPath, id: 'bundle-bad-row' })
+    assert.match(issue.detail, /官方插件页/, 'bundle 的 patch 要指向官方通道')
+    assert.match(issue.detail, /取消勾选/)
+    assert.match(issue.detail, /随包升级会被覆盖/)
+  })
+
+  it('官方组合结果里确认不到这一行时，指示降一档语气（不装作确定）', async () => {
+    const env = { name: 'broken', dir: brokenDir, current: false, builtin: false, bundles: [], dependencies: [], runs: [], installAnchor }
+    const report = await analyzeEnvironment(makeCtx({ profileContext: {} }), env, CONFIG)
+    assert.ok(report.skipped.some(item => item.check === 'composition-official'))
+    const issue = report.issues.find(candidate => candidate.code === 'orphan-row')
+    assert.ok(issue, '官方组合不可用时纯文本检查仍要给出 orphan-row')
+    assert.equal(issue.code, 'orphan-row')
+    assert.ok(issue.detail.includes(brokenDir), '照样要给文件位置：' + issue.detail)
+    assertActionable(issue.detail, { file: join(brokenDir, 'cordis.patch.yml'), id: 'dup' })
   })
 })
 

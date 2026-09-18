@@ -632,14 +632,113 @@ export async function removeKindDir(root: string, dir: string): Promise<void> {
 
 // ── 安装记录（companion-kinds.json）─────────────────────────────────────────
 
-/** 安装记录表：键为归一化仓库引用（本地路径用其绝对路径）。 */
-export type KindRecordMap = Map<string, InstalledKind>
+/**
+ * 把任意仓库拼写收敛成记录表的规范键。
+ *
+ * 记录表的键一律是 normalizeRepoRef 的结果（小写 owner/repo）；本地路径这类
+ * normalizeRepoRef 认不出的形态按原样当键。
+ *
+ * @param ref - 任意仓库拼写（owner/repo、URL、github:、客户端回传的展示名…）。
+ * @returns 规范键。
+ */
+export function canonicalKindKey(ref: string): string {
+  return normalizeRepoRef(ref) ?? ref
+}
 
 /**
- * 组装一条安装记录（把落地结果 + 仓库身份收敛成 wire 类型 InstalledKind）。
+ * 落盘形态的记录。
+ *
+ * 比 wire 类型 InstalledKind 多两个**仅供本模块内部使用**的字段，它们解决的问题是
+ * 精确性：一个技能集合仓库会落下多个目录，只记 `dir` 无法回答"这次安装到底碰了哪些
+ * 目录"。孤儿扫描（findOrphanKindDirs）与将来的多目录卸载都要靠 `dirs`。
+ * 多出来的键会随记录一起落盘，客户端 wire 解析只挑它认识的字段，因此不影响契约。
+ */
+export interface StoredKindRecord extends InstalledKind {
+  /** 本次安装落地的全部目录（单目录安装时就是那一个）。旧记录没有这个字段。 */
+  readonly dirs?: readonly string[]
+  /** 本次安装落地的目录名（多目录安装时用于展示与归属说明）。 */
+  readonly names?: readonly string[]
+}
+
+/**
+ * 安装记录表。
+ *
+ * 键是 canonicalKindKey 归一化后的仓库引用，**查询接口对任何等价拼写宽容**：
+ * 市场索引里的 repo 是原样大小写（WriteAudit/Probe-Skill-Mixed），客户端把记录体里
+ * 的 repo 原样回传给卸载 op，而表键是小写——两者不相等。修复做在**查表侧**而不是
+ * 写入侧，因为记录体的 repo 是给用户看的展示名，把它小写化会让 UI 丢掉原始大小写。
+ *
+ * 宽容只作用在 get/has/delete 的入参上；遍历（entries/values/keys）与落盘仍是每个记录
+ * 一条，所以不会出现"同一个记录在列表里显示两次"。
+ */
+export class KindRecordMap extends Map<string, InstalledKind> {
+  /**
+   * 按任意等价拼写取记录。
+   *
+   * 顺序：规范键 → 原样键 → 逐条比对（键与记录体 repo 都过一遍归一化）。
+   * 逐条比对是最后的兜底：旧包写的记录可能以 URL 为键、以 owner/repo 为体。
+   *
+   * @param ref - 仓库拼写。
+   * @returns 记录；不存在时 undefined。
+   */
+  override get(ref: string): InstalledKind | undefined {
+    const canonical = canonicalKindKey(ref)
+    const direct = super.get(canonical)
+    if (direct !== undefined) return direct
+    const raw = super.get(ref)
+    if (raw !== undefined) return raw
+    const wanted = normalizeRepoRef(ref)
+    if (wanted === null) return undefined
+    for (const [key, record] of this) {
+      if (canonicalKindKey(key) === wanted) return record
+      if (typeof record.repo === 'string' && canonicalKindKey(record.repo) === wanted) return record
+    }
+    return undefined
+  }
+
+  /**
+   * 是否存在等价拼写的记录。
+   * @param ref - 仓库拼写。
+   * @returns 是否存在。
+   */
+  override has(ref: string): boolean {
+    return this.get(ref) !== undefined
+  }
+
+  /**
+   * 按任意等价拼写删除记录（删的是它真正存放时用的那个键）。
+   * @param ref - 仓库拼写。
+   * @returns 是否真的删掉了一条。
+   */
+  override delete(ref: string): boolean {
+    const key = this.keyOf(ref)
+    return key === undefined ? false : super.delete(key)
+  }
+
+  /**
+   * 找出某个仓库拼写真正对应的键。
+   * @param ref - 仓库拼写。
+   * @returns 表中的键；不存在时 undefined。
+   */
+  keyOf(ref: string): string | undefined {
+    const canonical = canonicalKindKey(ref)
+    if (super.has(canonical)) return canonical
+    if (super.has(ref)) return ref
+    const wanted = normalizeRepoRef(ref)
+    if (wanted === null) return undefined
+    for (const [key, record] of this) {
+      if (canonicalKindKey(key) === wanted) return key
+      if (typeof record.repo === 'string' && canonicalKindKey(record.repo) === wanted) return key
+    }
+    return undefined
+  }
+}
+
+/**
+ * 组装一条安装记录（把落地结果 + 仓库身份收敛成落盘形态）。
  *
  * @param kind - 资源类型。
- * @param repo - 仓库展示名（owner/repo）。
+ * @param repo - 仓库展示名（原样大小写，UI 直接展示）。
  * @param outcome - 直装结果。
  * @returns 可直接落盘的记录。
  */
@@ -647,13 +746,15 @@ export function kindRecordOf(
   kind: Exclude<MarketItemKind, 'unknown'>,
   repo: string,
   outcome: InstallOutcome,
-): InstalledKind {
+): StoredKindRecord {
   return {
     kind,
     repo,
     // 单目录时记录那个目录，多目录时记录根——两者都能被幽灵判定与卸载路径使用。
     dir: outcome.dirs.length === 1 ? outcome.dirs[0]! : outcome.location,
     installedAt: new Date().toISOString(),
+    dirs: [...outcome.dirs],
+    names: [...outcome.names],
   }
 }
 
@@ -676,7 +777,7 @@ async function writeJsonAtomic(path: string, payload: unknown): Promise<void> {
 
 /** 解析记录文件，容错（坏文件读成空表）。 */
 function parseRecords(text: string): KindRecordMap {
-  const map: KindRecordMap = new Map()
+  const map = new KindRecordMap()
   try {
     const data = JSON.parse(text) as { records?: Record<string, InstalledKind> }
     for (const [key, value] of Object.entries(data.records ?? {})) {
@@ -699,8 +800,8 @@ function parseRecords(text: string): KindRecordMap {
  * @returns 记录表（副本；调用方改它不影响缓存）。
  */
 export async function loadKindRecords(): Promise<KindRecordMap> {
-  if (kindCache !== null) return new Map(kindCache)
-  const map: KindRecordMap = new Map()
+  if (kindCache !== null) return new KindRecordMap(kindCache)
+  const map = new KindRecordMap()
   for (const file of [legacyKindRecordsFile(), kindRecordsFile()]) {
     if (!existsSync(file)) continue
     try {
@@ -711,16 +812,20 @@ export async function loadKindRecords(): Promise<KindRecordMap> {
   }
   kindCache = map
   kindGeneration += 1
-  return new Map(map)
+  return new KindRecordMap(map)
 }
 
 /**
  * 写入一条记录（串行读改写）。
+ *
+ * 键走 canonicalKindKey（小写 owner/repo），记录体里的 repo 原样保留——展示名不能被
+ * 键的归一化污染，查询侧由 KindRecordMap 承担宽容。
+ *
  * @param repoKey - 仓库引用（会被归一化）。
- * @param record - 记录内容。
+ * @param record - 记录内容（可以是带 dirs/names 的落盘形态）。
  */
-export async function saveKindRecord(repoKey: string, record: InstalledKind): Promise<void> {
-  const key = normalizeRepoRef(repoKey) ?? repoKey
+export async function saveKindRecord(repoKey: string, record: InstalledKind | StoredKindRecord): Promise<void> {
+  const key = canonicalKindKey(repoKey)
   await enqueueMutation(async () => {
     const records = await loadKindRecords()
     records.set(key, record)
@@ -735,7 +840,7 @@ export async function saveKindRecord(repoKey: string, record: InstalledKind): Pr
  * @returns 是否真的存在并被删除。
  */
 export async function removeKindRecord(repoKey: string): Promise<boolean> {
-  const key = normalizeRepoRef(repoKey) ?? repoKey
+  const key = canonicalKindKey(repoKey)
   return await enqueueMutation(async () => {
     const records = await loadKindRecords()
     const existed = records.delete(key)
@@ -745,6 +850,97 @@ export async function removeKindRecord(repoKey: string): Promise<boolean> {
     }
     return existed
   })
+}
+
+/**
+ * 按任意等价拼写查一条安装记录（含它真正存放时用的键）。
+ *
+ * 这是写入侧与卸载侧应该用的显式入口：调用方拿到的是 `{ key, record }`，卸载时用 `key`
+ * 精确删除、用 `record.dirs` 精确清理目录，不再依赖"查表键恰好等于客户端回传字符串"。
+ *
+ * @param repoRef - 任意仓库拼写（owner/repo、URL、github:、展示名）。
+ * @returns 记录与其键；不存在时 undefined。
+ */
+export async function findKindRecord(repoRef: string): Promise<{ readonly key: string; readonly record: StoredKindRecord } | undefined> {
+  const records = await loadKindRecords()
+  const record = records.get(repoRef)
+  if (record === undefined) return undefined
+  const key = records.keyOf(repoRef)
+  return { key: key ?? canonicalKindKey(repoRef), record: record as StoredKindRecord }
+}
+
+/**
+ * 一条记录应当清理的目录（越界的不返回）。
+ *
+ * 优先用落盘形态的 `dirs`（多目录安装也精确）；旧记录退回 `dir`。返回的目录已经过
+ * isUnderRoot 过滤——卸载是破坏性操作，宁可少删也不越界删。
+ *
+ * @param record - 安装记录。
+ * @param root - 允许的根（技能根或预设根）。
+ * @returns 应当删除的绝对目录列表（去重、保持记录顺序）。
+ */
+export function kindDirsOf(record: InstalledKind | StoredKindRecord, root: string): string[] {
+  const stored = record as StoredKindRecord
+  const candidates = Array.isArray(stored.dirs) && stored.dirs.length > 0
+    ? stored.dirs
+    : record.dir === '' ? [] : [record.dir]
+  const out: string[] = []
+  for (const dir of candidates) {
+    if (typeof dir !== 'string' || dir === '') continue
+    if (!isUnderRoot(dir, root)) continue
+    if (!out.includes(dir)) out.push(dir)
+  }
+  return out
+}
+
+/**
+ * 扫描技能根与预设根，找出**没有任何安装记录认领**的目录。
+ *
+ * 为什么要有它：卸载失败、用户手工放置、外部工具清理记录都会留下目录残留，而契约
+ * （KindListResult.orphans）与客户端字典都承诺展示这一节。发布一个恒为空的区块等于
+ * 让用户以为"磁盘干净"，所以这里给出真实扫描。
+ *
+ * 扫描语义（刻意保守，宁可少报也不误报）：
+ *   - 只扫根的**下一层**目录：安装永远落在根下第一层，更深层属于技能/预设自己的内容，
+ *     把它们当成"未登记目录"没有意义；
+ *   - 跳过点目录（`.dsh-preset-owner.json` 之类的标记是文件，点目录不是安装产物）；
+ *   - 认领判定：任一记录的 `dirs` 或 `dir` 等于该目录，或者（旧记录没有 `dirs`、且 `dir`
+ *     等于根本身时）该目录名等于仓库末段的 slug——即单根安装的命名规则。
+ *     旧的多目录记录无法精确归属其余子目录，按"宁可少报"处理。
+ *
+ * @param options - 根覆盖（测试用）。
+ * @returns 未登记目录的绝对路径（排序后）。
+ */
+export async function findOrphanKindDirs(options: { readonly skillsRootDir?: string; readonly presetsRootDir?: string } = {}): Promise<string[]> {
+  const roots = [
+    { root: options.skillsRootDir ?? skillsRoot(), kind: 'skill' as const },
+    { root: options.presetsRootDir ?? presetsRoot(), kind: 'agent-preset' as const },
+  ]
+  const records = await loadKindRecords()
+  const claimed = new Set<string>()
+  for (const record of records.values()) {
+    const stored = record as StoredKindRecord
+    if (record.dir !== '') claimed.add(resolve(record.dir))
+    if (Array.isArray(stored.dirs)) {
+      for (const dir of stored.dirs) {
+        if (typeof dir === 'string' && dir !== '') claimed.add(resolve(dir))
+      }
+    }
+    for (const { root, kind } of roots) {
+      if (record.kind !== kind || resolve(record.dir) !== resolve(root)) continue
+      claimed.add(resolve(join(root, slugDirName(lastSegment(record.repo)))))
+    }
+  }
+  const orphans: string[] = []
+  for (const { root } of roots) {
+    for (const entry of await readEntries(root)) {
+      if (!entry.isDirectory() || entry.name.startsWith('.')) continue
+      const dir = join(root, entry.name)
+      if (claimed.has(resolve(dir))) continue
+      orphans.push(dir)
+    }
+  }
+  return orphans.sort()
 }
 
 /** 一条记录在磁盘上是否还有对应目录。 */
