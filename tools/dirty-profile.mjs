@@ -18,7 +18,8 @@
  * **实测约束（造脏前必读）**：三种"看起来更狠"的脏会让 dsh 在启动阶段硬失败，连界面都没有，
  * 因此不放进可启动变体（只在 --variant hostile 里复现）：bundle 声明了装不上的组合包
  * （"cannot resolve profile bundle"）、patch 行指向解析不到的包（ERR_MODULE_NOT_FOUND）、
- * patch 两行同 id（duplicate loader entry id）。详见 docs/private/visual-audit.md §11.1。
+ * 同一个 insert 列表内两行同 id（`duplicate loader entry id`；**per-group** 判定——同一个 id 落在两个不同
+ * insert 列表并不致命）。详见 docs/private/visual-audit.md §11.1。
  *
  * 用法：
  *   node tools/dirty-profile.mjs --profile pm-dirty-$$ [--port 3411] [--keep] [--out /tmp/vis-dirty]
@@ -57,7 +58,7 @@ const profile = argv.profile ?? ('pm-dirty-' + process.pid)
 const port = Number(argv.port ?? (3400 + Math.floor(Math.random() * 200)))
 const outDir = argv.out ?? '/tmp/vis-dirty'
 const keep = argv.keep === 'true'
-/** bootsafe：不会让整实例起不来的最小脏；hostile：含重复 id（真实会崩的那种）。 */
+/** bootsafe：不会让整实例起不来的最小脏；hostile：同一个 insert 列表里塞重复 id（实测会崩的那种）。 */
 const variant = argv.variant ?? 'bootsafe'
 /** 被禁用的官方行（web-app 组合包里真实存在的行 id）。 */
 const disabledRow = argv['disabled-row'] ?? 'ui-sidebar-files'

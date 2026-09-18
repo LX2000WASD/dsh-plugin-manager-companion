@@ -40,7 +40,7 @@ import {
   formatMissingRequirements, isGitSource, isSensitiveEnvKey, scanRequirements,
 } from './scan.ts'
 import { filterAnswers, sessionKey, withInstallSession } from './installSession.ts'
-import type { DiagnosticReport, InstalledKind } from './types.ts'
+import type { DiagnosticReport, EnvironmentInfo, InstalledKind } from './types.ts'
 
 /** 官方 runPluginCommand 的入参形状（结构式，见下）。 */
 export interface PluginOperationContext {
@@ -236,7 +236,9 @@ function prepareHome(options: CliOptions): void {
  * @returns 锚点绝对路径；解析不出时 undefined。
  */
 export async function resolveInstallAnchor(injected?: string): Promise<string | undefined> {
-  if (injected !== undefined && injected !== '') return injected
+  // 空白注入按"没给"处理：调用方用一个空格表达"别用注入值"比传 undefined 更常见，
+  // 当成锚点会让引擎拿一个空白路径去解析，而报错文本里只有一个空格，查不出原因。
+  if (injected !== undefined && injected.trim() !== '') return injected
   try {
     // 说明符放在变量里：官方包是 peer（CLI 可能在没装它的环境里使用），
     // 字面量说明符会让 tsc 去解析一个不保证存在的模块并让构建失败；
@@ -501,33 +503,288 @@ async function runMount(options: CliOptions, out: { stdout: (text: string) => vo
   return 0
 }
 
-/** analyze：跑诊断并打印，发现问题退出 1。 */
-async function runAnalyze(options: CliOptions, deps: CliDependencies, out: { stdout: (text: string) => void; stderr: (text: string) => void }): Promise<number> {
-  if (deps.analyze === undefined) {
-    out.stderr('dshpmc analyze: the diagnostics engine is not available in this invocation. '
-      + 'It is provided by the host plugin (open the companion environment console in the Web UI), '
-      + 'which owns the live loader context this check needs.' + String.fromCharCode(10))
-    return 2
-  }
-  const report = await deps.analyze(options.profile, DEFAULT_CONFIG)
-  if (options.json) {
-    out.stdout(JSON.stringify(report, undefined, 2) + String.fromCharCode(10))
-  } else {
-    out.stdout('environment: ' + report.environment + '   checked at ' + report.generatedAt + String.fromCharCode(10))
-    const counts = Object.entries(report.counts).filter(([, count]) => count > 0)
-    out.stdout('issues: ' + String(report.issues.length)
-      + (counts.length === 0 ? '' : ' (' + counts.map(([layer, count]) => layer + '=' + String(count)).join(', ') + ')')
-      + String.fromCharCode(10))
-    for (const issue of report.issues) {
-      out.stdout(String.fromCharCode(10) + '[' + issue.severity + '] ' + issue.code + ': ' + issue.title + String.fromCharCode(10))
-      out.stdout('  ' + issue.detail + String.fromCharCode(10))
-      for (const evidence of issue.evidence) out.stdout('  at ' + evidence.at + ' — ' + evidence.note + String.fromCharCode(10))
-      if (issue.fix !== undefined) out.stdout('  fix: ' + issue.fix.action + ' — ' + issue.fix.summary + String.fromCharCode(10))
-    }
-    for (const skip of report.skipped) out.stdout(String.fromCharCode(10) + 'skipped: ' + skip.check + ' — ' + skip.reason + String.fromCharCode(10))
-  }
-  return report.issues.length > 0 ? 1 : 0
+/** 引擎模块的最小结构式视图：动态加载，加载失败也要能报出可读原因。 */
+interface AnalyzerModule {
+  analyzeEnvironment(ctx: unknown, env: Record<string, unknown>, config: CompanionConfig): Promise<DiagnosticReport>
 }
+
+/** 诊断目标：EnvironmentInfo 加上可选安装锚点（与 diagnostics.ts 的 DiagnosticTargetEnvironment 同形）。 */
+type AnalyzeTarget = EnvironmentInfo & { readonly installAnchor?: string }
+
+/**
+ * 最小 host 上下文。
+ *
+ * 引擎对 ctx 只做两件事：ctx.get('profileContext') 取安装锚点、ctx.logger 记账。
+ * CLI 进程里两样都没有：get 一律 undefined（引擎会把它记成"没有锚点"的 skipped，
+ * 而不是当成"包不存在"），logger 用空实现。**不假装自己是宿主**。
+ *
+ * @returns 结构式最小上下文。
+ */
+export function minimalCliContext(): { get(name: string): undefined; logger: Record<string, () => void> } {
+  const noop = (): void => {}
+  return { get: () => undefined, logger: { debug: noop, info: noop, warn: noop, error: noop } }
+}
+
+/**
+ * 动态加载诊断引擎。
+ *
+ * 刻意不用静态 import：CLI 要在引擎的官方依赖（app-boot / plugin-inventory 等）缺失时
+ * 也能报出**可读的原因**，而不是让整个 bin 加载失败。说明符放在变量里，避免打包/编译期
+ * 去解析一个不保证存在的模块。
+ *
+ * @returns 引擎模块或失败原因。
+ */
+export async function loadAnalyzer(): Promise<{ readonly analyzer?: AnalyzerModule; readonly reason?: string }> {
+  try {
+    const specifier = './diagnostics.js'
+    const module = await import(specifier) as { analyzeEnvironment?: unknown }
+    if (typeof module.analyzeEnvironment !== 'function') {
+      return { reason: 'the diagnostics module exposes no analyzeEnvironment export' }
+    }
+    return { analyzer: module as unknown as AnalyzerModule }
+  } catch (error) {
+    return { reason: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+/**
+ * 由磁盘事实构造诊断目标（不依赖宿主）。
+ *
+ * @param name - 环境名。
+ * @param installAnchor - 已解析的安装锚点；解析不出时不传（引擎会如实记 skipped）。
+ * @returns 诊断目标。
+ */
+export function environmentTargetFor(name: string, installAnchor?: string): AnalyzeTarget {
+  const dir = environmentDir(name)
+  const manifest = readEnvironmentManifest(dir)
+  return {
+    name,
+    dir,
+    current: false,
+    builtin: isBuiltinEnvironment(name),
+    bundles: manifest.bundles,
+    dependencies: manifest.dependencies,
+    runs: [],
+    ...installAnchor === undefined ? {} : { installAnchor },
+  }
+}
+
+/**
+ * 启动阶段硬失败的根因特征。
+ *
+ * 这三种"脏"会让 dsh 在启动阶段就退出：用户连界面都没有，诊断页也永远看不到。
+ * CLI 是唯一的逃生口，所以这里把根因文本显式挑出来单独展示——即便它在报告里的
+ * 身份只是"某层被跳过的原因"（官方 composeEntries / loadProfileDirectory 会抛错，
+ * 引擎把抛错原因记进 skipped）。
+ */
+export const BOOT_BLOCKER_SIGNATURES: readonly string[] = [
+  'duplicate loader entry id',
+  'cannot resolve profile bundle',
+  'ERR_MODULE_NOT_FOUND',
+  'plugin tree failed to load',
+  'ERR_PACKAGE_PATH_NOT_EXPORTED',
+]
+
+/**
+ * 关键核对项：这些没跑完，就不能说"环境没问题"。
+ *
+ * 与"结构性不可用"分开：CLI 里没有活 Loader，运行时层（runtime）永远跳过，那是**已知且预期**
+ * 的缺失（要显著告知，但不构成"有问题"）；而依赖/组合/一致性三层是只读磁盘就能跑的，
+ * 它们跳过说明这次诊断并没有真正覆盖到"环境能不能起来"。
+ */
+export const CRITICAL_SKIP_CHECKS: readonly string[] = [
+  'environment-dir', 'dependency-layer', 'composition-official', 'composition-layer', 'consistency-layer',
+]
+
+/** 一次诊断的完整判定：覆盖情况 + 根因 + 退出码语义。 */
+export interface AnalyzeCoverage {
+  /** 哪个层跑完了 / 跳过了 / 被配置关闭。 */
+  readonly layers: readonly { readonly layer: string; readonly state: 'ran' | 'skipped' | 'disabled' }[]
+  /** 关键核对项没完成的原因（人类可读）。 */
+  readonly incomplete: readonly string[]
+  /** 启动阶段硬失败的根因文本（可能来自 skipped.reason，而不只是 issues）。 */
+  readonly blockers: readonly string[]
+  /** 判定：发现问题 / 没跑完 / 干净。 */
+  readonly verdict: 'issues' | 'incomplete' | 'clean'
+  /** 退出码：0 干净；1 有问题或没跑完；2 用法/环境错误由调用方给。 */
+  readonly code: number
+}
+
+/**
+ * 一个 skipped 条目归属的层。
+ *
+ * 优先用引擎给的 `layers`（task-29 起 DiagnosticSkip 带复数层归属——单数表达不了
+ * "一次能力缺失同时废掉两层"）；老引擎没有这个字段时退回按 check 名推断。
+ *
+ * @param skip - 跳过项。
+ * @returns 层名列表。
+ */
+function layersOfSkip(skip: { readonly check: string; readonly layers?: unknown }): string[] {
+  if (Array.isArray(skip.layers)) {
+    return skip.layers.filter((layer): layer is string => typeof layer === 'string')
+  }
+  const named = ['dependency', 'composition', 'runtime', 'consistency', 'ecosystem']
+    .filter(layer => skip.check === layer + '-layer' || skip.check.startsWith(layer + '-'))
+  return named
+}
+
+/**
+ * 这个跳过项是否让"环境没问题"这句话不能成立。
+ *
+ * 关键层是只读磁盘就能跑的三层（依赖/组合/一致性）：它们跳过说明这次诊断没有真正覆盖
+ * "环境能不能起来"。运行时层在 CLI 里结构性不可用（没有活 Loader），要显著告知，但不构成结论。
+ *
+ * @param skip - 跳过项。
+ * @returns 是否属于关键核对缺失。
+ */
+function isCriticalSkip(skip: { readonly check: string; readonly layers?: unknown }): boolean {
+  if (CRITICAL_SKIP_CHECKS.includes(skip.check)) return true
+  return layersOfSkip(skip).some(layer => CRITICAL_SKIP_CHECKS.includes(layer + '-layer'))
+}
+
+/** 文本里是否含启动阶段硬失败特征。 */
+function blockerHit(text: string): string | undefined {
+  for (const signature of BOOT_BLOCKER_SIGNATURES) {
+    if (text.includes(signature)) return signature
+  }
+  return undefined
+}
+
+/**
+ * 判定一次诊断的结果与退出码。
+ *
+ * 语义（刻意不让 issues=0 等于"健康"）：
+ *   - 有问题 → 'issues' / 1；
+ *   - 没问题但**关键核对项没跑完**（组合层读不出来、缺安装锚点）→ 'incomplete' / 1，
+ *     由调用方在文案里说清楚"这次没能完成组合层核对"；
+ *   - 只有关键项都跑完且没问题才是 'clean' / 0。
+ *
+ * @param report - 引擎报告。
+ * @param notes - 调用方补充的事实（例如"没有安装锚点"）。
+ * @returns 判定结果。
+ */
+export function judgeAnalyze(
+  report: DiagnosticReport,
+  notes: { readonly anchorMissing?: boolean; readonly disabledLayers?: readonly string[] } = {},
+): AnalyzeCoverage {
+  const blockers: string[] = []
+  const pushBlocker = (text: string): void => {
+    if (text === '' || blockerHit(text) === undefined) return
+    if (!blockers.includes(text)) blockers.push(text)
+  }
+  for (const issue of report.issues) {
+    pushBlocker(issue.title)
+    pushBlocker(issue.detail)
+    for (const evidence of issue.evidence) pushBlocker(evidence.at + ' — ' + evidence.note)
+    if (issue.fix !== undefined) pushBlocker(issue.fix.summary)
+  }
+  for (const skip of report.skipped) pushBlocker(skip.reason)
+
+  const incomplete: string[] = []
+  for (const skip of report.skipped) {
+    if (!isCriticalSkip(skip)) continue
+    incomplete.push(skip.check + ': ' + skip.reason)
+  }
+  if (notes.anchorMissing === true) {
+    incomplete.push('install-anchor: 没有安装锚点 → L1 dependency / L2 composition / L4 consistency 的模块解析缺安装侧根，本次结果不完整')
+  }
+
+  const disabled = new Set(notes.disabledLayers ?? [])
+  const skippedLayers = new Set<string>()
+  for (const skip of report.skipped) {
+    for (const layer of layersOfSkip(skip)) skippedLayers.add(layer)
+  }
+  const layers = ['dependency', 'composition', 'runtime', 'consistency', 'ecosystem'].map(layer => ({
+    layer,
+    state: disabled.has(layer)
+      ? 'disabled' as const
+      : skippedLayers.has(layer) ? 'skipped' as const : 'ran' as const,
+  }))
+
+  const verdict: AnalyzeCoverage['verdict'] = report.issues.length > 0
+    ? 'issues'
+    : (incomplete.length > 0 || blockers.length > 0) ? 'incomplete' : 'clean'
+  return { layers, incomplete, blockers, verdict, code: verdict === 'clean' ? 0 : 1 }
+}
+
+/**
+ * analyze：跑诊断并打印。
+ *
+ * 两条路径：
+ *   1. 宿主注入的 deps.analyze（Web 侧接线）优先——那条路径有自己的活 Loader；
+ *   2. 没有注入时**自己加载引擎只读跑**：环境起不来（bundle 解析不到 / patch 行解析不到 /
+ *      两行同 id）时界面上没有任何入口，CLI 是唯一的逃生口，所以这条路径必须真的能跑。
+ *
+ * @param options - 解析后的全局 flag。
+ * @param deps - 注入依赖。
+ * @param out - 输出 sink。
+ * @returns 退出码：0 干净；1 有问题/没跑完；2 用法或环境错误。
+ */
+async function runAnalyze(options: CliOptions, deps: CliDependencies, out: { stdout: (text: string) => void; stderr: (text: string) => void }): Promise<number> {
+  const nl = String.fromCharCode(10)
+  let report: DiagnosticReport
+  let anchorMissing = false
+  let anchorPath: string | undefined
+  if (deps.analyze !== undefined) {
+    report = await deps.analyze(options.profile, DEFAULT_CONFIG)
+  } else {
+    const loaded = await loadAnalyzer()
+    if (loaded.analyzer === undefined) {
+      out.stderr('dshpmc analyze: cannot load the diagnostics engine (' + (loaded.reason ?? 'unknown reason') + ').' + nl
+        + 'Install the companion package build (pnpm run build:host) or pass the host plugin path.' + nl)
+      return 2
+    }
+    anchorPath = await resolveInstallAnchor(deps.installAnchor)
+    anchorMissing = anchorPath === undefined
+    const target = environmentTargetFor(options.profile, anchorPath)
+    // 最小 ctx：没有活 Loader，运行时层会如实记 skipped（而不是假装查过）。
+    report = await loaded.analyzer.analyzeEnvironment(minimalCliContext(), { ...target }, DEFAULT_CONFIG)
+  }
+
+  const disabledLayers = Object.entries(DEFAULT_CONFIG.diagnostics)
+    .filter(([, enabled]) => enabled !== true)
+    .map(([layer]) => layer)
+  const judgement = judgeAnalyze(report, { anchorMissing, disabledLayers })
+  const counts = Object.entries(report.counts).filter(([, count]) => count > 0)
+
+  if (options.json) {
+    out.stdout(JSON.stringify(report, undefined, 2) + nl)
+    out.stderr('coverage: ' + judgement.layers.map(layer => layer.layer + '=' + layer.state).join(' ')
+      + '  verdict: ' + judgement.verdict + nl)
+    return judgement.code
+  }
+
+  out.stdout('environment: ' + report.environment + '   checked at ' + report.generatedAt + nl)
+  out.stdout('  dir: ' + environmentDir(options.profile) + nl)
+  out.stdout('  coverage: ' + judgement.layers.map(layer => layer.layer + '=' + layer.state).join(' ') + nl)
+  out.stdout('  install anchor: ' + (anchorPath ?? (deps.analyze === undefined ? 'MISSING' : 'provided by the host')) + nl)
+  out.stdout('issues: ' + String(report.issues.length)
+    + (counts.length === 0 ? '' : ' (' + counts.map(([layer, count]) => layer + '=' + String(count)).join(', ') + ')')
+    + nl)
+
+  if (judgement.blockers.length > 0) {
+    out.stdout(nl + '!!! boot-blocking root cause detected — this environment cannot start:' + nl)
+    for (const blocker of judgement.blockers) out.stdout('  - ' + blocker + nl)
+  }
+  if (judgement.verdict === 'incomplete') {
+    out.stdout(nl + 'INCOMPLETE: 这次没能完成关键核对——issues=0 **不代表环境健康**。' + nl)
+    for (const reason of judgement.incomplete) out.stdout('  - ' + reason + nl)
+    for (const blocker of judgement.blockers) {
+      if (!judgement.incomplete.some(reason => reason.includes(blocker))) out.stdout('  - 未提升为问题的根因：' + blocker + nl)
+    }
+    out.stdout('  （把根因提升为正式问题属于诊断引擎的事；CLI 只负责如实展示。）' + nl)
+  }
+
+  for (const issue of report.issues) {
+    out.stdout(nl + '[' + issue.severity + '] ' + issue.code + ': ' + issue.title + nl)
+    out.stdout('  ' + issue.detail + nl)
+    for (const evidence of issue.evidence) out.stdout('  at ' + evidence.at + ' — ' + evidence.note + nl)
+    if (issue.fix !== undefined) out.stdout('  fix: ' + issue.fix.action + ' — ' + issue.fix.summary + nl)
+  }
+  for (const skip of report.skipped) out.stdout(nl + 'skipped: ' + skip.check + ' — ' + skip.reason + nl)
+  return judgement.code
+}
+
 
 /** uninstall-kind：删除一次 skill/预设直装（含预设归属清理）。 */
 async function runUninstallKind(options: CliOptions, out: { stdout: (text: string) => void; stderr: (text: string) => void }): Promise<number> {

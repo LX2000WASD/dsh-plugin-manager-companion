@@ -51,6 +51,9 @@ import type {
 /** 传给官方装载函数（loadProfileDirectory / loadOptionalPatches）的诊断前缀。 */
 const DIAG_BIN = 'dsh-plugin-manager-companion'
 
+/** 五层的固定顺序：只在"环境级能力缺失废掉全部五层"这种跳过里用得到。 */
+const ALL_LAYERS: readonly DiagnosticLayer[] = ['dependency', 'composition', 'runtime', 'consistency', 'ecosystem']
+
 /** 单包源码扫描的硬上限（质量门要覆盖整条加载链，所以给得宽）。超出即标注 truncated。 */
 const SCAN_MAX_FILES_PER_PACKAGE = 400
 
@@ -207,7 +210,12 @@ export async function analyzeEnvironment(
   const usedIds = new Set<string>()
 
   if (!existsSync(env.dir)) {
-    skipped.push({ check: 'environment-dir', reason: '环境目录不存在：' + env.dir })
+    // 环境目录不存在：五层都没有输入（不是"查过且没问题"，每层都必须显示成没查）。
+    skipped.push({
+      check: 'environment-dir',
+      layers: [...ALL_LAYERS],
+      reason: '环境目录不存在：' + env.dir,
+    })
   }
 
   // 解析根要安装锚点：调用方透传优先，其次问官方 profileContext（launcher 一定会提供它）。
@@ -226,8 +234,11 @@ export async function analyzeEnvironment(
     runtime = { entries: [], agentPresets: undefined, source: 'unavailable', reason: messageOf(error) }
   }
   if (runtime.source === 'unavailable') {
+    // 没有 Loader：runtime 与 consistency 两层都真的没跑（两层的实现都按 source==='unavailable' 早退）。
+    // 只标一层会把另一层画成 0 = "查过且没问题"，那正是这个字段要防的误读。
     skipped.push({
       check: 'runtime-inventory',
+      layers: ['runtime', 'consistency'],
       reason: '运行时事实不可用（Loader 服务缺失，或官方投影与 Loader 直读都失败）：'
         + (runtime.reason ?? '原因未知'),
     })
@@ -248,6 +259,8 @@ export async function analyzeEnvironment(
     if (!layerEnabled(diagnostics, entry.layer)) {
       skipped.push({
         check: entry.layer + '-layer',
+        // 整层没查：带上层归属，UI 才能把这一格画成「没查」而不是 0。
+        layers: [entry.layer],
         reason: '配置里关闭了该层（settings.diagnostics.' + entry.layer + '）',
       })
       continue
@@ -255,8 +268,14 @@ export async function analyzeEnvironment(
     try {
       issues.push(...entry.run())
     } catch (error) {
-      // 单层内部异常：如实登记为"这次没查成"，不让其余四层的结论被吞掉。
-      skipped.push({ check: entry.layer + '-layer', reason: '该层执行失败：' + messageOf(error) })
+      // 单层内部异常：如实登记为"这次没查成"，不让其余层的结论被吞掉。
+      // 这同样是整层没查：layers 必须设上，否则 UI 会把它画成 0（=查过且没问题）。
+      // 抛错的是这一层，就只标这一层——不替别的层下结论。
+      skipped.push({
+        check: entry.layer + '-layer',
+        layers: [entry.layer],
+        reason: '该层执行失败：' + messageOf(error),
+      })
     }
   }
 
@@ -512,6 +531,7 @@ function dependencyLayer(
       detail: '该环境的 package.json 读取失败（' + facts.manifest.broken + '），'
         + '依赖声明全部读不到：以它启动的 profile 会在 boot 阶段直接失败。',
       subjects: [env.name],
+      scope: env.name.length > 0 ? env.name : undefined,
       evidence: [{ kind: 'file', at: 'package.json', note: '解析失败的 manifest' }],
       id: 'broken-manifest',
     }))
@@ -848,7 +868,7 @@ function crossGroupDuplicateIssue(
       + '修法：给其中一行换一个 id，或删掉不再需要的那一行。'
       + (first === undefined ? '' : manualEditSteps(env, first, id, facts.packageDirs, true, 'either')),
     subjects: [id],
-    scope: scopeOfPatchFile(rows[0]?.file),
+    scope: scopeOfPatchFile(env.name, env.dir, rows[0]?.file),
     evidence: rows.map(row => ({
       kind: 'file' as const,
       at: relativeTo(env.dir, row.file) + ':' + row.line,
@@ -916,7 +936,7 @@ function compositionLayer(
         operation: '删除 ' + relativeTo(env.dir, first.file) + ' 第 ' + first.line + ' 行起的 id=' + id
           + ' 的重复 insert 行，只保留第一处，然后重启该环境',
       },
-      scope: scopeOfPatchFile(rows[0]?.file),
+      scope: scopeOfPatchFile(env.name, env.dir, rows[0]?.file),
       evidence: [
         ...rows.map((row, index) => ({
           kind: 'file' as const,
@@ -956,7 +976,7 @@ function compositionLayer(
         + '（官方启停开关、后续 patch、行级配置）都无法稳定指向它，重启一次就换了身份。'
         + '给这一行补一个显式 id 即可，没有副作用。',
       subjects: [row.name ?? '(anonymous)', at],
-      scope: scopeOfPatchFile(row.file),
+      scope: scopeOfPatchFile(env.name, env.dir, row.file),
       evidence: [{ kind: 'file', at, note: '缺少显式 id 的 insert 行' }],
       id: 'unaddressable-row:' + at,
     }))
@@ -987,7 +1007,7 @@ function compositionLayer(
         rowReachedComposition(composition, row))
         + '另一条路是把包装进来（' + name + '），装好再重启该环境。',
       subjects: [name],
-      scope: scopeOfPatchFile(row.file),
+      scope: scopeOfPatchFile(env.name, env.dir, row.file),
       extra: {
         operation: '删除 ' + at + ' 的 insert 行（id=' + rowId + '）后重启该环境；或先安装 ' + name,
       },
@@ -2432,17 +2452,44 @@ function manualEditSteps(
 }
 
 /**
- * patch 文件归属的包名：patch 与它的 package.json 同目录时取那个包名，否则 undefined。
+ * 一条发现的「作用域」标签：环境级的问题用**环境名**，包级的问题用**包名**。
  *
- * 只认**同目录**这一种形态：官方 bundle 的 patch（包根下的 cordis.patch.yml）与包内任意
- * 深度的 patch 都命中；用户写在 profile 目录的 patch 也命中，那时作用域正是 profile 本身，
- * 与「这一行属于谁」的语义一致，不产生误导。
+ * 环境名的权威来源是**目录名**（官方 resolveProfileDir(\`dsh --profile <name>\`) 的入参；
+ * loadProfileDirectory 返回的 Profile.name = basename(dir)）。profile manifest 里的 name 只是
+ * 初始化时写进去的一个值，之后不同步——用户手工重命名环境目录后它还是旧值，拿它当环境身份
+ * 就会出现「同一页两个名字」（auditor 真机验证）。所以：
+ *   · patch 落在环境目录内、且不在它的 node_modules 下 → 用户自己那份 cordis.patch.yml → 环境名；
+ *   · 其它情况（包自带的 patch）→ 该包自己的 package.json name。
+ *
+ * @param envName - 环境名（EnvironmentInfo.name，即目录名）。
+ * @param envDir - 环境目录绝对路径。
+ * @param file - patch 文件绝对路径；缺省时 undefined。
+ * @returns 作用域标签；两边都判不出来时 undefined（调用方按环境名兜底）。
  */
-function scopeOfPatchFile(file: string | undefined): string | undefined {
-  if (file === undefined) return undefined
-  const manifest = readJsonFile(join(dirname(file), 'package.json'))
-  const name = manifest?.['name']
-  return typeof name === 'string' && name.length > 0 ? name : undefined
+function scopeOfPatchFile(envName: string, envDir: string, file: string | undefined): string | undefined {
+  if (file === undefined) return envName.length > 0 ? envName : undefined
+  const inProfilePatch = isInside(envDir, file) && !isInside(join(envDir, 'node_modules'), file)
+  if (inProfilePatch) return envName.length > 0 ? envName : undefined
+  return packageNameOfFile(file) ?? (envName.length > 0 ? envName : undefined)
+}
+
+/**
+ * patch 文件归属的包名：从它的目录起往上找最近的 package.json（包根），读那一个包的 name。
+ *
+ * @param file - patch 文件绝对路径。
+ * @returns 包名；找不到时 undefined。
+ */
+function packageNameOfFile(file: string): string | undefined {
+  let dir = dirname(file)
+  for (let depth = 0; depth < 6; depth += 1) {
+    const manifest = readJsonFile(join(dir, 'package.json'))
+    const name = manifest?.['name']
+    if (typeof name === 'string' && name.length > 0) return name
+    const parent = dirname(dir)
+    if (parent === dir) break
+    dir = parent
+  }
+  return undefined
 }
 
 /** 本次解析真正查过的根（写进 detail：结论必须说清查过什么，用户才能判断可信度）。 */

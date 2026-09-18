@@ -496,10 +496,10 @@ describe('diagnostics · 噪声治理', () => {
     const duplicate = report.groups.find(group => group.code === 'duplicate-row-id')
     assert.ok(duplicate, '应有一个 duplicate-row-id 组：' + JSON.stringify(report.groups))
     assert.equal(duplicate.count, 1)
-    assert.deepEqual(duplicate.scopes, [{ scope: 'dsh-profile-demo', count: 1 }],
-      '组要说明命中归属哪个包（demo profile 的 patch 与其 package.json 同目录）')
-    assert.ok(duplicate.key.startsWith('composition:duplicate-row-id:confirm-fix:dsh-profile-demo'),
-      '组键要带上严重级别：' + duplicate.key)
+    assert.deepEqual(duplicate.scopes, [{ scope: 'demo', count: 1 }],
+      '环境级 patch 的作用域必须是环境名（目录名），不是 manifest 里的 name')
+    assert.ok(duplicate.key.startsWith('composition:duplicate-row-id:confirm-fix:demo'),
+      '组键要带上严重级别与作用域：' + duplicate.key)
     assert.ok(duplicate.exampleTitle.includes('alpha'), '组要带一条样例标题：' + duplicate.exampleTitle)
   })
 })
@@ -594,6 +594,140 @@ describe('diagnostics · 需人工处理的提示（后果 + 三要素）', () =
   })
 })
 
+
+describe('diagnostics · 作用域标签（环境名 vs manifest name）', () => {
+  it('环境级 patch 的 scope 用环境名（目录名），不用 manifest 的 name', async () => {
+    // fixture：目录名 demo，manifest.name dsh-profile-demo（官方允许两者不同步）
+    const report = await analyzeEnvironment(makeCtx({}), ENV(installAnchor), CONFIG)
+    const duplicate = report.issues.find(issue => issue.code === 'duplicate-row-id')
+    const orphan = report.issues.find(issue => issue.code === 'orphan-row')
+    assert.ok(duplicate, '要能拿到环境级 patch 的发现')
+    assert.equal(duplicate.scope, 'demo', 'duplicate-row-id 的 scope 必须是环境名：' + duplicate.scope)
+    assert.equal(orphan.scope, 'demo', 'orphan-row 的 scope 必须是环境名：' + orphan.scope)
+    const group = report.groups.find(item => item.code === 'duplicate-row-id')
+    assert.deepEqual(group.scopes, [{ scope: 'demo', count: 1 }])
+    assert.ok(group.key.endsWith(':demo'), '组键也要用环境名：' + group.key)
+  })
+
+  it('环境级问题（坏 manifest）也有 scope，且是环境名', async () => {
+    const env = { name: 'broken', dir: brokenDir, current: false, builtin: false, bundles: [], dependencies: [], runs: [], installAnchor }
+    const report = await analyzeEnvironment(makeCtx({}), env, CONFIG)
+    const issue = report.issues.find(candidate => candidate.code === 'broken-manifest')
+    assert.ok(issue, '应检出 broken-manifest')
+    assert.equal(issue.scope, 'broken', '环境级问题的 scope 是环境名：' + issue.scope)
+  })
+
+  it('变异验证：把 scope 换成 manifest 的 name，钉住的断言必须报红', async () => {
+    const report = await analyzeEnvironment(makeCtx({}), ENV(installAnchor), CONFIG)
+    const issue = report.issues.find(candidate => candidate.code === 'orphan-row')
+    assert.equal(issue.scope, 'demo')
+    const mutated = Object.assign({}, issue, { scope: 'dsh-profile-demo' })
+    assert.notEqual(mutated.scope, 'demo')
+    assert.throws(() => assert.equal(mutated.scope, 'demo', '旧行为必须被钉住'),
+      '改回 manifest name 后断言必须失败——否则这条钉子抓不到回归')
+  })
+
+  it('环境名与包名不混用：bundle 自带的 patch 仍用包名', async () => {
+    const env = { name: 'bundle-holder2', dir: join(home, 'profiles', 'bundle-holder'), current: false, builtin: false, bundles: ['probe-bundle'], dependencies: [], runs: [], installAnchor }
+    const report = await analyzeEnvironment(makeCtx({}), env, CONFIG)
+    const issue = report.issues.find(candidate => candidate.code === 'orphan-row')
+    assert.ok(issue, '应检出 orphan-row')
+    assert.equal(issue.scope, 'probe-bundle', '包自带的 patch 用包名，不能写成环境名')
+  })
+})
+
+describe('diagnostics · 跳过项（哪一层没查，是引擎给的显式事实）', () => {
+  /** 非层级检查的稳定机器码：它们只说明某层结论不完整，不代表整层没查，不许带 layers。 */
+  const NON_LAYER_CHECKS = [
+    'install-anchor', 'dependency-scan', 'composition-official', 'ecosystem-index',
+  ]
+
+  it('关闭某一层：skip 的 layers 等于 [该层]，check 名不变', async () => {
+    const config = { ...CONFIG, diagnostics: { ...CONFIG.diagnostics, dependency: false, runtime: false } }
+    const report = await analyzeEnvironment(makeCtx({}), ENV(installAnchor), config)
+    const dependencySkip = report.skipped.find(item => item.check === 'dependency-layer')
+    assert.ok(dependencySkip, '关掉依赖层要有 skip：' + JSON.stringify(report.skipped.map(item => item.check)))
+    assert.deepEqual(dependencySkip.layers, ['dependency'], '整层没查必须给出层归属')
+    const runtimeSkip = report.skipped.find(item => item.check === 'runtime-layer')
+    assert.deepEqual(runtimeSkip.layers, ['runtime'])
+  })
+
+  it('没有 Loader：runtime 与 consistency 两层都被标成没查（不是只标一层）', async () => {
+    const report = await analyzeEnvironment(makeCtx({}), ENV(installAnchor), CONFIG)
+    const skip = report.skipped.find(item => item.check === 'runtime-inventory')
+    assert.ok(skip, '缺 Loader 要有 runtime-inventory skip')
+    assert.deepEqual(skip.layers, ['runtime', 'consistency'],
+      '一次能力缺失同时废掉两层，漏标出来的正是"查过且没问题"')
+    assert.equal(report.counts.runtime, 0)
+    assert.equal(report.counts.consistency, 0)
+  })
+
+  it('环境目录不存在：五层全覆盖（每层都不能显示成 0）', async () => {
+    const env = { ...ENV(installAnchor), dir: join(home, 'profiles', 'nope') }
+    const report = await analyzeEnvironment(makeCtx({}), env, CONFIG)
+    const skip = report.skipped.find(item => item.check === 'environment-dir')
+    assert.ok(skip, '要有 environment-dir skip')
+    assert.deepEqual([...skip.layers].sort(), ['composition', 'consistency', 'dependency', 'ecosystem', 'runtime'])
+  })
+
+  it('反向用例：install-anchor / dependency-scan / composition-official / ecosystem-index 不设 layers', async () => {
+    const env = { name: 'broken', dir: brokenDir, current: false, builtin: false, bundles: [], dependencies: [], runs: [] }
+    // 打开生态层才会走到它的骨架跳过（默认关闭时那一层是显式关闭，属于层级跳过）。
+    const config = { ...CONFIG, diagnostics: { ...CONFIG.diagnostics, ecosystem: true } }
+    const report = await analyzeEnvironment(makeCtx({}), env, config)
+    const seen = new Set(report.skipped.map(item => item.check))
+    for (const check of ['composition-official', 'ecosystem-index']) {
+      assert.ok(seen.has(check), 'fixture 应当产生 ' + check + '：' + JSON.stringify([...seen]))
+    }
+    for (const item of report.skipped) {
+      if (NON_LAYER_CHECKS.includes(item.check)) {
+        assert.equal(item.layers, undefined, item.check + ' 不是整层没查，不能带 layers')
+      }
+    }
+    // 锚点缺省时同样不许带（它只说明依赖层结论偏少）
+    const noAnchor = await analyzeEnvironment(makeCtx({}), ENV(), CONFIG)
+    const anchorSkip = noAnchor.skipped.find(item => item.check === 'install-anchor')
+    assert.ok(anchorSkip, '缺锚点要有 install-anchor skip')
+    assert.equal(anchorSkip.layers, undefined, '锚点缺失不是整层没查')
+  })
+
+  it('不变量：带 layers 的 skip 的 check 必须是 <layer>-layer', async () => {
+    const config = { ...CONFIG, diagnostics: { ...CONFIG.diagnostics, composition: false, consistency: false } }
+    const report = await analyzeEnvironment(makeCtx({}), ENV(installAnchor), config)
+    const layered = report.skipped.filter(item => item.layers !== undefined)
+    assert.ok(layered.length >= 2, '至少两处整层跳过：' + JSON.stringify(report.skipped.map(item => item.check)))
+    for (const item of layered) {
+      // 单层跳过（关闭/执行失败）的机器码必须与层一致；多层的走各自的事实用例（runtime-inventory）。
+      if (item.layers.length === 1) {
+        assert.equal(item.check, item.layers[0] + '-layer', '层归属与机器码必须一致：' + item.check)
+      }
+      assert.ok(NON_LAYER_CHECKS.includes(item.check) === false, '层级检查不该在非层级名单里：' + item.check)
+    }
+    assert.ok(layered.some(item => item.check === 'composition-layer' && item.layers.length === 1),
+      'fixture 里应当有单层跳过：' + JSON.stringify(report.skipped.map(item => [item.check, item.layers])))
+  })
+
+  it('变异验证①：删掉 layers 设置后，钉住的断言必须报红', async () => {
+    const config = { ...CONFIG, diagnostics: { ...CONFIG.diagnostics, dependency: false } }
+    const report = await analyzeEnvironment(makeCtx({}), ENV(installAnchor), config)
+    const skip = report.skipped.find(item => item.check === 'dependency-layer')
+    assert.deepEqual(skip.layers, ['dependency'])
+    const mutated = Object.assign({}, skip)
+    delete mutated.layers
+    assert.throws(() => assert.deepEqual(mutated.layers, ['dependency'], '整层没查必须给出层归属'),
+      '去掉 layers 后断言必须失败——否则 UI 会把它画成 0（=查过且没问题）')
+  })
+
+  it('变异验证②：把两层压成一层，runtime-inventory 的断言必须报红', async () => {
+    const report = await analyzeEnvironment(makeCtx({}), ENV(installAnchor), CONFIG)
+    const skip = report.skipped.find(item => item.check === 'runtime-inventory')
+    assert.deepEqual(skip.layers, ['runtime', 'consistency'])
+    const collapsed = { ...skip, layers: [...skip.layers].slice(0, 1) }
+    assert.deepEqual(collapsed.layers, ['runtime'])
+    assert.throws(() => assert.deepEqual(collapsed.layers, ['runtime', 'consistency']),
+      '压成一层后必须报红——那会把 consistency 画成"查过且没问题"')
+  })
+})
 describe('diagnostics · 词法扫描器', () => {
   it('注释与字符串里的伪注册、伪 import 都不算数', () => {
     const code = [
