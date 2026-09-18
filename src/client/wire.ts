@@ -214,13 +214,34 @@ function group(raw: unknown, index: number): DiagnosticGroup | undefined {
   }
 }
 
-/** 一条跳过记录。 */
-function skip(raw: unknown, index: number): DiagnosticSkip | undefined {
+/**
+ * 一条跳过记录。
+ *
+ * `layers` 必须**原样透传**：它是引擎的事实，界面据此区分"这一层查过且没问题"与
+ * "这一层根本没查"。复数而不是单数是有据可依的——有的能力缺失会同时废掉两层
+ * （runtime-inventory 缺失 → runtime 与 consistency 都没查），单数会把另一层错标成
+ * "查过了、没问题"。客户端**不能**靠 check 字符串的形状反推层：那是约定耦合，
+ * check 一改名就会静默退化成"显示 0"（把没查画成没问题）。
+ *
+ * 归一在这里只做校验，三条规则：
+ *   1. 引擎给的、且是已知层名的项才保留；
+ *   2. 未知层名**不发明**（丢掉该项，而不是映射到某一层）；
+ *   3. 非层级跳过（如 environment-dir）不带本字段——它不代表整层没查。
+ *
+ * @param raw - 原始项。
+ * @param index - 报告内下标（用于合成缺失的 check）。
+ * @param known - 已知的层名（调用方从 LAYER_ORDER 传进来）。
+ * @returns 归一后的跳过记录；原始项不是对象时 undefined。
+ */
+function skip(raw: unknown, index: number, known: readonly DiagnosticLayer[]): DiagnosticSkip | undefined {
   const record = asObject(raw)
   if (record === undefined) return undefined
+  const layers = texts(record['layers'])
+    .filter((name): name is DiagnosticLayer => known.includes(name as DiagnosticLayer))
   return {
     check: text(record['check'], 'unknown#' + String(index + 1)),
     reason: text(record['reason']),
+    ...layers.length === 0 ? {} : { layers },
   }
 }
 
@@ -253,7 +274,7 @@ export function normalizeReport(raw: unknown, layers: readonly DiagnosticLayer[]
     counts: counts as unknown as Readonly<Record<DiagnosticLayer, number>>,
     issues,
     skipped: asArray(record['skipped'])
-      .map((item, index) => skip(item, index))
+      .map((item, index) => skip(item, index, layers))
       .filter((item): item is DiagnosticSkip => item !== undefined),
     // groups 是可选的线上契约字段：没有就保持没有（界面据此走"逐条列表"路径）。
     ...groups.length === 0 ? {} : { groups },

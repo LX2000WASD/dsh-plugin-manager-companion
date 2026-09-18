@@ -588,9 +588,19 @@ export class HealthController {
     // 见 ConsolePage 的 HealthPanel）。控制器不重复判断——它拿不到 profile 事实。
     const action = issue.fix
     if (action === undefined) return
-    this.store.update((draft) => { draft.fixingId = issue.id; draft.error = undefined })
+    // 开跑时把上一次的失败一起清掉：只清 error 不清 errorKey 会让上一轮的失败文案留在页面上，
+    // 与新状态互相矛盾（同族倒挂的镜像：旧失败盖在新结果上）。
+    this.store.update((draft) => {
+      draft.fixingId = issue.id
+      draft.error = undefined
+      draft.errorKey = undefined
+      draft.notice = undefined
+    })
     try {
-      const result = await runJob<EnvironmentResult>(FIX_OP, { action: action.action, ...action.target === undefined ? {} : { target: action.target } })
+      // 结果必须归一：形状不符时 normalizeEnvironmentResult 给出 ok=false + 明确 code，
+      // 否则 result.output/code 都是 undefined，失败会被静默吞掉（页面上什么都不显示）。
+      const result = normalizeEnvironmentResult(
+        await runJob<unknown>(FIX_OP, { action: action.action, ...action.target === undefined ? {} : { target: action.target } }))
       this.store.update((draft) => {
         draft.fixingId = undefined
         draft.notice = result.output
@@ -648,6 +658,8 @@ export interface EnvironmentsFace {
 /** 环境控制器。 */
 export class EnvironmentsController {
   private readonly store: SnapshotStore<EnvironmentsState>
+  /** "读列表"写下的失败；只有它能被下一次成功的读取清掉（见 ReadFailureLedger）。 */
+  private readonly readFailure = new ReadFailureLedger()
 
   constructor() {
     this.store = createSnapshotStore<EnvironmentsState>({
@@ -679,20 +691,39 @@ export class EnvironmentsController {
     }
   }
 
-  /** 重新读环境列表。 */
+  /**
+   * 重新读环境列表。
+   *
+   * **只动 loading**：`notice` / `error` 描述的是"上一次操作"，刷新列表是另一回事，
+   * 无权替操作宣布结果。这里曾经先清 error/errorKey，而 act() 是"先落结果、再 refresh"——
+   * 于是写操作失败后马上被这一行抹掉，结果块的 exitCode 恒为 0、界面上呈现成"完成"
+   * （真机复现：复制插件填一个不存在的包 → 结果块「完成」，输出却是失败文本）。
+   *
+   * 为什么不改成"把落定挪到 refresh 之后"：那要求每个新操作都记得排序，本 bug 正是
+   * 这种调用顺序约定失效的产物；而"刷新列表不碰操作结果"是一条不依赖调用方记性的规则。
+   * 失败态由操作自身清零（每个操作开始时清）与 dismissEnvironmentNotice 负责。
+   */
   async refresh(): Promise<void> {
-    this.store.update((draft) => { draft.loading = true; draft.error = undefined; draft.errorKey = undefined })
+    this.store.update((draft) => { draft.loading = true })
     try {
       const environments = normalizeEnvironments(await callOp<unknown>('listEnvironments', {}))
       if (environments === undefined) {
-        this.store.update((draft) => { draft.loading = false; draft.errorKey = 'error.incompletePayload' })
+        this.store.update((draft) => {
+          draft.loading = false
+          draft.errorKey = this.readFailure.record('error.incompletePayload')
+        })
         return
       }
-      this.store.update((draft) => { draft.environments = environments; draft.loading = false })
+      this.store.update((draft) => {
+        draft.environments = environments
+        draft.loading = false
+        this.readFailure.clearOwn(draft)
+      })
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
       this.store.update((draft) => {
         draft.loading = false
-        draft.error = error instanceof Error ? error.message : String(error)
+        draft.error = this.readFailure.record(message)
       })
     }
   }
@@ -733,7 +764,13 @@ export class EnvironmentsController {
    * @param name - 被备份的环境名。
    */
   async exportBackup(name: string): Promise<void> {
-    this.store.update((draft) => { draft.busy = `backup ${name}`; draft.error = undefined; draft.errorKey = undefined; draft.diff = undefined })
+    this.store.update((draft) => {
+      draft.busy = `backup ${name}`
+      draft.error = undefined
+      draft.errorKey = undefined
+      draft.notice = undefined
+      draft.diff = undefined
+    })
     try {
       const backup = normalizeBackup(await callOp<unknown>('backupExport', { name }))
       if (backup === undefined) {
@@ -755,6 +792,13 @@ export class EnvironmentsController {
    * @param file - 浏览器 File 对象。
    */
   async loadBackup(file: File): Promise<void> {
+    // 读文件也是一次操作：起始先把上一次的结果块清掉，否则失败时结果块里留着的
+    // 是**上一次**操作的输出（P6：导入无效备份时块里还是上一次的内容）。
+    this.store.update((draft) => {
+      draft.notice = undefined
+      draft.error = undefined
+      draft.errorKey = undefined
+    })
     try {
       const text = await file.text()
       // 用户挑的文件可能根本不是备份（甚至是任意 JSON）：归一不过就拒绝，
@@ -785,7 +829,12 @@ export class EnvironmentsController {
   async diffBackup(target: string): Promise<void> {
     const backup = this.store.getSnapshot().backup
     if (backup === undefined) return
-    this.store.update((draft) => { draft.busy = `diff ${target}`; draft.error = undefined; draft.errorKey = undefined })
+    this.store.update((draft) => {
+      draft.busy = `diff ${target}`
+      draft.error = undefined
+      draft.errorKey = undefined
+      draft.notice = undefined
+    })
     try {
       const diff = normalizeBackupDiff(await callOp<unknown>('backupDiff', { backup, target }))
       if (diff === undefined) {
@@ -853,6 +902,8 @@ export interface MarketItemView {
 /** 市场控制器。 */
 export class MarketplaceController {
   private readonly store: SnapshotStore<MarketplaceState>
+  /** "读索引"写下的失败；只有它能被下一次成功的读取清掉（见 ReadFailureLedger）。 */
+  private readonly readFailure = new ReadFailureLedger()
 
   constructor() {
     this.store = createSnapshotStore<MarketplaceState>({
@@ -881,18 +932,26 @@ export class MarketplaceController {
    * @param refresh - 是否强制绕过缓存。
    */
   async load(refresh: boolean): Promise<void> {
-    this.store.update((draft) => { draft.loading = true; draft.error = undefined; draft.errorKey = undefined })
+    this.store.update((draft) => { draft.loading = true })
     try {
       const result = normalizeMarketplace(await callOp<unknown>('marketplace', { refresh }))
       if (result === undefined) {
-        this.store.update((draft) => { draft.loading = false; draft.errorKey = 'error.incompletePayload' })
+        this.store.update((draft) => {
+          draft.loading = false
+          draft.errorKey = this.readFailure.record('error.incompletePayload')
+        })
         return
       }
-      this.store.update((draft) => { draft.result = result; draft.loading = false })
+      this.store.update((draft) => {
+        draft.result = result
+        draft.loading = false
+        this.readFailure.clearOwn(draft)
+      })
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
       this.store.update((draft) => {
         draft.loading = false
-        draft.error = error instanceof Error ? error.message : String(error)
+        draft.error = this.readFailure.record(message)
       })
     }
   }
@@ -948,6 +1007,8 @@ export interface KindsFace {
 /** 技能与预设控制器。 */
 export class KindsController {
   private readonly store: SnapshotStore<KindsState>
+  /** "读记录"写下的失败；只有它能被下一次成功的读取清掉（见 ReadFailureLedger）。 */
+  private readonly readFailure = new ReadFailureLedger()
 
   constructor() {
     this.store = createSnapshotStore<KindsState>({
@@ -966,22 +1027,27 @@ export class KindsController {
 
   /** 读技能与预设记录。 */
   async load(): Promise<void> {
-    this.store.update((draft) => { draft.loading = true; draft.error = undefined; draft.errorKey = undefined })
+    this.store.update((draft) => { draft.loading = true })
     try {
       const result = normalizeKindList(await callOp<unknown>('listKinds', {}))
       if (result === undefined) {
-        this.store.update((draft) => { draft.loading = false; draft.errorKey = 'error.incompletePayload' })
+        this.store.update((draft) => {
+          draft.loading = false
+          draft.errorKey = this.readFailure.record('error.incompletePayload')
+        })
         return
       }
       this.store.update((draft) => {
         draft.records = result.records
         draft.orphans = result.orphans
         draft.loading = false
+        this.readFailure.clearOwn(draft)
       })
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
       this.store.update((draft) => {
         draft.loading = false
-        draft.error = error instanceof Error ? error.message : String(error)
+        draft.error = this.readFailure.record(message)
       })
     }
   }
@@ -991,7 +1057,13 @@ export class KindsController {
    * @param repo - owner/repo。
    */
   async uninstall(repo: string): Promise<void> {
-    this.store.update((draft) => { draft.busy = repo; draft.error = undefined; draft.notice = undefined })
+    // 同 health.fix：开跑时连 errorKey 一起清，避免上一轮的失败文案残留。
+    this.store.update((draft) => {
+      draft.busy = repo
+      draft.error = undefined
+      draft.errorKey = undefined
+      draft.notice = undefined
+    })
     try {
       const result = normalizeEnvironmentResult(await runJob<unknown>('uninstallKind', { repo }))
       this.store.update((draft) => {
@@ -1032,6 +1104,40 @@ export interface ConfigFace {
   editConfigField(path: readonly string[], value: unknown): void
   saveConfig(): void
   discardConfig(): void
+}
+
+/**
+ * 读类动作的失败记账。
+ *
+ * 规则：**一次读取只清自己写下的那条失败**。两个方向都是实测教训：
+ *   · 读的成功不得抹掉操作留下的失败——原先 refresh() 一上来就 `error = undefined`，而
+ *     act() 是"先落结果、再 refresh"，于是写操作失败后结果块画成"完成"（真机复现）。
+ *   · 但读取**自己**上一次的失败也不该永远留着——列表恢复正常了红字还挂着，那是假失败。
+ */
+class ReadFailureLedger {
+  private last: string | undefined
+
+  /**
+   * 记下一次失败。
+   * @param failure - 写进 state 的失败标识（错误消息或字典键）。
+   * @returns 同一个标识，便于在 update 里直接赋值。
+   */
+  record<T extends string>(failure: T): T {
+    this.last = failure
+    return failure
+  }
+
+  /**
+   * 读成功后清掉自己上一次写的失败（别人的失败原样留着）。
+   * @param draft - 状态草案。
+   */
+  clearOwn(draft: { error?: string; errorKey?: string }): void {
+    const last = this.last
+    if (last === undefined) return
+    if (draft.error === last) draft.error = undefined
+    if (draft.errorKey === last) draft.errorKey = undefined
+    this.last = undefined
+  }
 }
 
 /** 一次暂存的编辑。 */

@@ -52,6 +52,24 @@ function stubPrimitives() {
       if (!cache.has(prop)) {
         const name = prop
         cache.set(name, function Stub(props) {
+          // TerminalBlock 是唯一带"运行态成功/失败"语义的原语，桩件必须复现官方判定，
+          // 否则"失败被画成成功"这类倒挂在这里根本看不见。判定逐条对应官方实现
+          // （ui-primitives/src/TerminalBlock.tsx:124-133 的 runState）：
+          // 只有「非运行中 + 无信号 + exitCode 为 0 或 undefined」才算 clean settle。
+          if (name === 'TerminalBlock') {
+            const labels = props?.labels ?? {}
+            const code = props?.exitCode
+            const settledFailed = props?.running !== true
+              && ((code !== undefined && code !== null && code !== 0) || typeof props?.signal === 'string')
+            const state = props?.running === true ? 'running' : settledFailed ? 'failed' : 'done'
+            // 真实块还会画出命令行与输出正文，桩件照画，断言才看得到结果内容。
+            const body = [props?.command, props?.output].filter(value => typeof value === 'string').join('\n')
+            return React.createElement('div', {
+              'data-stub': name,
+              'data-run-state': state,
+              'data-exit-code': String(code),
+            }, state === 'running' ? labels.running : state === 'failed' ? labels.failed : labels.done, '\n', body)
+          }
           const text = value => typeof value === 'string' || typeof value === 'number' ? String(value) : undefined
           const parts = [props?.label, props?.title, props?.placeholder, props?.text, text(props?.value)]
             .filter(value => typeof value === 'string')
@@ -87,9 +105,10 @@ function makeSnapshotStore(init) {
 
 /**
  * 以模拟模块表启动产物。
+ * @param overrides - 覆盖表里某个模块（例如换掉 react，让首屏落在指定子页）。
  * @returns bundle 的导出对象。
  */
-function bootBundle() {
+function bootBundle(overrides = {}) {
   assert.ok(existsSync('dist/client.js'), 'dist/client.js 不存在：先跑 pnpm run build')
   const table = {
     'react': React,
@@ -100,6 +119,7 @@ function bootBundle() {
     '@deepseek-ai/dsh-client-ui-slots': {},
     '@deepseek-ai/dsh-client-ui-primitives': stubPrimitives(),
     '@deepseek-ai/dsh-client-ui-dockkit': {},
+    ...overrides,
   }
   let exported
   globalThis.window = {
@@ -237,6 +257,32 @@ async function until(check, what) {
     await new Promise(resolve => setTimeout(resolve, 5))
   }
   throw new Error('等待超时：' + what)
+}
+
+/**
+ * 让 ConsolePage 首屏落在指定子页的 React 替身。
+ *
+ * 为什么需要：环境子页不是独立注册项（控制台只有一个注册项），SSR 首屏默认落在「体检」，
+ * 于是环境页结果块的成败文案在无 DOM 的测试里根本渲染不到。做法：ConsolePage 的**第一个**
+ * 无初值 useState 是 activeId，替身只改这一个调用的初值。这是纯粹的"渲染到目标子页"手段：
+ * 钩子顺序一旦变化，断言会直接失败（不会静默变成永远通过）。
+ *
+ * @param tabId - 首屏要落在的子页 id（health / env / settings）。
+ * @returns { react, reset }：要被塞进模块表的 react 替身，与每次渲染前必须调用的复位函数。
+ */
+function reactWithInitialTab(tabId) {
+  let noArgCalls = 0
+  const react = {
+    ...React,
+    useState(initial) {
+      if (arguments.length === 0 || initial === undefined) {
+        noArgCalls += 1
+        return React.useState(noArgCalls === 1 ? tabId : undefined)
+      }
+      return React.useState(initial)
+    },
+  }
+  return { react, reset: () => { noArgCalls = 0 } }
 }
 
 /** 一份形状正确的诊断报告（作为"正常路径"的对照）。 */
@@ -667,6 +713,48 @@ describe('客户端渲染健壮性（残缺载荷不许变成空白页）', () =
     } finally { stub.restore() }
   })
 
+  it('跳过项：引擎给的 layers 原样透传（含多层），缺层/未知层不猜（"未查"不能画成 0）', async () => {
+    // 契约见 src/types.ts 的 DiagnosticSkip.layers：只有"整层没查"才给层名，且**可能有多个**
+    // （runtime-inventory 缺失同时废掉 runtime 与 consistency；单数会把另一层错标成"查过了"）。
+    // 客户端反推 check 字符串是约定耦合，归一必须原样透传、且绝不发明层名。
+    const exported = bootBundle()
+    const { slotRegistrations } = applyWithMocks(exported)
+    const face = registration(slotRegistrations, 'settings.section', 'console').options.inject()
+    const stub = stubFetch({
+      diagnose: () => ({ ok: true, value: { jobId: 'job-skip' } }),
+      job: () => ({
+        ok: true,
+        value: {
+          done: true,
+          result: {
+            ...REPORT,
+            skipped: [
+              { check: 'ecosystem-layer', reason: '该层关闭', layers: ['ecosystem'] },
+              { check: 'runtime-inventory', reason: '没有 Loader', layers: ['runtime', 'consistency'] },
+              { check: 'environment-dir', reason: '无法确定环境目录' },
+              { check: 'mystery-layer', reason: '未知层名', layers: ['not-a-layer'] },
+              { check: 'mixed-layer', reason: '半真半假', layers: ['runtime', 'nope'] },
+              { check: 'not-an-array', reason: '形状不对', layers: 'runtime' },
+            ],
+          },
+        },
+      }),
+      capabilities: () => ({ ok: true, value: {} }),
+    })
+    try {
+      face.diagnose()
+      const landed = await until(() => face.hooks.health.getSnapshot().report, '报告落到状态里')
+      assert.equal(landed.skipped.length, 6, '跳过项不能丢')
+      assert.deepEqual(landed.skipped[0].layers, ['ecosystem'], '单层必须透传')
+      assert.deepEqual(landed.skipped[1].layers, ['runtime', 'consistency'],
+        '一次跳过废掉两层时必须带上两层（否则另一层会被画成"查过且没问题"）')
+      assert.equal(landed.skipped[2].layers, undefined, '非层级的跳过不带层名（它不代表整层没查）')
+      assert.equal(landed.skipped[3].layers, undefined, '未知层名不得被发明成某一层')
+      assert.deepEqual(landed.skipped[4].layers, ['runtime'], '混合数组只保留已知层名')
+      assert.equal(landed.skipped[5].layers, undefined, '不是数组（旧形状/脏数据）不猜')
+    } finally { stub.restore() }
+  })
+
   it('目标环境不存在：host 的失败如实呈现，不悄悄退回当前环境', async () => {
     const exported = bootBundle()
     const { slotRegistrations, dicts } = applyWithMocks(exported)
@@ -684,6 +772,89 @@ describe('客户端渲染健壮性（残缺载荷不许变成空白页）', () =
       assert.ok(html.includes('体检失败：环境 nope 不存在'), html.slice(0, 300))
       assert.ok(html.includes('诊断目标：nope（不是当前环境）'), '失败时也要能看出目标是谁')
     } finally { stub.restore() }
+  })
+
+  it('失败态护栏（真实序列）：复制插件失败 → 结果块是失败态，不是「完成」', async () => {
+    // 关键：这条护栏**驱动真实序列**——UI 的动作 → act() → refresh()，不直接喂状态。
+    // task-14 的护栏直接写 store，绕过了 act()→refresh()，所以真机上"失败画成完成"没被抓到
+    // （docs/CODE-POLICY.md 第 7.4 节记的正是这类自证式护栏）。
+    const { react, reset } = reactWithInitialTab('env')
+    const exported = bootBundle({ 'react': react })
+    const { slotRegistrations, dicts } = applyWithMocks(exported)
+    const reg = registration(slotRegistrations, 'settings.section', 'console')
+    const face = reg.options.inject()
+    const stub = stubFetch({
+      listEnvironments: () => ({ ok: true, value: [{ name: 'pm-test', current: true }, { name: 'other' }] }),
+      copyPlugins: () => ({ ok: true, value: { jobId: 'job-copy' } }),
+      job: () => ({
+        ok: true,
+        value: {
+          done: true,
+          result: { ok: false, code: 'package-operation-failed', output: '无法安装 dsh-probe-nope-xyz：官方返回非零退出码' },
+        },
+      }),
+    })
+    try {
+      face.copyPlugins('pm-test', 'other', ['dsh-probe-nope-xyz'])
+      const settled = await until(() => {
+        const snapshot = face.hooks.environments.getSnapshot()
+        return snapshot.busy === undefined && snapshot.notice !== undefined && !snapshot.loading ? snapshot : undefined
+      }, '复制操作落定（含其后的列表刷新）')
+      assert.equal(settled.error, 'package-operation-failed', '失败态必须活过 refresh()：' + JSON.stringify(settled))
+
+      reset()
+      const { html, error } = renderSafely(reg.component, propsFor(face, makeT(dicts)))
+      assert.equal(error, undefined)
+      assert.match(html, /data-run-state="failed"/, '结果块必须是失败态：' + html.slice(-600))
+      assert.ok(!html.includes('完成'), '不得出现 trace.done「完成」文案')
+      assert.ok(html.includes('无法安装 dsh-probe-nope-xyz'), '失败输出要如实呈现')
+      assert.ok(html.includes('操作失败'), '失败文案要出现')
+    } finally { stub.restore() }
+  })
+
+  it('失败态护栏（真实序列）：卸载技能失败 → 失败文案活过随后的 load()', async () => {
+    const exported = bootBundle()
+    const { slotRegistrations, dicts } = applyWithMocks(exported)
+    const reg = registration(slotRegistrations, 'settings.section', 'kinds')
+    const face = reg.options.inject()
+    const stub = stubFetch({
+      uninstallKind: () => ({ ok: true, value: { jobId: 'job-uninstall' } }),
+      job: () => ({ ok: true, value: { done: true, result: { ok: false, code: 'not-found', output: '目录不存在：/tmp/x' } } }),
+      listKinds: () => ({ ok: true, value: { records: [], orphans: [] } }),
+    })
+    try {
+      face.uninstallKind('owner/repo')
+      const settled = await until(() => {
+        const snapshot = face.hooks.kinds.getSnapshot()
+        return snapshot.busy === undefined && snapshot.notice !== undefined && !snapshot.loading ? snapshot : undefined
+      }, '卸载操作落定（含其后的列表加载）')
+      assert.equal(settled.error, 'not-found', '失败态必须活过 load()：' + JSON.stringify(settled))
+      const { html, error } = renderSafely(reg.component, propsFor(face, makeT(dicts)))
+      assert.equal(error, undefined)
+      assert.ok(html.includes('not-found') || html.includes('目录不存在'), '失败文案要出现：' + html.slice(0, 300))
+    } finally { stub.restore() }
+  })
+
+  it('导入无效备份：结果块不得留下上一次操作的内容（P6）', async () => {
+    const { react, reset } = reactWithInitialTab('env')
+    const exported = bootBundle({ 'react': react })
+    const { slotRegistrations, dicts } = applyWithMocks(exported)
+    const reg = registration(slotRegistrations, 'settings.section', 'console')
+    const face = reg.options.inject()
+    const t = makeT(dicts)
+    const renderEnv = () => { reset(); return renderSafely(reg.component, propsFor(face, t)) }
+
+    // 前置：结果块里确实有"上一次操作"的内容。
+    face.hooks.environments.update((draft) => { draft.notice = '上一次操作结果：已启动 foo' })
+    assert.ok(renderEnv().html.includes('已启动 foo'), '前置条件：块里先要有上一次的内容')
+
+    // 真实序列：导入一个非法文件。
+    await face.loadBackup({ text: async () => 'not-json' })
+    const after = renderEnv()
+    assert.equal(after.error, undefined)
+    assert.ok(!after.html.includes('已启动 foo'), '上一次操作的内容必须被清掉，不能留在块里')
+    assert.ok(after.html.includes('这个文件不是本插件的备份'), '失败原因要出现：' + after.html.slice(-400))
+    assert.ok(!after.html.includes('data-run-state="done"'), '这次导入失败不得被画成成功态')
   })
 
   it('环境列表：条目缺 runs/bundles/dependencies 时归一成空数组', async () => {
@@ -704,5 +875,86 @@ describe('客户端渲染健壮性（残缺载荷不许变成空白页）', () =
       })
       assert.deepEqual(state.environments[1].runs, [{ pid: 42, port: null, command: '' }])
     } finally { stub.restore() }
+  })
+
+  it('失败态护栏：环境结果块在 errorKey-only / error-only 下都不是成功态（旧代码会画成"完成"）', () => {
+    // 环境子页不是独立注册项，所以这里用 react 替身把首屏落在「环境」子页。
+    const { react, reset } = reactWithInitialTab('env')
+    const exported = bootBundle({ 'react': react })
+    const { slotRegistrations, dicts } = applyWithMocks(exported)
+    const reg = registration(slotRegistrations, 'settings.section', 'console')
+    const face = reg.options.inject()
+    const t = makeT(dicts)
+    const renderEnv = () => {
+      reset()
+      return renderSafely(reg.component, propsFor(face, t))
+    }
+
+    // 1) errorKey-only：payload 残缺类失败（真实形状：只设 errorKey，不设 error）。
+    face.hooks.environments.update((draft) => {
+      draft.notice = '上一次操作结果'
+      draft.error = undefined
+      draft.errorKey = 'error.incompletePayload'
+    })
+    const keyOnly = renderEnv()
+    assert.equal(keyOnly.error, undefined)
+    assert.match(keyOnly.html, /data-run-state="failed"/, 'errorKey-only 必须渲染成失败态：' + keyOnly.html.slice(0, 300))
+    assert.ok(!keyOnly.html.includes('完成'), '不得出现 trace.done「完成」文案（与同一块里的红字报错自相矛盾）')
+    assert.ok(keyOnly.html.includes('宿主返回的数据不完整'), '失败文案要真的出现：' + keyOnly.html.slice(0, 300))
+
+    // 2) error-only：host 给的原始诊断（真实形状：只设 error，不设 errorKey）。
+    face.hooks.environments.update((draft) => {
+      draft.notice = '上一次操作结果'
+      draft.error = 'no-profile-context'
+      draft.errorKey = undefined
+    })
+    const errorOnly = renderEnv()
+    assert.equal(errorOnly.error, undefined)
+    assert.match(errorOnly.html, /data-run-state="failed"/, 'error-only 必须渲染成失败态')
+    assert.ok(!errorOnly.html.includes('完成'), '不得出现 trace.done「完成」文案')
+    assert.ok(errorOnly.html.includes('no-profile-context'), '失败文案要真的出现')
+
+    // 3) 成功对照：两者皆空才允许画成成功态——否则前两条会因为"永远不画成功"而形同虚设。
+    face.hooks.environments.update((draft) => {
+      draft.notice = '上一次操作结果'
+      draft.error = undefined
+      draft.errorKey = undefined
+    })
+    const clean = renderEnv()
+    assert.equal(clean.error, undefined)
+    assert.match(clean.html, /data-run-state="done"/, '干净结束仍必须是成功态')
+    assert.ok(clean.html.includes('完成'), '成功对照必须出现 trace.done「完成」文案')
+  })
+
+  it('失败态护栏：errorKey-only 与 error-only 在体检/市场/技能的错误区都渲染出失败文案', async () => {
+    const cases = [
+      {
+        id: 'console',
+        hook: 'health',
+        // 体检页的失败区是红线，不是结果块：两种形状都必须出现。
+        keyOnly: '宿主返回的数据不完整',
+        errorText: '官方能力探针不可用',
+      },
+      { id: 'marketplace', hook: 'marketplace', keyOnly: '宿主返回的数据不完整', errorText: '索引源不可达' },
+      { id: 'kinds', hook: 'kinds', keyOnly: '宿主返回的数据不完整', errorText: '目录不可读' },
+    ]
+    for (const entry of cases) {
+      const exported = bootBundle()
+      const { slotRegistrations, dicts } = applyWithMocks(exported)
+      const reg = registration(slotRegistrations, 'settings.section', entry.id)
+      const face = reg.options.inject()
+      const store = face.hooks[entry.hook]
+      const t = makeT(dicts)
+
+      store.update((draft) => { draft.error = undefined; draft.errorKey = 'error.incompletePayload' })
+      const keyOnly = renderSafely(reg.component, propsFor(face, t))
+      assert.equal(keyOnly.error, undefined)
+      assert.ok(keyOnly.html.includes(entry.keyOnly), entry.id + ' errorKey-only 要出现失败文案：' + keyOnly.html.slice(0, 200))
+
+      store.update((draft) => { draft.errorKey = undefined; draft.error = entry.errorText })
+      const errorOnly = renderSafely(reg.component, propsFor(face, t))
+      assert.equal(errorOnly.error, undefined)
+      assert.ok(errorOnly.html.includes(entry.errorText), entry.id + ' error-only 要出现失败文案')
+    }
   })
 })
