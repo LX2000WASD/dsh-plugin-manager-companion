@@ -454,6 +454,14 @@ export interface HealthState {
   /** 客户端自己判定的失败（载荷残缺等）；文案归字典，控制层只给键。 */
   errorKey?: CompanionLocaleKey
   /**
+   * 当前这条失败**来自哪个动作**：诊断还是修复。
+   *
+   * 为什么必须是显式字段：靠"notice 写过没有"这种间接线索归因时不成立——修复走 callOp 抛异常
+   * 的那条路径只写 error、不写 notice，界面于是把"修复失败"说成"体检失败"（真机实测的 P1）。
+   * 写入规则：谁写下当前这条失败，谁就写这里；它描述的失败被清掉时同步清成 undefined。
+   */
+  failureFrom?: 'diagnose' | 'fix' | undefined
+  /**
    * 诊断目标环境名；undefined 表示当前环境。
    *
    * 为什么保留 undefined 而不是在控制器里解析成当前环境名：控制器不认识 profile 列表
@@ -495,11 +503,17 @@ export class HealthController {
    * 落进新目标的状态里（那会让"报告属于哪个环境"变成一个谎言）。
    */
   private generation = 0
+  /**
+   * 诊断与修复**各记各的失败**：诊断成功只清自己写下的那条，修复失败不会被顺手抹掉
+   * （与 client-dev 在 task-18 修的 ReadFailureLedger 同一思路——读的成功不该清掉操作的失败）。
+   */
+  private readonly diagnoseFailure = new ReadFailureLedger()
+  private readonly fixFailure = new ReadFailureLedger()
 
   constructor() {
     this.store = createSnapshotStore<HealthState>({
-      report: undefined, running: false, error: undefined, fixingId: undefined, notice: undefined,
-      capabilities: undefined, target: undefined,
+      report: undefined, running: false, error: undefined, failureFrom: undefined, fixingId: undefined,
+      notice: undefined, capabilities: undefined, target: undefined,
     })
   }
 
@@ -526,24 +540,49 @@ export class HealthController {
       draft.report = undefined
       draft.fixingId = undefined
       draft.notice = undefined
-      draft.error = undefined
-      draft.errorKey = undefined
+      // 只清诊断自己写下的失败：切目标不该抹掉"上一次修复失败"这条事实。
+      if (this.diagnoseFailure.clearOwn(draft)) draft.failureFrom = undefined
     })
     void this.diagnose()
   }
 
   /**
-   * 跑一次诊断。
+   * 跑一次诊断（用户动作）。
+   *
+   * 会清掉上一条**动作结果**（notice）：用户主动体检即"处置"了上一次动作留下的提示。
    * @param layers - 只诊断这些层；省略即按配置全量。
    */
   async diagnose(layers?: readonly DiagnosticLayer[]): Promise<void> {
+    await this.runDiagnosis(layers, { keepNotice: false })
+  }
+
+  /**
+   * 修复之后的自动刷新：报告必须更新，但修复的结果提示要留着。
+   *
+   * 为什么不能直接用 diagnose()：那是"用户主动体检"，开头会清 notice；而这条 notice 是用户
+   * 刚点的那个修复动作的产物（成功与失败都一样），在同一个 0ms 内被清掉等于用户什么都没看到
+   * （真机实测时间线：+0ms 写 notice → +0ms 被自动刷新清掉）。
+   */
+  private async refreshAfterFix(): Promise<void> {
+    await this.runDiagnosis(undefined, { keepNotice: true })
+  }
+
+  /**
+   * 诊断主体：两条入口（用户体检 / 修复后的自动刷新）只差"要不要保留上一条动作结果"。
+   * @param layers - 只诊断这些层；省略即按配置全量。
+   * @param options - keepNotice 为真时保留上一条动作结果（修复的产物）。
+   */
+  private async runDiagnosis(
+    layers: readonly DiagnosticLayer[] | undefined,
+    options: { readonly keepNotice: boolean },
+  ): Promise<void> {
     const generation = ++this.generation
     const target = this.store.getSnapshot().target
     this.store.update((draft) => {
       draft.running = true
-      draft.error = undefined
-      draft.errorKey = undefined
-      draft.notice = undefined
+      // 只清**诊断自己**上一次写下的失败：修复失败要留在页面上（它是操作的事实，不是这次读的结果）。
+      if (this.diagnoseFailure.clearOwn(draft)) draft.failureFrom = undefined
+      if (!options.keepNotice) draft.notice = undefined
     })
     try {
       // 目标环境由 host 决定语义：省略即当前环境；指定的环境不存在时 host 返回
@@ -556,7 +595,11 @@ export class HealthController {
       const report = normalizeReport(raw, LAYER_ORDER)
       if (report === undefined) {
         // 载荷不可用时不渲染半个报告：如实报"失败"，页面照常可读（绝不空白）。
-        this.store.update((draft) => { draft.running = false; draft.errorKey = 'error.incompletePayload' })
+        this.store.update((draft) => {
+          draft.running = false
+          draft.errorKey = this.diagnoseFailure.record('error.incompletePayload')
+          draft.failureFrom = 'diagnose'
+        })
         return
       }
       this.store.update((draft) => { draft.report = report; draft.running = false })
@@ -574,7 +617,8 @@ export class HealthController {
       if (generation !== this.generation) return
       this.store.update((draft) => {
         draft.running = false
-        draft.error = error instanceof Error ? error.message : String(error)
+        draft.error = this.diagnoseFailure.record(error instanceof Error ? error.message : String(error))
+        draft.failureFrom = 'diagnose'
       })
     }
   }
@@ -588,12 +632,10 @@ export class HealthController {
     // 见 ConsolePage 的 HealthPanel）。控制器不重复判断——它拿不到 profile 事实。
     const action = issue.fix
     if (action === undefined) return
-    // 开跑时把上一次的失败一起清掉：只清 error 不清 errorKey 会让上一轮的失败文案留在页面上，
-    // 与新状态互相矛盾（同族倒挂的镜像：旧失败盖在新结果上）。
+    // 开跑时只清**上一条修复失败**（用户重新发起修复=处置完成）；诊断失败不是这次动作写的，留着。
     this.store.update((draft) => {
       draft.fixingId = issue.id
-      draft.error = undefined
-      draft.errorKey = undefined
+      if (this.fixFailure.clearOwn(draft)) draft.failureFrom = undefined
       draft.notice = undefined
     })
     try {
@@ -604,13 +646,19 @@ export class HealthController {
       this.store.update((draft) => {
         draft.fixingId = undefined
         draft.notice = result.output
-        if (!result.ok) draft.error = result.code ?? result.output
+        if (!result.ok) {
+          draft.error = this.fixFailure.record(result.code ?? result.output)
+          draft.failureFrom = 'fix'
+        }
       })
-      if (result.ok) await this.diagnose()
+      // 自动刷新而不是"用户体检"：报告要更新，但刚写的修复结果要留住（否则 0ms 内被清掉）。
+      if (result.ok) await this.refreshAfterFix()
     } catch (error) {
+      // 抛异常这条路径以前只写 error、不写 notice，界面据此把归因退回"体检失败"（真机 P1）。
       this.store.update((draft) => {
         draft.fixingId = undefined
-        draft.error = error instanceof Error ? error.message : String(error)
+        draft.error = this.fixFailure.record(error instanceof Error ? error.message : String(error))
+        draft.failureFrom = 'fix'
       })
     }
   }
@@ -1130,13 +1178,16 @@ class ReadFailureLedger {
   /**
    * 读成功后清掉自己上一次写的失败（别人的失败原样留着）。
    * @param draft - 状态草案。
+   * @returns 是否真的清掉了一条（调用方据此决定要不要清"当前失败来自谁"的归因）。
    */
-  clearOwn(draft: { error?: string; errorKey?: string }): void {
+  clearOwn(draft: { error?: string; errorKey?: string }): boolean {
     const last = this.last
-    if (last === undefined) return
-    if (draft.error === last) draft.error = undefined
-    if (draft.errorKey === last) draft.errorKey = undefined
+    if (last === undefined) return false
+    let cleared = false
+    if (draft.error === last) { draft.error = undefined; cleared = true }
+    if (draft.errorKey === last) { draft.errorKey = undefined; cleared = true }
     this.last = undefined
+    return cleared
   }
 }
 

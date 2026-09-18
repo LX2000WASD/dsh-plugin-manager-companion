@@ -276,18 +276,33 @@
 
 .issueActions {
   display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
 }
 
-/* 修复动作的说明：行内小字，不悬停也能看到。 */
+/*
+ * 修复动作的说明：独占一行、左对齐、最多两行。
+ * 旧布局把它挤在按钮右侧右对齐，800px 面板里会被压成三行——读起来像装饰，而不是"将要做什么"。
+ */
 
 .fixSummary {
+  align-self: stretch;
   font-size: 12px;
   line-height: 18px;
   color: var(--dsw-alias-label-tertiary);
-  text-align: right;
+  text-align: left;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
+
+/* 按钮文字不折行：「确认修复」折成「确认修 / 复」会毁掉这一行的可扫读性。 */
+
+.fixButton {
+  flex: none;
+  white-space: nowrap;
 }
 
 /* 环境子页 */

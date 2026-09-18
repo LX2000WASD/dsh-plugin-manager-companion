@@ -15,81 +15,20 @@
  */
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync, existsSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
+import {
+  NS, React, bootBundle, propsFor as harnessPropsFor, stubFetch as harnessStubFetch, until,
+} from './client-harness.mjs'
 
 const require_ = createRequire(import.meta.url)
-const React = require_('react')
 const { renderToStaticMarkup } = require_('react-dom/server')
 
-/** 官方平台种子表（deepseek-harness packages/client/web/src/platform.ts）。 */
-const PLATFORM = [
-  'react', 'react/jsx-runtime', 'react-dom', 'react-dom/client',
-  '@deepseek-ai/cordis',
-  '@deepseek-ai/dsh-client-store',
-  '@deepseek-ai/dsh-client-ui-slots',
-  '@deepseek-ai/dsh-client-ui-primitives',
-  '@deepseek-ai/dsh-client-ui-dockkit',
-]
-
-/** 本包在模块表里的 id。 */
-const PACKAGE_ID = 'dsh-plugin-manager-companion'
-/** 本插件在客户端 locale 注册表里的命名空间。 */
-const NS = 'plugin-manager-companion'
 /** 控制台注册项的 id（settings.section 的 console 入口）。 */
 const CONSOLE_ID = 'console'
 
-/**
- * primitives 桩：把 label/title/placeholder/text/value/children 渲染成文本。
- *
- * `data-title` 单独暴露这件事很重要：只有挂在 title 上的文案等于"不悬停看不见"，
- * 测试要能把它与"真的画出来了"区分开（P2-b 的护栏依赖这一点）。
- * @returns 模块替身。
- */
-function stubPrimitives() {
-  const cache = new Map()
-  return new Proxy({}, {
-    get(_target, prop) {
-      if (prop === 'relativeTime') return () => ({ unit: 'now', n: 0 })
-      if (typeof prop !== 'string') return undefined
-      if (!cache.has(prop)) {
-        const name = prop
-        cache.set(name, function Stub(props) {
-          const attrs = { 'data-stub': name }
-          if (typeof props?.title === 'string') attrs['data-title'] = props.title
-          if (typeof props?.open === 'boolean') attrs['data-open'] = String(props.open)
-          if (name === 'TerminalBlock') {
-            const code = props?.exitCode
-            const failed = props?.running !== true && code !== undefined && code !== null && code !== 0
-            attrs['data-run-state'] = failed ? 'failed' : 'done'
-          }
-          const text = value => typeof value === 'string' || typeof value === 'number' ? String(value) : undefined
-          const parts = [props?.label, props?.placeholder, props?.text, text(props?.value)]
-            .filter(value => typeof value === 'string')
-          const body = [parts.join(' | '), props?.command, props?.output].filter(value => typeof value === 'string')
-          // `anchor` 必须照渲染：Menu/HoverCard 的可见内容就在锚点上，桩件吞掉它会让
-          // 「下拉有没有渲染出来」这类断言变成假绿。
-          return React.createElement('div', attrs, body.join('\n'),
-            props?.collapsedContent ?? null, props?.anchor ?? null, props?.children ?? null)
-        })
-      }
-      return cache.get(prop)
-    },
-  })
-}
-
-/** 符合官方 SnapshotStore 契约的桩件。 */
-function makeSnapshotStore(init) {
-  let snapshot = init
-  const listeners = new Set()
-  const notify = () => { for (const fn of [...listeners]) fn() }
-  return {
-    getSnapshot: () => snapshot,
-    subscribe(fn) { listeners.add(fn); return () => { listeners.delete(fn) } },
-    set(next) { snapshot = next; notify() },
-    update(mutator) { mutator(snapshot); notify() },
-  }
-}
+// 平台表桩件（含 primitives / SnapshotStore / defineStore 的缺失导出护栏）都在
+// tests/client-harness.mjs：四个客户端测试文件共用一份，产物新增 API 只需改那一处。
 
 /**
  * React 替身：把 ConsolePage 的首屏子页与新建对话框摆到指定位置。
@@ -117,60 +56,16 @@ function shimReact({ openDialog = false } = {}) {
   }
 }
 
-/** 以模拟模块表启动产物，返回注册项与假 ctx。 */
+/**
+ * 以模拟模块表启动产物，返回注册项与假 ctx。
+ *
+ * 模块表来自 tests/client-harness.mjs 的 platformTable（含"缺导出指名报错"的护栏），
+ * 这里保留本文件自己的注册面/字典收集（字典是 Map，且缺键即抛——这是本文件的断言口径）。
+ */
 function boot(options = {}) {
-  assert.ok(existsSync('dist/client.js'), 'dist/client.js 不存在：先跑 pnpm run build:client')
+  const exported = bootBundle({ react: options.react ?? React })
   const registrations = []
   const dicts = new Map()
-  const table = {
-    'react': options.react ?? React,
-    'react/jsx-runtime': require_('react/jsx-runtime'),
-    'react-dom': {}, 'react-dom/client': {},
-    '@deepseek-ai/cordis': { Context: class {} },
-    '@deepseek-ai/dsh-client-store': {
-      createSnapshotStore: makeSnapshotStore,
-      shallowEqual: (a, b) => a === b,
-      // 控制台的子页选择用声明式 store（defineStore），所以桩件必须提供它：
-      // 句柄 create() 出来的实例就是"就地改草稿 + 通知"的引擎契约（与 makeSnapshotStore 同一意图）。
-      defineStore(spec) {
-        return {
-          spec,
-          create() {
-            let state = spec.init()
-            const listeners = new Set()
-            const notify = () => { for (const fn of [...listeners]) fn() }
-            const instance = {
-              getSnapshot: () => state,
-              subscribe(fn) { listeners.add(fn); return () => { listeners.delete(fn) } },
-              clearPersisted() {},
-              actions: {},
-            }
-            for (const [name, mutator] of Object.entries(spec.actions)) {
-              instance.actions[name] = (...params) => { mutator(state, ...params); notify() }
-            }
-            return instance
-          },
-        }
-      },
-    },
-    '@deepseek-ai/dsh-client-ui-slots': {},
-    '@deepseek-ai/dsh-client-ui-primitives': stubPrimitives(),
-    '@deepseek-ai/dsh-client-ui-dockkit': {},
-  }
-  let exported
-  globalThis.window = {
-    __ModuleLoader__: {
-      load({ id, factory }) {
-        exported = factory((spec) => {
-          if (!(spec in table)) throw new Error('missed the module table: ' + spec)
-          return table[spec]
-        })
-        assert.equal(id, PACKAGE_ID, 'bundle 必须以自身 id 注册')
-      },
-    },
-  }
-  new Function(readFileSync('dist/client.js', 'utf8'))()
-
   const noop = () => () => {}
   exported.apply({
     effect(fn) { const dispose = fn(); return typeof dispose === 'function' ? dispose : () => {} },
@@ -225,26 +120,16 @@ let currentEntry
 /**
  * 把注入面与 store 座位铺成组件 props。
  *
- * 注册项声明了 store 时，这里按官方说法自己 `create()` 一个实例铺成 useStore/actions——
- * 注意每次调用都会拿到**新实例**；需要跨渲染保持同一实例的用例，请用 withStore 显式覆盖。
+ * 铺法来自 tests/client-harness.mjs 的 propsFor（hooks 隔间 → use<Name>；注册项声明了 store
+ * 就 create() 一个实例铺 useStore/actions）；本文件只固定两件自己的口径：extra 里默认带
+ * `close`（对话框要的 prop），以及每次调用都会拿到**新 store 实例**（框架语义：一 handle × 一 scope × 一实例）。
  * @param face - 注入面。
  * @param t - 字典翻译。
  * @param extra - 额外 props。
  * @returns 组件 props。
  */
 function propsFor(face, t, extra = {}) {
-  const { hooks, ...actions } = face
-  const props = { t, ...actions, close: () => {}, ...extra }
-  for (const [name, source] of Object.entries(hooks)) {
-    props['use' + name[0].toUpperCase() + name.slice(1)] = selector => selector(source.getSnapshot())
-  }
-  const handle = currentEntry?.options.store
-  if (handle !== undefined) {
-    const instance = handle.create()
-    props.useStore = selector => selector(instance.getSnapshot())
-    props.actions = instance.actions
-  }
-  return props
+  return harnessPropsFor(face, t, { close: () => {}, ...extra }, currentEntry)
 }
 
 /** 渲染控制台并落在指定子页（子页选择走 store 的 select action，不再是组件内 state）。 */
@@ -255,30 +140,8 @@ function renderTab(entry, face, t, tabId, extra = {}) {
   return renderToStaticMarkup(React.createElement(entry.component, props))
 }
 
-/** 装一个 fetch 桩：记录每次调用的 op 与请求体。 */
-function stubFetch(handlers) {
-  const calls = []
-  const original = globalThis.fetch
-  globalThis.fetch = async (url, init) => {
-    const op = String(url).split('/').pop()
-    const body = init?.body === undefined ? undefined : JSON.parse(init.body)
-    calls.push({ op, body })
-    const handler = handlers[op]
-    if (handler === undefined) throw new Error('未预期的 op: ' + String(op))
-    return { status: 200, json: async () => handler(body, calls) }
-  }
-  return { calls, restore: () => { globalThis.fetch = original } }
-}
-
-/** 等状态收敛（控制器动作是 fire-and-forget 的）。 */
-async function until(check, what) {
-  for (let index = 0; index < 200; index += 1) {
-    const value = check()
-    if (value !== undefined && value !== false) return value
-    await new Promise(resolve => setTimeout(resolve, 5))
-  }
-  throw new Error('等待超时：' + what)
-}
+/** fetch 桩：本文件按 `{ op, body }` 记录调用，所以用共享桩件的 entries 形状。 */
+const stubFetch = handlers => harnessStubFetch(handlers, { calls: 'entries' })
 
 describe('环境子页：模板来自官方、启动结果如实', () => {
   it('模板清单走官方 op，模板字段是下拉（不再用自由文本承模板名）', () => {
@@ -636,5 +499,172 @@ describe('控制台：子页选择跨重挂载存活（task-30）', () => {
     } finally {
       stub.restore()
     }
+  })
+})
+
+describe('修复失败的归因与存续（task-35 P1）', () => {
+  const REPORT_WITH_FIX = {
+    environment: 'pm-web',
+    generatedAt: '2026-09-19T03:00:00.000Z',
+    counts: { dependency: 1, composition: 0, runtime: 0, consistency: 0, ecosystem: 0 },
+    issues: [{
+      id: 'i1', layer: 'dependency', severity: 'confirm-fix', code: 'undeclared-dependency',
+      title: '声明了但没装：pkg', detail: 'detail', subjects: ['pkg'],
+      evidence: [{ kind: 'file', at: 'package.json:12', note: '声明位置' }],
+      fix: { action: 'install-dependency', target: 'pkg', summary: '重新安装 pkg，或删掉这条声明' },
+    }],
+    skipped: [],
+  }
+  const okDiagnose = {
+    diagnose: () => ({ ok: true, value: { jobId: 'job-1' } }),
+    job: () => ({ ok: true, value: { done: true, result: REPORT_WITH_FIX } }),
+    listEnvironments: () => ({ ok: true, value: [] }),
+  }
+
+  /** 跑一次诊断，让页面上有可修复的问题。 */
+  async function diagnoseOnce(face) {
+    face.diagnose()
+    await until(() => face.hooks.health.getSnapshot().report !== undefined, '报告落地')
+    return face.hooks.health.getSnapshot().report.issues[0]
+  }
+
+  it('载荷 ok=false：显示「修复失败」，不是「体检失败」', async () => {
+    const { entry, face, t } = boot()
+    const stub = stubFetch({
+      ...okDiagnose,
+      fix: () => ({ ok: true, value: { ok: false, code: 'operation-failed', output: '装不上：pkg' } }),
+    })
+    try {
+      const issue = await diagnoseOnce(face)
+      face.fix(issue)
+      await until(() => face.hooks.health.getSnapshot().error !== undefined, '修复失败落进 store')
+      assert.equal(face.hooks.health.getSnapshot().failureFrom, 'fix', '归因必须是 fix')
+      const html = renderToStaticMarkup(React.createElement(entry.component, propsFor(face, t)))
+      assert.ok(html.includes('修复失败'), '要显示修复失败：' + html.slice(0, 300))
+      assert.ok(!html.includes('体检失败'), '不得写成体检失败')
+    } finally { stub.restore() }
+  })
+
+  it('callOp 直接抛（异常形态）：同样显示「修复失败」——这是漏掉的那一半', async () => {
+    const { entry, face, t } = boot()
+    const stub = stubFetch({
+      ...okDiagnose,
+      // 刻意不写 notice 的那条路径：请求本身失败，客户端只拿到异常。
+      fix: () => { throw new Error('Failed to fetch') },
+    })
+    try {
+      const issue = await diagnoseOnce(face)
+      face.fix(issue)
+      await until(() => face.hooks.health.getSnapshot().error !== undefined, '异常落进 store')
+      assert.equal(face.hooks.health.getSnapshot().failureFrom, 'fix', '异常路径的归因也必须是 fix')
+      assert.equal(face.hooks.health.getSnapshot().notice, undefined, '前提：这条路径确实不写 notice')
+      const html = renderToStaticMarkup(React.createElement(entry.component, propsFor(face, t)))
+      assert.ok(html.includes('修复失败'), '异常形态也要显示修复失败：' + html.slice(0, 300))
+      assert.ok(!html.includes('体检失败'), '不得写成体检失败（真机 P1 就是这里）')
+    } finally { stub.restore() }
+  })
+
+  it('修复失败之后跑一次成功的体检，失败横幅仍在（用户处置前不消失）', async () => {
+    const { entry, face, t } = boot()
+    const stub = stubFetch({
+      ...okDiagnose,
+      fix: () => { throw new Error('Failed to fetch') },
+    })
+    try {
+      const issue = await diagnoseOnce(face)
+      face.fix(issue)
+      await until(() => face.hooks.health.getSnapshot().error !== undefined, '修复失败落进 store')
+      face.diagnose()
+      await until(() => face.hooks.health.getSnapshot().running === false, '体检跑完')
+      const state = face.hooks.health.getSnapshot()
+      assert.equal(state.error !== undefined, true, '修复失败必须还在：' + JSON.stringify(state.error))
+      assert.equal(state.failureFrom, 'fix', '归因仍然是 fix')
+      const html = renderToStaticMarkup(React.createElement(entry.component, propsFor(face, t)))
+      assert.ok(html.includes('修复失败'), '横幅必须还在页面上：' + html.slice(0, 300))
+    } finally { stub.restore() }
+  })
+
+  it('重新发起修复即清上一条：新失败替换旧失败，成功则横幅消失', async () => {
+    const { entry, face } = boot()
+    let mode = 'fail-a'
+    const stub = stubFetch({
+      ...okDiagnose,
+      fix: () => mode === 'fail-a'
+        ? { ok: true, value: { ok: false, code: 'operation-failed', output: '第一次失败' } }
+        : mode === 'fail-b'
+          ? { ok: true, value: { ok: false, code: 'operation-failed', output: '第二次失败' } }
+          : { ok: true, value: { ok: true, output: '装好了' } },
+    })
+    try {
+      const issue = await diagnoseOnce(face)
+      face.fix(issue)
+      await until(() => face.hooks.health.getSnapshot().notice === '第一次失败', '第一次失败')
+      mode = 'fail-b'
+      face.fix(issue)
+      await until(() => face.hooks.health.getSnapshot().notice === '第二次失败', '第二次失败替换了第一次')
+      mode = 'ok'
+      face.fix(issue)
+      await until(() => face.hooks.health.getSnapshot().fixingId === undefined
+        && face.hooks.health.getSnapshot().notice === '装好了', '修复成功')
+      assert.equal(face.hooks.health.getSnapshot().error, undefined, '修复成功后不该还挂着失败')
+      assert.equal(face.hooks.health.getSnapshot().failureFrom, undefined, '归因也要跟着清掉')
+    } finally { stub.restore() }
+  })
+
+  it('体检失败的归因不被顶掉（仍然是「体检失败」）', async () => {
+    const { entry, face, t } = boot()
+    const stub = stubFetch({
+      diagnose: () => ({ ok: true, value: { jobId: 'job-1' } }),
+      job: () => ({ ok: true, value: { done: true, error: '引擎挂了' } }),
+      listEnvironments: () => ({ ok: true, value: [] }),
+    })
+    try {
+      face.diagnose()
+      await until(() => face.hooks.health.getSnapshot().error !== undefined, '体检失败落进 store')
+      assert.equal(face.hooks.health.getSnapshot().failureFrom, 'diagnose', '归因是 diagnose')
+      const html = renderToStaticMarkup(React.createElement(entry.component, propsFor(face, t)))
+      assert.ok(html.includes('体检失败'), '要显示体检失败：' + html.slice(0, 300))
+      assert.ok(!html.includes('修复失败'), '没点过修复就不该出现修复失败')
+    } finally { stub.restore() }
+  })
+
+  it('修复成功：结果留着，且报告确实被重新拉过（自动刷新不是什么都不做）', async () => {
+    const { face } = boot()
+    let mode = 'fail'
+    const stub = stubFetch({
+      ...okDiagnose,
+      fix: () => mode === 'fail'
+        ? { ok: true, value: { ok: false, code: 'operation-failed', output: '先失败一次' } }
+        : { ok: true, value: { ok: true, output: '装好了' } },
+    })
+    try {
+      const issue = await diagnoseOnce(face)
+      face.fix(issue)
+      await until(() => face.hooks.health.getSnapshot().error !== undefined, '先失败一次')
+      const before = stub.calls.filter(call => call.op === 'diagnose').length
+      mode = 'ok'
+      face.fix(issue)
+      await until(() => face.hooks.health.getSnapshot().notice === '装好了', '成功提示可见')
+      await until(() => stub.calls.filter(call => call.op === 'diagnose').length > before, '自动刷新确实重跑了体检')
+      const state = face.hooks.health.getSnapshot()
+      assert.equal(state.notice, '装好了', '成功提示不能被自己触发的刷新清掉')
+      assert.equal(state.error, undefined, '修复成功后不该还挂着失败')
+      assert.equal(state.failureFrom, undefined, '归因跟着一起清')
+    } finally { stub.restore() }
+  })
+
+  it('用户主动体检才清上一条动作结果（下一次动作=处置）', async () => {
+    const { face } = boot()
+    const stub = stubFetch({
+      ...okDiagnose,
+      fix: () => ({ ok: true, value: { ok: true, output: '装好了' } }),
+    })
+    try {
+      const issue = await diagnoseOnce(face)
+      face.fix(issue)
+      await until(() => face.hooks.health.getSnapshot().notice === '装好了', '成功提示可见')
+      face.diagnose()
+      await until(() => face.hooks.health.getSnapshot().notice === undefined, '用户体检清掉上一条结果')
+    } finally { stub.restore() }
   })
 })

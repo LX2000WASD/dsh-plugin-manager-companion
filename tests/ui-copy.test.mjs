@@ -17,142 +17,21 @@
  */
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync, existsSync } from 'node:fs'
-import { createRequire } from 'node:module'
+import { readFileSync } from 'node:fs'
+import { applyWithMocks, bootBundle, NS } from './client-harness.mjs'
 
-const require_ = createRequire(import.meta.url)
-const React = require_('react')
-
-/** 官方平台种子表（deepseek-harness packages/client/web/src/platform.ts）。 */
-const PLATFORM = [
-  'react', 'react/jsx-runtime', 'react-dom', 'react-dom/client',
-  '@deepseek-ai/cordis',
-  '@deepseek-ai/dsh-client-store',
-  '@deepseek-ai/dsh-client-ui-slots',
-  '@deepseek-ai/dsh-client-ui-primitives',
-  '@deepseek-ai/dsh-client-ui-dockkit',
-]
-
-/** 本包在模块表里的 id。 */
-const PACKAGE_ID = 'dsh-plugin-manager-companion'
-/** 本插件在客户端 locale 注册表里的命名空间。 */
-const NS = 'plugin-manager-companion'
 /** 文案的真源（本测试的第二个数据源）。 */
 const SOURCE = 'src/client/locales.ts'
 
-/** primitives 用 Proxy 桩：本文件只关心注册面，不关心视觉实现。 */
-function stubPrimitives() {
-  return new Proxy({}, { get: () => () => null })
-}
-
-/**
- * 符合官方 SnapshotStore 契约的桩件（与 client-boot.test.mjs 同一实现意图）。
- * @param init - 初始状态。
- * @returns 一个快照存储。
- */
-function makeSnapshotStore(init) {
-  let snapshot = init
-  const listeners = new Set()
-  const notify = () => { for (const fn of [...listeners]) fn() }
-  return {
-    getSnapshot: () => snapshot,
-    subscribe(fn) { listeners.add(fn); return () => { listeners.delete(fn) } },
-    set(next) { snapshot = next; notify() },
-    update(mutator) { mutator(snapshot); notify() },
-  }
-}
-
 /**
  * 以模拟模块表启动产物，取它注册的字典。
+ *
+ * 桩件（平台表 / SnapshotStore / defineStore / primitives）都在 tests/client-harness.mjs，
+ * 四个客户端测试文件共用一份；这里只关心"产物真的注册了哪份文案"。
  * @returns `{ zh, en }` 两份字典。
  */
 function loadDictionaries() {
-  assert.ok(existsSync('dist/client.js'), 'dist/client.js 不存在：先跑 pnpm run build')
-  const table = {
-    'react': React,
-    'react/jsx-runtime': require_('react/jsx-runtime'),
-    'react-dom': {}, 'react-dom/client': {},
-    '@deepseek-ai/cordis': { Context: class {} },
-    '@deepseek-ai/dsh-client-store': {
-      createSnapshotStore: makeSnapshotStore,
-      shallowEqual: (a, b) => a === b,
-    // 声明式 store（register 的 store 座位）也要能被桩件启动：控制台把「当前子页」搬进了 store，
-    // 缺这个导出的话产物 apply() 会抛 "defineStore is not a function"（报错指向产物、不指向桩件）。
-    defineStore: spec => ({
-      spec,
-      create() {
-        let state = spec.init()
-        const listeners = new Set()
-        const notify = () => { for (const fn of [...listeners]) fn() }
-        const instance = {
-          getSnapshot: () => state,
-          subscribe(fn) { listeners.add(fn); return () => { listeners.delete(fn) } },
-          clearPersisted() {},
-          actions: {},
-        }
-        for (const [name, mutator] of Object.entries(spec.actions)) {
-          instance.actions[name] = (...params) => { mutator(state, ...params); notify() }
-        }
-        return instance
-      },
-    }),
-  },
-    '@deepseek-ai/dsh-client-ui-slots': {},
-    '@deepseek-ai/dsh-client-ui-primitives': stubPrimitives(),
-    '@deepseek-ai/dsh-client-ui-dockkit': {},
-  }
-  let exported
-  globalThis.window = {
-    __ModuleLoader__: {
-      load({ id, factory }) {
-        exported = factory((spec) => {
-          if (!(spec in table)) throw new Error('missed the module table: ' + spec)
-          return table[spec]
-        })
-        assert.equal(id, PACKAGE_ID, 'bundle 必须以自身 id 注册')
-      },
-    },
-  }
-  new Function(readFileSync('dist/client.js', 'utf8'))()
-
-  const dicts = []
-  const noop = () => () => {}
-  exported.apply({
-    effect(fn) { const dispose = fn(); return typeof dispose === 'function' ? dispose : () => {} },
-    on: noop,
-    get() { return undefined },
-    logger: { info() {}, warn() {}, error() {} },
-    locale: {
-      register(ns, d) { dicts.push({ ns, d }); return () => {} },
-      bind: () => (key) => key,
-      subscribe: () => () => {},
-      getSnapshot: () => ({ revision: 0 }),
-    },
-    slots: {
-      inject: (name, fn) => { const reg = fn(); return typeof reg === 'function' ? reg : () => {} },
-      register: () => () => {},
-      entries: () => [],
-      getVersion: () => 0,
-      subscribe: () => () => {},
-    },
-    remote: { pluginManager: {}, pluginInventory: {}, $on: () => () => {}, $mount: async () => () => {} },
-    settingsScope: {
-      bind({ namespace }) {
-        const snapshot = {
-          status: 'ready', value: undefined, base: undefined, user: undefined,
-          revision: 1, writable: true, mode: 'host', namespace,
-        }
-        return {
-          getSnapshot: () => snapshot,
-          subscribe: () => () => {},
-          mutate: async () => {},
-          set: async () => {},
-          unset: async () => {},
-        }
-      },
-      describe: () => ({ subscribe: () => () => {}, getSnapshot: () => ({ descriptors: [] }) }),
-    },
-  })
+  const dicts = applyWithMocks(bootBundle()).dicts
   const hit = dicts.find(entry => entry.ns === NS)
   assert.ok(hit !== undefined, '产物没有注册 ' + NS + ' 字典，实到：' + dicts.map(e => e.ns).join(', '))
   assert.ok(hit.d.zh !== undefined && hit.d.en !== undefined, NS + ' 字典缺少 zh 或 en')

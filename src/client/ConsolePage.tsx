@@ -304,6 +304,7 @@ function IssueRow({
                   {/* 改什么必须不悬停就看得见：这是知情同意的一部分。 */}
                   <span className={css.fixSummary}>{issue.fix.summary}</span>
                   <Button
+                    className={css.fixButton}
                     variant={issue.severity === 'safe-fix' ? 'primary' : 'outline'}
                     size="sm"
                     disabled={fixing || busy}
@@ -351,6 +352,7 @@ function HealthPanel({
   const errorKey = useHealth(state => state.errorKey)
   const fixingId = useHealth(state => state.fixingId)
   const notice = useHealth(state => state.notice)
+  const failureFrom = useHealth(state => state.failureFrom)
   const capabilities = useHealth(state => state.capabilities)
   const target = useHealth(state => state.target)
   const environments = useEnvironments(state => state.environments)
@@ -505,12 +507,11 @@ function HealthPanel({
       {error === undefined && errorKey === undefined ? null : (
         <p className={css.error} role="status">
           {/*
-            归因要准：修复动作失败说成「体检失败」会把责任指错地方。
-            判据只用控制器已有的两个事实——诊断开跑时会清掉 notice，而修复无论成败都会写 notice，
-            所以"有 error 同时 notice 被写过"就一定是修复失败，不需要新增状态。
+            归因直接读控制器写下的显式字段（failureFrom）。绝不用"notice 写过没有"这种间接线索：
+            修复抛异常的那条路径不写 notice，间接判据会把"修复失败"说成"体检失败"（真机实测的 P1）。
           */}
-          {(notice === undefined ? t('health.failed', { message: errorKey === undefined ? error ?? '' : t(errorKey) })
-            : t('health.fixFailed', { message: errorKey === undefined ? error ?? '' : t(errorKey) }))}
+          {t(failureFrom === 'fix' ? 'health.fixFailed' : 'health.failed',
+            { message: errorKey === undefined ? error ?? '' : t(errorKey) })}
         </p>
       )}
       {capabilities === undefined || capabilities.missing.length === 0 ? null : (
