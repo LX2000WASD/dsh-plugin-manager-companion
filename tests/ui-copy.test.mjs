@@ -294,6 +294,10 @@ const HOST_FORBIDDEN = [
     source: '第三轮反馈 2026-09-19 实拍原文：node_modules：仍留有 dsh-probe-block 的目录。需要时请手工删除它。' },
   { id: 'host·dsh.bundle 字段', re: /dsh\.bundle/, why: '清单字段名；用户需要的是「它不是一个组合包」这个结论',
     source: 'DESIGN §12.6（本轮新增清单）：与 dsh.profile.bundles 同类' },
+  { id: 'host·installAnchor 等 API 名', re: /installAnchor|profileContext|ctx\./, why: '内部 API 名；用户要知道的是「为什么做不了」，不是哪个服务取不到',
+    source: 'Lead 复核 task-85 时发现（升级路径渲染输出实测命中）：拿不到官方 installAnchor（ctx.profileContext.installAnchor）' },
+  { id: 'host·括号套括号的长句', re: /（[^）]{6,}（[^）]{4,}）[^）]{0,20}）/, why: '一层括号里再套一层括号，读者要拆两遍；先把结论说完，细节另起一行',
+    source: 'Lead 复核 task-85 时发现（升级路径渲染输出实测命中）：无法试装：官方安装通道不可用（拿不到…（ctx.profileContext.installAnchor）：…）' },
   // ── 规则 H3：同一行里堆三个状态（结论 + 回滚状态 + 包名…）──────────────────
   // 形态判据（可判定）：**同一行**里出现「≥2 个冒号」且至少有一个逗号。
   // 为什么是形态而不是语义："同一件事说三遍"没有可靠的语义判据，但"三个状态短语用逗号硬拼成
@@ -605,6 +609,89 @@ describe('UI 文案标准（DESIGN §12）', () => {
       // 反向：这条用例必须真的走到了「回滚失败」那条路，否则它测的不是用户实拍那一幕。
       assert.match(output, /回滚没有完成/, '这条用例没走到回滚失败路径：' + output)
       assert.equal(settled.result.rolledBack, false)
+    } finally {
+      if (originalHome === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = originalHome
+      rm(home, { recursive: true, force: true })
+    }
+  })
+
+
+  // ── 规则 H4（升级路径）：同一条判据必须覆盖 upgrade 的渲染输出 ──────────────
+  //
+  // 为什么补这条（Lead 复核 task-85 时发现）：H4 原先只驱动「安装失败」一条路，
+  // 而 upgrade 路径的 output 是**运行时拼装**的（installFacts 的多行 + 金丝雀未激活那段），
+  // 于是 `dsh.profile.bundles` 从升级路径漏了出去——护栏一声不响。
+  // 判据同 H4：拿用户真正看到的那个字符串过同一张表。
+  it('规则 H4（升级路径）：升级与回滚的渲染输出也必须过同一张表', async () => {
+    const { handleOp } = await import('../dist/index.js')
+    const { mkdtempSync, mkdirSync: mk, writeFileSync: wr, rmSync: rm } = await import('node:fs')
+    const { tmpdir } = await import('node:os')
+    const { join: j } = await import('node:path')
+    const home = mkdtempSync(j(tmpdir(), 'pmc-copy-up-'))
+    const originalHome = process.env.DSH_HOME
+    process.env.DSH_HOME = home
+    try {
+      const envDir = j(home, 'profiles', 'up-env')
+      mk(j(envDir, 'node_modules'), { recursive: true })
+      // 依赖里已经有候选、但**启动列表里没有它**——正是"装完没进层栈"那种形态，
+      // installFacts 会把两行事实都渲染出来（历史上这两行就带着字段路径）。
+      wr(j(envDir, 'package.json'), JSON.stringify({
+        name: 'p',
+        dependencies: { 'dsh-probe-up': 'link:/probe-up' },
+        dsh: { profile: { bundles: ['@deepseek-ai/dsh-base'] } },
+      }, undefined, 2))
+      mk(j(envDir, 'node_modules', 'dsh-probe-up'), { recursive: true })
+      wr(j(envDir, 'node_modules', 'dsh-probe-up', 'package.json'), JSON.stringify({ name: 'dsh-probe-up', version: '0.0.1' }))
+      const ctx = {
+        get(name) {
+          if (name === 'profileContext') return { name: 'up-env', dir: envDir, installAnchor: '/anchor/package.json', cwd: tmpdir(), home }
+          return undefined
+        },
+        logger: { info() {}, warn() {}, error() {} },
+        effect(fn) { const d = fn(); return typeof d === 'function' ? d : () => {} },
+      }
+      const jobs = new Map()
+      let seq = 0
+      const deps = {
+        ctx,
+        config: () => ({
+          diagnostics: { dependency: true, composition: true, runtime: true, consistency: true, ecosystem: false },
+          qualityGate: { enabled: true, mode: 'block', allowlist: [] },
+          marketplace: { enabled: false, cacheTtlMinutes: 1440, timeoutMs: 15000, indexUrl: '' },
+          trial: { enabled: true, depth: 'shallow', baseline: false, allowNetwork: true, onFailure: 'block', autoCleanup: true, retentionDays: 14, maxKept: 0 },
+          upgrade: { autoCheck: false, interval: 'manual', registryUrl: '' },
+        }),
+        configUpdate: async (patch) => patch,
+        capabilities: () => ({ profileBacked: true, manager: true, inventory: false, environmentName: 'up-env', missing: [] }),
+        jobs: {
+          start(task) { seq += 1; const id = 'job-' + String(seq); const rec = { done: false }; jobs.set(id, rec); void Promise.resolve().then(task).then((v) => { rec.result = v; rec.done = true }, (e) => { rec.error = String(e), rec.done = true }); return id },
+          status(id) { const r = jobs.get(id); return r === undefined ? { done: true, missing: true } : { done: r.done, result: r.result, error: r.error } },
+        },
+        // 升级替身：走"金丝雀没能验证"那条路（历史上这里拼了 dsh.profile.bundles）。
+        upgrade: {
+          canary: async () => ({
+            ran: true, conclusion: 'cannot-trial', depth: 'shallow', escalated: false, elapsedMs: 1,
+            output: '金丝雀没能验证（不等于通过）：候选 dsh-probe-up 装完之后没有进入启动列表'
+              + '——启动时不会加载它，这次验证没有验证到新版本。',
+            cleanup: null,
+            activation: { name: 'dsh-probe-up', bundles: ['@deepseek-ai/dsh-base'], activated: false, removedFirst: false, removeNote: '' },
+          }),
+          apply: async () => ({ ok: false, output: '没有升级 dsh-probe-up：金丝雀没能验证（不等于通过）。' }),
+        },
+      }
+      const started = await handleOp('upgrade', { name: 'dsh-probe-up', version: '0.0.2', environment: 'up-env' }, deps)
+      assert.equal(started.ok, true, '升级 op 没起来：' + JSON.stringify(started))
+      let settled
+      for (let i = 0; i < 200; i += 1) {
+        const st = await handleOp('job', { id: started.value.jobId }, deps)
+        if (st.value.done === true) { settled = st.value; break }
+        await new Promise((r) => setTimeout(r, 5))
+      }
+      const output = String(settled?.result?.output ?? '')
+      assert.ok(output.length > 0, '没拿到升级渲染输出，这条用例会空转')
+      const hits = HOST_FORBIDDEN.filter(rule => rule.re.test(output)).map(rule => rule.id)
+      assert.deepEqual(hits, [], '升级输出命中了禁止项：' + hits.join(', ') + String.fromCharCode(10) + output)
     } finally {
       if (originalHome === undefined) delete process.env.DSH_HOME
       else process.env.DSH_HOME = originalHome

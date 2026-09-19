@@ -1912,8 +1912,8 @@ function operationContext(
   const context = profileContextOf(options.ctx)
   const installAnchor = options.installAnchor ?? context?.installAnchor
   if (installAnchor === undefined || installAnchor.length === 0) {
-    throw new EnvironmentError('no-profile-context', '拿不到官方 installAnchor（ctx.profileContext.installAnchor）：'
-      + '当前进程不是由 dsh 以 profile 方式启动的，跨环境包操作无法定位安装锚点。')
+    throw new EnvironmentError('no-profile-context', '这个进程不是以某个环境启动的，'
+      + '所以无法定位该环境的安装位置，跨环境的包操作做不了。')
   }
   return {
     profile,
@@ -1985,7 +1985,7 @@ export async function repairDependencies(
   const context = profileContextOf(options.ctx)
   const profile = context?.name
   if (profile === undefined || profile.length === 0) {
-    return failure('no-profile-context', '拿不到当前环境名（ctx.profileContext.name），无法修复安装')
+    return failure('no-profile-context', '读不到当前是哪个环境，无法修复安装')
   }
   const dir = environmentDir(profile)
   if (!existsSync(join(dir, 'package.json'))) return failure('not-found', '环境不存在：' + profile)

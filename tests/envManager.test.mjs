@@ -580,8 +580,9 @@ test('copyPlugins 走官方 operations，只换 profile 参数', async () => {
   const noContext = await env.copyPlugins('src', 'dst', ['pkg-a'])
   assert.equal(noContext.ok, false)
   assert.equal(noContext.code, 'no-profile-context')
-  // task-71：立场句「拒绝猜测路径。」删了；原因（不是以 profile 方式启动、无法定位锚点）必须留。
-  assert.match(noContext.output, /无法定位安装锚点/)
+  // task-71：立场句「拒绝猜测路径。」删了；原因必须留（task-85 第三轮文案：说成用户语言，
+  // 不再出现 installAnchor 这类内部 API 名）。
+  assert.match(noContext.output, /无法定位该环境的安装位置/)
   assert.doesNotMatch(noContext.output, /拒绝猜测路径/)
 
   assert.equal((await env.copyPlugins('missing', 'dst', ['pkg-a'], { installAnchor: '/anchor/package.json' })).code, 'not-found')

@@ -319,7 +319,7 @@ async function runTrialStep(
   }
   const realName = currentEnvironmentName(ctx) ?? runtime?.capabilities.environmentName ?? ""
   if (realName.length === 0) {
-    return cannotTrial("读不到当前环境名（官方 profileContext 不可用），无法确定候选包会落进哪个环境，也就没有可以对照的快照源。")
+    return cannotTrial("读不到当前是哪个环境，无法确定候选包会落进哪里，也就没有可以对照的快照源。")
   }
   if (targetName.length > 0 && !sameEnvironment(targetName, realName)) {
     return cannotTrial("这次安装的目标是 " + targetName + "，但官方安装通道只作用于当前环境 " + realName

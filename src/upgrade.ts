@@ -791,8 +791,8 @@ function officialContext(profile: string, dir: string, deps: UpgradeEngineDeps):
   const context = deps.ctx?.get('profileContext') as ProfileContextLike | undefined
   const installAnchor = deps.installAnchor ?? context?.installAnchor
   if (installAnchor === undefined || installAnchor.length === 0) {
-    throw new EnvironmentError('no-profile-context', '拿不到官方 installAnchor（ctx.profileContext.installAnchor）：'
-      + '当前进程不是由 dsh 以 profile 方式启动的，升级无法定位安装锚点。')
+    throw new EnvironmentError('no-profile-context', '这个进程不是以某个环境启动的，'
+      + '所以无法定位该环境的安装位置，升级做不了。')
   }
   return { profile, dir, installAnchor, cwd: dir, home: context?.home ?? dshHome() }
 }
@@ -844,9 +844,9 @@ export function installFacts(environment: string, name: string): readonly string
   const spec = specs[name]
   const lines = [
     spec === undefined
-      ? 'package.json：dependencies 里没有 ' + name
-      : 'package.json：' + name + ' = ' + spec,
-    'package.json：dsh.profile.bundles ' + (manifest.bundles.includes(name) ? '含 ' + name : '不含 ' + name),
+      ? '依赖声明：没有 ' + name
+      : '依赖声明：' + name + ' = ' + spec,
+    '启动列表：' + (manifest.bundles.includes(name) ? '含 ' + name : '不含 ' + name),
   ]
   const entry = join(dir, 'node_modules', name)
   let shape = '不存在'
@@ -986,9 +986,10 @@ export async function runUpgradeCanary(
     escalated: result.escalated,
     elapsedMs: result.elapsedMs,
     output: unactivated
-      ? '金丝雀没能验证（不等于通过）：候选 ' + evidence.name + ' 装完之后没有进入组合层栈'
-        + '（dsh.profile.bundles = ' + JSON.stringify(evidence.bundles) + '）——挂载期不会加载它，'
-        + '这次启动验证没有验证到新版本。\n' + evidence.removeNote + '\n' + result.output
+      ? '金丝雀没能验证（不等于通过）：候选 ' + evidence.name + ' 装完之后没有进入启动列表'
+        + '——启动时不会加载它，这次验证没有验证到新版本。'
+        + '（判定依据：启动列表共 ' + String(evidence.bundles.length) + ' 项，不含它）\n'
+        + evidence.removeNote + '\n' + result.output
       : result.output,
     cleanup,
     ...evidence === null ? {} : { activation: evidence },

@@ -647,7 +647,8 @@ test('拿不到 installAnchor 时拒绝升级（绝不猜路径）', async () =>
   })
   assert.equal(result.ok, false)
   assert.equal(result.code, 'no-profile-context')
-  assert.match(result.output, /installAnchor/)
+  // task-85 第三轮文案：断言从内部 API 名改成用户语言（判据没松：仍然必须说清"为什么做不了"）。
+  assert.match(result.output, /无法定位该环境的安装位置/)
 })
 
 // ── ⑨ 设置：三项 + 归一 ───────────────────────────────────────────────────
