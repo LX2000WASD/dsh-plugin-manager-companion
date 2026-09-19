@@ -6,6 +6,12 @@
  * 前提检查：两种形态都要拍——**正常态**（事实读到了）与**未知态**（事实读不到）。
  *   未知态靠 DSH_INSTALL_ANCHOR 指向一个不存在的文件来造（真实降级，不是假载荷）。
  *
+ * ⚠ 同一 profile 不能并发取证（2026-09-20，task-97 实际踩过）：
+ *   本脚本会**真的改探针环境**（装/卸包、改盘上版本）。两个取证任务同时跑会争用同一个 profile，
+ *   双方都拿到半真半假的状态，那一轮结论全部作废——只能杀掉重跑。
+ *   规矩：取证**串行**跑；起新的之前先确认没有旧的还在（ss -ltn | grep ':35'）。
+ *   完整记录见 docs/CODE-POLICY.md §7.15。
+ *
  * 用法：node tests/about-evidence.mjs --port 3560 --token <t> --out /tmp/t95 --theme light --state normal|unknown
  */
 

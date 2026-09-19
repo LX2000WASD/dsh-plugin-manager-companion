@@ -10,6 +10,12 @@
  *   ③ 点确认 → 等回滚完成 → 断言**盘上版本回到升级前**（读 node_modules 的 package.json）；
  *   ④ 每一步都截图，最后断言四张图 md5 两两不同。
  *
+ * ⚠ 同一 profile 不能并发取证（2026-09-20，task-97 实际踩过）：
+ *   本脚本会**真的改探针环境**（装/卸包、改盘上版本）。两个取证任务同时跑会争用同一个 profile，
+ *   双方都拿到半真半假的状态，那一轮结论全部作废——只能杀掉重跑。
+ *   规矩：取证**串行**跑；起新的之前先确认没有旧的还在（ss -ltn | grep ':35'）。
+ *   完整记录见 docs/CODE-POLICY.md §7.15。
+ *
  * 用法：node tests/rollback-evidence.mjs --port 3590 --token <t> --out /tmp/t97 --theme light
  */
 

@@ -4,6 +4,12 @@
  * 归属：A 类（新工具，不进 pnpm test 的 glob）。
  * 官方复用：无；浏览器侧只用 tools/cdp-shot.mjs，可见性/md5 断言用 tools/shot-assert.mjs（§7.14 的硬要求）。
  *
+ * ⚠ 同一 profile 不能并发取证（2026-09-20，task-97 实际踩过）：
+ *   本脚本会**真的改探针环境**（装/卸包、改盘上版本）。两个取证任务同时跑会争用同一个 profile，
+ *   双方都拿到半真半假的状态，那一轮结论全部作废——只能杀掉重跑。
+ *   规矩：取证**串行**跑；起新的之前先确认没有旧的还在（ss -ltn | grep ':35'）。
+ *   完整记录见 docs/CODE-POLICY.md §7.15。
+ *
  * 用法：node tests/software-upgrade-evidence.mjs --port 3570 --token <t> --out /tmp/t96 --theme light --state normal|unknown
  *
  * 两个 state：
