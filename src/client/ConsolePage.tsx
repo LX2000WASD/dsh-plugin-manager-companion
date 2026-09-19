@@ -1757,9 +1757,19 @@ function TrialEnvironments({
   //
   // 三种情况必须分开（§12.3.3：不许用缺席表达状态）：
   //   · 有计划且会删 0 个 → "没有需要清理的"（这是**结论**，宿主给的）；
-  //   · 有计划且会删 N 个 → "将删除 N 个"；
+  //   · 有计划且会删 N 个 → "按当前计划删除 N 个"；
   //   · **读不到计划** → 既不能说 0 也不能说 N，只能说"读不到、无法确认会删几个"，且**禁用按钮**。
   // 第三种如果混成第一种，用户会以为"按下去没事"——那是拿一个猜出来的结论去支撑不可逆操作。
+  //
+  // 为什么"会删 0 个"**不**禁用按钮（task-92 修正了 task-91 的写法）：
+  //   op 执行时**不看客户端这份计划**——它自己重新读盘算一次
+  //   （cleanupTrialEnvironments → listTrialEnvironments + planTrialCleanup）。
+  //   也就是说计划只是**查询那一刻的快照**（见 docs/REST-CONTRACT.md 的已知边界）。
+  //   拿一个非权威的快照去禁用按钮，就是"用代理判断代替事实"：
+  //   若某个环境在"读到计划"与"点确认"之间越过保留期，用户会**永远按不下去**，
+  //   只能刷新页面——而那个动作本身是安全的（引擎有"运行中永不删"兜底，没东西可删时就是空操作）。
+  //   所以：只有"读不到计划"才禁用（那时连确认框该说几个字都不知道）；
+  //   "会删 0 个"允许按，执行后由引擎如实回报（结果行会说"没有需要清理的测试环境"）。
   const cleanupPlan = report?.plan
   const cleanupCount = cleanupPlan === undefined ? undefined : cleanupPlan.remove.length
   const failed = error !== undefined || errorKey !== undefined
@@ -1884,7 +1894,7 @@ function TrialEnvironments({
             <Button
               variant="primary"
               size="md"
-              disabled={cleanupCount === undefined || cleanupCount === 0}
+              disabled={cleanupCount === undefined}
               onClick={() => {
                 setConfirmingCleanup(false)
                 onCleanup()

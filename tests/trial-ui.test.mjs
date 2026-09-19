@@ -369,11 +369,27 @@ describe('试装设置页（task-52）：披露来自 host、未知如实、warn
     assert.ok(!/onCleanup\(\)/.test(button),
       '清理按钮不得在 onClick 里直接调 onCleanup()（那等于没有确认框）：' + button)
     // 而确认框的"确认"按钮里**必须**调 onCleanup()——否则框开了也没法真执行。
-    const marker = 'disabled={cleanupCount === undefined || cleanupCount === 0}'
+    // 禁用条件**只**看"计划读不到"："会删 0 个"不禁用（计划是快照，不是权威——task-92）。
+    const marker = 'disabled={cleanupCount === undefined}'
     const confirmAt = source.indexOf('onClick={() => {', source.indexOf(marker))
     assert.ok(confirmAt >= 0, '确认框里找不到确认按钮的 onClick')
     const confirmBlock = source.slice(confirmAt, confirmAt + 140)
     assert.match(confirmBlock, /onCleanup\(\)/, '确认按钮必须真的执行清理：' + confirmBlock)
+  })
+
+  it('「会删 0 个」不禁用确认按钮（计划是快照，不是权威——task-92）', () => {
+    // 为什么这条必须存在（它是 task-92 从契约反推出来的自洽性缺陷）：
+    //   op 执行时**不看客户端这份计划**，它自己重新读盘算一次。
+    //   拿一个非权威的快照去禁用按钮 = 用代理判断代替事实：
+    //   若某个环境在"读到计划"与"点确认"之间越过保留期，用户会**永远按不下去**。
+    //   只有"读不到计划"才禁用（那时连确认框该说几个字都不知道）。
+    const source = readFileSync('src/client/ConsolePage.tsx', 'utf8')
+    const at = source.indexOf('disabled={cleanupCount === undefined}')
+    assert.ok(at >= 0, '确认按钮的禁用条件变了（应当只看"计划读不到"）')
+    // 反向：禁用条件里不许再出现 === 0（那会把"当前没有过期环境"也锁住）。
+    const line = source.slice(source.lastIndexOf('disabled=', at), source.indexOf('}', at) + 1)
+    assert.ok(!/cleanupCount === 0/.test(line),
+      '禁用条件不得包含 cleanupCount === 0（计划是快照，按不下去会变成死锁）：' + line)
   })
   it('测试环境：空列表说「没有测试环境」，读失败说失败（不把故障画成空列表）', async () => {
     const okBoot = boot('settings.section', 'console', {})
