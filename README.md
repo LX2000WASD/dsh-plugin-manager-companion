@@ -94,6 +94,9 @@ bash tools/e2e-visual.sh      # 真机浏览器：三个页面 + 官方插件页
 验收命令是 `pnpm test`（它先 build）。直接跑 `node --test` 会拿碰巧躺在 `dist` 里的那份当被测物，
 属静默假绿——见 [docs/CODE-POLICY.md](docs/CODE-POLICY.md) §7.6。
 
+**升级官方版本前先读** [docs/OFFICIAL-DEPENDENCIES.md](docs/OFFICIAL-DEPENDENCIES.md)：逐条列出我们依赖的官方事实（每条都有 file:line、失效后果、最快发现命令），
+外加一条升级后按顺序跑的最小 smoke 序列与一张历史事故对照表；不确定的条目在那份文件里标着"不确定"。
+
 约定见 [docs/CODE-POLICY.md](docs/CODE-POLICY.md)（"参考不复制"三分类准入 + 工具红线），
 设计权威见 [docs/DESIGN.md](docs/DESIGN.md)，host↔client 契约见 [docs/REST-CONTRACT.md](docs/REST-CONTRACT.md)。
 
