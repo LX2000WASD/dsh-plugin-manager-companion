@@ -260,3 +260,97 @@ describe('试装设置页（task-52）：披露来自 host、未知如实、warn
     assert.ok(weird.includes('未识别：brand-new-policy'), '未知处置保留原始值')
   })
 })
+
+/**
+ * 试装那一节的**交互**护栏（verify2 补，task-52 验收中发现）。
+ *
+ * 为什么加它（真机变异验证的实测结果）：把「试装总开关」的 onChange 改成丢弃新值
+ * （开关点了什么都不会发生），本文件上面那批断言**全绿**——它们都只渲染静态 HTML，
+ * 从不驱动控件。这正是本仓库最在意的那类缺陷：界面看起来有开关、用户点了却没有效果，
+ * 而门禁一声不响。
+ *
+ * 手法：用一个**捕获 Switch props** 的 primitives 替身启动产物，渲染后取出真实的
+ * onChange 并调用它 —— 走的就是用户点开关那条路（不是绕过 UI 直接调控制器）。
+ * 变异一旦落在 onChange 上，本用例立刻红。
+ */
+
+/** 捕获 Switch 的 props（其余 primitives 保持"任意名字都能渲染"）。 */
+function captureSwitchPrimitives(captured) {
+  return new Proxy({}, {
+    get(_target, prop) {
+      if (prop === 'relativeTime') return () => ({ unit: 'now', n: 0 })
+      if (typeof prop !== 'string') return undefined
+      const name = prop
+      return function Stub(props) {
+        if (name === 'Switch') captured.push(props)
+        return React.createElement('div', { 'data-stub': name }, props?.label ?? null, props?.children ?? null)
+      }
+    },
+  })
+}
+
+/**
+ * 启动产物（Switch 可捕获）并取控制台注册项。
+ *
+ * @param value - settings 命名空间的当前值。
+ * @returns 注册项、注入面、字典座位与捕获到的 Switch props。
+ */
+function bootWithSwitch(value) {
+  const captured = []
+  const exported = bootBundle({ '@deepseek-ai/dsh-client-ui-primitives': captureSwitchPrimitives(captured) })
+  const applied = applyWithMocks(exported, { value })
+  const t = makeT(applied.dicts, { strict: true })
+  const entry = registration(applied.slotRegistrations, 'settings.section', 'console')
+  const face = entry.options.inject()
+  return { entry, face, t, captured }
+}
+
+/** 渲染「环境控制台 → 设置」子页。 */
+function renderConsoleSettings(entry, face, t) {
+  const props = propsFor(face, t, {}, entry)
+  props.actions.select('settings')
+  return renderToStaticMarkup(React.createElement(entry.component, props))
+}
+
+describe('试装开关真的会生效（verify2 补的交互护栏）', () => {
+  it('调用「试装总开关」的真实 onChange，新值必须落进草稿（丢弃新值 = 红）', () => {
+    const { entry, face, t, captured } = bootWithSwitch({ trial: { enabled: false } })
+    renderConsoleSettings(entry, face, t)
+    const toggle = captured.find(props => props.label === '试装总开关')
+    assert.ok(toggle !== undefined, '试装总开关的 Switch 必须被渲染：' + JSON.stringify(captured.map(p => p.label)))
+    assert.equal(toggle.checked, false, '初值应来自配置')
+    assert.equal(typeof toggle.onChange, 'function', '开关必须有 onChange')
+
+    // 用户点开关 —— 走的是组件自己那条回调。
+    toggle.onChange(true)
+    assert.equal(face.hooks.config.getSnapshot().draft?.trial?.enabled, true,
+      '点开关后草稿里必须是新值（丢弃新值 = 用户点了没反应）')
+    assert.equal(face.hooks.config.getSnapshot().dirty, true, '改了字段必须变脏（否则保存按钮永远不可用）')
+  })
+
+  it('其余三个开关同样真的生效（任一丢弃即红）', () => {
+    const { entry, face, t, captured } = bootWithSwitch({})
+    renderConsoleSettings(entry, face, t)
+    const byLabel = (label) => {
+      const hit = captured.find(props => props.label === label)
+      assert.ok(hit !== undefined, '控件必须在：' + label + '（现有：' + JSON.stringify(captured.map(p => p.label)) + '）')
+      return hit
+    }
+    for (const [label, path] of [
+      ['试装前做基线启动', 'baseline'],
+      ['允许联网拉取候选包', 'allowNetwork'],
+      ['自动清理测试环境', 'autoCleanup'],
+    ]) {
+      const control = byLabel(label)
+      const next = control.checked !== true
+      control.onChange(next)
+      assert.equal(face.hooks.config.getSnapshot().draft?.trial?.[path], next, label + ' 的开关必须生效')
+    }
+    // 深度 / 失败行为是 PmSelect（官方 Menu），这里只断言初值都在（它们的回调由 PmSelect 驱动）。
+    const draft = face.hooks.config.getSnapshot().draft
+    assert.equal(draft?.trial?.depth, 'auto', '深度默认 auto')
+    assert.equal(draft?.trial?.onFailure, 'block', '失败行为默认 block')
+    assert.ok(draft?.trial?.retentionDays >= 1, '保留天数有值')
+    assert.ok(draft?.trial?.maxKept >= 0, '保留上限有值')
+  })
+})
