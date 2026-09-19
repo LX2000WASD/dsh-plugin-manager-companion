@@ -37,7 +37,7 @@
 
 import { existsSync, readFileSync, readdirSync, realpathSync, statSync, type Dirent } from 'node:fs'
 import { createRequire, isBuiltin } from 'node:module'
-import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Context } from '@deepseek-ai/cordis'
 import { profilesRoot, readEnvironmentManifest, type EnvironmentManifest } from './paths.ts'
@@ -2760,17 +2760,70 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value as Record<string, unknown>
 }
 
-/** 路径是否在目录内（含目录自身）。 */
-function isInside(dir: string, candidate: string): boolean {
-  const base = resolve(dir)
-  const target = resolve(candidate)
-  return target === base || target.startsWith(base + '/')
+/**
+ * 路径归属判定用的规范形：解析为绝对路径，能解析到实体就取真实路径，大小写不敏感的平台上一并折叠。
+ *
+ * 为什么要有它：判断"这个 patch 文件属于环境自己还是属于某个包"原来靠
+ * `target.startsWith(base + '/')` 这种字符串前缀比较。三个平台差异会让它判错：
+ *   · Windows 的路径分隔符是反斜杠（resolve 会统一，但拼接的分隔符不该由我们猜）；
+ *   · Windows / macOS 默认文件系统**大小写不敏感**：`C:\\DSH\\profiles\\demo` 与
+ *     `C:\\dsh\\profiles\\demo` 是同一个目录，前缀比较会把用户自己的 patch 判成"环境外"，
+ *     于是处置建议说反（本该改环境自己的文件，却让人去动包）。
+ *
+ * realpath 顺带把符号链接折叠掉：link 安装（profile 里指向源码目录的软链）也归到真实位置。
+ * 解析不到实体（文件还不存在）时退回 resolve 的结果，判定依然成立。
+ *
+ * @param target - 待规范的路径。
+ * @returns 规范形（分隔符统一、大小写按平台折叠）。
+ */
+function canonicalPath(target: string): string {
+  const absolute = resolve(target)
+  let real = absolute
+  try {
+    real = realpathSync(absolute)
+  } catch {
+    // 路径还不存在（或中间段不可读）：按解析出的绝对路径判定。
+  }
+  return caseInsensitiveFs() ? real.toLowerCase() : real
 }
 
-/** 相对路径（不在目录内时返回绝对路径）。 */
+/** 平台默认文件系统是否大小写不敏感（口径与 paths.ts 的 caseInsensitiveFs() 一致）。 */
+function caseInsensitiveFs(): boolean {
+  return process.platform === 'win32' || process.platform === 'darwin'
+}
+
+/**
+ * 路径是否在目录内（含目录自身）——按**相对路径**判定，不拼分隔符。
+ *
+ * @param dir - 目录。
+ * @param candidate - 待判定的路径。
+ * @returns 是否在目录内（或就是它本身）。
+ */
+function isInside(dir: string, candidate: string): boolean {
+  const base = canonicalPath(dir)
+  const target = canonicalPath(candidate)
+  if (target === base) return true
+  const rel = relative(base, target)
+  // 空串在上面已判过；`..` / `../x` 是越界；isAbsolute 覆盖 Windows 的不同盘符
+  // （跨卷时 path.relative 返回目标绝对路径，而不是相对路径）。
+  return rel.length > 0 && !rel.startsWith('..') && !isAbsolute(rel)
+}
+
+/**
+ * 相对路径（不在目录内时返回绝对路径）。
+ *
+ * `..foo` 这种以两点开头的**普通名字**不算越界——原来用 `startsWith('..')` 会把
+ * `<env>/..hidden.yml` 判成环境外，于是证据里给出一条绝对路径、处置通道也说反。
+ *
+ * @param base - 基准目录。
+ * @param file - 目标文件。
+ * @returns 目录内的相对路径；不在目录内时原样返回。
+ */
 function relativeTo(base: string, file: string): string {
   const rel = relative(base, file)
-  return rel.length === 0 || rel.startsWith('..') ? file : rel
+  if (rel.length === 0) return file
+  if (rel === '..' || rel.startsWith('..' + sep) || isAbsolute(rel)) return file
+  return rel
 }
 
 /** 错误消息。 */

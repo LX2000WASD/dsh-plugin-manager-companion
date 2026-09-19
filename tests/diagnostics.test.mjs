@@ -11,7 +11,7 @@ import assert from 'node:assert/strict'
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
 import { readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import {
   analyzeEnvironment, installAnchorRoots, installedPackageDir, isPlausibleSpecifier, scanCode, specifierResolves,
   tokenize, locatePatchRows,
@@ -916,6 +916,59 @@ describe('diagnostics · 扫描器输入过滤（打包碎片不是依赖）', (
   })
 })
 
+describe('diagnostics · patch 归属判定是平台无关的（task-59）', () => {
+  /** 临时把 process.platform 伪装成另一个平台（磁盘上的大小写不变，只换判定）。 */
+  function withPlatform(platform, body) {
+    const original = Object.getOwnPropertyDescriptor(process, 'platform')
+    Object.defineProperty(process, 'platform', { value: platform, configurable: true })
+    try { return body() } finally { Object.defineProperty(process, 'platform', original) }
+  }
+
+  /** 旧口径（自造分隔符的前缀比较）——用来证明"退回旧行为会判错"。 */
+  function oldIsInsidePrefix(base, candidate) {
+    const b = resolve(base)
+    const t = resolve(candidate)
+    return t === b || t.startsWith(b + '/')
+  }
+
+  it('环境自己的 patch：环境目录大小写不同（大小写不敏感平台）仍判成 profile-patch', async () => {
+    // 同一份目录，只是 casing 写错：Windows/macOS 上是同一个位置。
+    // 磁盘上仍是真实大小写的 envDir（环境目录必须真的存在）；
+    // 大小写不敏感由伪装平台触发：canonicalPath 会把两侧都折叠，于是 envDir 与 envDir.toUpperCase() 同一形。
+    const env = { name: 'demo', dir: envDir, current: false, builtin: false, bundles: [], dependencies: [], runs: [], installAnchor }
+    const report = await withPlatform('darwin', () =>
+      analyzeEnvironment(makeCtx({ profileContext: {} }), env, CONFIG))
+    const issue = report.issues.find(candidate => candidate.code === 'duplicate-row-id')
+    assert.ok(issue, '应检出 duplicate-row-id：' + JSON.stringify(report.issues.map(candidate => candidate.code)))
+    assert.equal(issue.scope, 'demo',
+      '用户自己的 patch 必须判成环境自己的（scope=环境名），实际：' + issue.scope)
+    // 变异验证：同一份输入，退回旧的前缀比较必须判否——这正是"处置建议说反"的根因。
+    assert.equal(oldIsInsidePrefix(envDir.toUpperCase(), patchPath), false,
+      '夹具前提：旧口径在大小写不同的路径（目录大写、文件仍原样）上确实判否')
+    assert.equal(oldIsInsidePrefix(envDir.toUpperCase(), patchPath.toUpperCase()), true,
+      '旧口径只在两侧大小写完全一致时才碰巧对——所以真机上"有时对有时错"，更难发现')
+  })
+
+  it('包自带的 patch：包目录大小写不同（大小写不敏感平台）仍判成包自带', async () => {
+    const upperBundleDir = bundleDir.replace(/probe-bundle$/, 'PROBE-BUNDLE')
+    const env = { name: 'bundle-holder', dir: join(home, 'profiles', 'bundle-holder'), current: false, builtin: false, bundles: ['probe-bundle'], dependencies: [], runs: [], installAnchor }
+    const report = await withPlatform('darwin', () =>
+      analyzeEnvironment(makeCtx({}), env, CONFIG))
+    const issue = report.issues.find(candidate => candidate.code === 'orphan-row')
+    assert.ok(issue, '应检出 orphan-row')
+    assert.equal(issue.scope, 'probe-bundle', '包自带的 patch 必须判成包自带，实际：' + issue.scope)
+    assert.equal(oldIsInsidePrefix(upperBundleDir, bundlePatchPath), false,
+      '夹具前提：旧口径在大小写不同的路径上确实判否')
+  })
+
+  it('Linux（大小写敏感）上判据不变：不存在的目录仍如实记 environment-dir', async () => {
+    if (process.platform === 'win32' || process.platform === 'darwin') return
+    const env = { name: 'demo', dir: join(home, 'profiles', 'DEMO'), current: false, builtin: false, bundles: [], dependencies: [], runs: [], installAnchor }
+    const report = await analyzeEnvironment(makeCtx({ profileContext: {} }), env, CONFIG)
+    assert.ok(report.skipped.some(item => item.check === 'environment-dir'),
+      '不存在的环境目录要如实记 skip：' + JSON.stringify(report.skipped.map(item => item.check)))
+  })
+})
 describe('diagnostics · 文案不留未渲染的 Markdown（task-55）', () => {
   it('每条发现的 title / detail / fix.summary / operation 里都不许出现 **', async () => {
     // Web 卡片与 CLI 都是纯文本渲染：**x** 会原样显示成字面星号（copy-review-2 §3.6 陷阱 1）。
