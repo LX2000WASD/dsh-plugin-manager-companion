@@ -565,6 +565,12 @@ export function listEnvironments(ctx?: Context, options: ListEnvironmentsOptions
       current: name === current,
       builtin: isBuiltinEnvironment(name),
       bundles: manifest.bundles,
+      // 读不懂 manifest 时**不能**让调用方把空数组当事实：把未知如实带出去。
+      ...(manifest.bundlesKnown === false ? {
+        bundlesKnown: false,
+        ...(manifest.bundlesUnknownReason === undefined
+          ? {} : { bundlesUnknownReason: manifest.bundlesUnknownReason }),
+      } : {}),
       dependencies: manifest.dependencies,
       runs: runs.get(name) ?? [],
     })

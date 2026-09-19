@@ -16,6 +16,7 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
+import { configState } from './settings.ts'
 import type {
   BundleInfo, ChangeResult, PluginEntryId, PluginInfo, PluginInventorySnapshot,
   PluginSpecInspection,
@@ -72,6 +73,10 @@ export function probeOfficialCapabilities(ctx: Context): OfficialCapabilities {
   const inventory = ctx.get('loader') !== undefined
   if (!inventory) missing.push('Loader 服务不可用：运行时事实类检查已跳过')
 
+  // 配置面降级也要出现在这里：用户看到的是"我改的设置没生效"，必须能在同一处读到原因。
+  const config = configState()
+  if (!config.writable) missing.push('配置不可写（' + (config.detail ?? config.reason ?? '原因未知') + '）')
+
   return {
     profileBacked,
     manager,
@@ -84,9 +89,14 @@ export function probeOfficialCapabilities(ctx: Context): OfficialCapabilities {
 /**
  * 官方 pluginManager 服务的**结构式**视图。
  *
- * 只声明我们真正调用的方法，不 import 官方类：官方包是 peer，不同小版本
- * 之间可能有增减，结构式引用让"官方少了一个方法"变成一次运行时检查而不是
- * 一个编译期断裂。每个方法在调用前都由 {@link requireManager} 校验。
+ * 类型面保留官方管理的完整可读面；**运行时校验**只覆盖我们真正调用的方法
+ * （见 REQUIRED_MANAGER_METHODS）。两者刻意分开：
+ *   · listPlugins / listBundles 在本仓库 0 处调用（2026-09-19 核过），所以不进必需清单——
+ *     官方改它们时不该让我们报"能力不可用"（那是误报）；
+ *   · 但它们留在类型面里，谁以后要用就有现成的类型，也不必现在顺手收紧类型面。
+ *
+ * 不 import 官方类：官方包是 peer，小版本之间可能有增减；结构式引用让"官方少了一个
+ * 方法"变成一次运行时可读的降级，而不是调用点的 TypeError。
  */
 interface OfficialManagerLike {
   listPlugins(): Promise<PluginInfo[]>
@@ -115,20 +125,54 @@ export class OfficialUnavailableError extends Error {
 }
 
 /**
+ * 我们真正调用过的 pluginManager 方法（缺任何一个都让这项能力不可用）。
+ *
+ * 为什么是显式清单而不是"把接口上的方法全列一遍"：接口是契约面，方法清单是**实际使用**面。
+ * 只有后者才能在官方改方法时给出准确的"我们用到的那一个不见了"，也不会因为官方增删
+ * 我们没用的方法而误报。清单与 OfficialManagerLike 必须同步（下面有编译期校验）。
+ */
+const REQUIRED_MANAGER_METHODS = [
+  'inspect', 'setPluginEnabled', 'setBundleEnabled', 'installBundle', 'removeBundle',
+] as const satisfies readonly (keyof OfficialManagerLike)[]
+
+/** 取该对象上名为 name 的成员是否可调用（含原型链上的方法）。 */
+function isCallableMethod(service: object, name: string): boolean {
+  let current: object | null = service
+  while (current !== null) {
+    const value = (current as Record<string, unknown>)[name]
+    if (value !== undefined) return typeof value === 'function'
+    current = Object.getPrototypeOf(current) as object | null
+  }
+  return false
+}
+
+/**
  * 取官方 pluginManager，缺失时抛出可读错误。
  *
  * 每个调用点都必须经过它——这样"官方不可用"永远以一个**具名错误**出现，
  * 而不是 `undefined.listBundles is not a function`。
  *
+ * 两层校验：服务存在（ctx.get）与**我们用到的方法存在**。第二层是 2026-09-19 补的：
+ * 官方改/删一个 Remote 方法时，用户原本看到调用点的 TypeError（读不懂）；现在得到的是
+ * "缺哪个方法"+"所以这项能力不可用"。
+ *
  * @param ctx - 本插件的 host 上下文。
  * @returns 官方管理器（结构式视图）。
- * @throws {OfficialUnavailableError} 官方管理器未装配时。
+ * @throws {OfficialUnavailableError} 官方管理器未装配，或缺少我们调用到的方法时。
  */
 export function requireManager(ctx: Context): OfficialManagerLike {
   const service = ctx.get('pluginManager')
   if (service === undefined) {
     throw new OfficialUnavailableError('pluginManager', probeOfficialCapabilities(ctx).missing[0]
       ?? '官方 pluginManager 服务不可用')
+  }
+  const absent = REQUIRED_MANAGER_METHODS.filter(name => !isCallableMethod(service, name))
+  if (absent.length > 0) {
+    throw new OfficialUnavailableError('pluginManager',
+      '官方 pluginManager 缺少我们用到的' + (absent.length > 1 ? '这些方法：' : '方法：') + absent.join('、')
+      + '：说明官方依赖的接口与预期不一致（官方改过或删过这个方法），'
+      + '因此"当前环境的插件管理"这项能力不可用——升级/回退 @deepseek-ai/dsh-plugin-manager，'
+      + '或改用官方 CLI（dsh plugin）完成同一步操作。')
   }
   return service as unknown as OfficialManagerLike
 }

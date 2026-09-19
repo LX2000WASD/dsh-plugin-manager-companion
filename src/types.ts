@@ -33,8 +33,18 @@ export interface EnvironmentInfo {
   readonly current: boolean
   /** 官方内置环境（web/headless 等），只读不可删。 */
   readonly builtin: boolean
-  /** `dsh.profile.bundles` 的层栈。 */
+  /** `dsh.profile.bundles` 的层栈；读不懂 manifest 时为空数组，**必须**配合 bundlesKnown 判断。 */
   readonly bundles: readonly string[]
+  /**
+   * 层栈是不是确定的事实。缺省（undefined）等价于 true。
+   *
+   * 为什么必须有：官方若改了 `dsh.profile.bundles` 的名字或位置，读出来是空数组；
+   * 界面若直接显示 `0 个组合包`，就是把"我不知道"说成"这个环境没有层栈"。
+   * false 表示这份 manifest 的结构我们读不懂，层栈相关的结论都不可信。
+   */
+  readonly bundlesKnown?: boolean
+  /** bundlesKnown 为 false 时的原因（面向用户）；确定时为 undefined。 */
+  readonly bundlesUnknownReason?: string
   /** 直接依赖名列表。 */
   readonly dependencies: readonly string[]
   /** 进程表扫描到的运行实例；空数组表示未运行。 */

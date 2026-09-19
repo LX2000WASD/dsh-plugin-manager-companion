@@ -7,9 +7,9 @@
  * → plugin_search 的打分与版本比较。
  */
 
-import test from 'node:test'
+import test, { after } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { gzipSync } from 'node:zlib'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -23,9 +23,21 @@ const match = await import('../dist/match.js')
 
 // ── 测试夹具 ────────────────────────────────────────────────────────────
 
+/**
+ * 本轮建过的临时 HOME：跑完统一删掉。
+ * 不删的话每次跑测试都会往 /tmp 里堆 30 个目录（实测一次全量跑遗留 1,056 个），
+ * 属于测试自己对环境的不负责。
+ */
+const createdHomes = []
+after(() => {
+  for (const home of createdHomes) rmSync(home, { recursive: true, force: true })
+  createdHomes.length = 0
+})
+
 /** 每个测试自建一个 DSH_HOME，避免污染真实环境（也避免测试之间互相看见缓存）。 */
 function makeHome() {
   const home = mkdtempSync(join(tmpdir(), 'pmc-market-'))
+  createdHomes.push(home)
   process.env.DSH_HOME = home
   registry.resetRegistryMemory()
   marketplace.clearInstalledIndexCache()

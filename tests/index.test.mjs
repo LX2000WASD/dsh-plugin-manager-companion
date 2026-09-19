@@ -238,6 +238,9 @@ function makeRollbackManager(envDir, packageName, sourceDir, { removeLink }) {
   const writeManifest = (manifest) => writeFileSync(join(envDir, 'package.json'), JSON.stringify(manifest, undefined, 2) + '\n')
   return {
     inspect: async () => ({ status: 'ok' }),
+    // task-40 起 requireManager 会逐个校验"我们真正调用的方法"：桩件也必须齐全，
+    // 否则拿到的会是可读的"官方缺少方法"错误（这正是我们要的行为）。
+    setPluginEnabled: async () => ({ application: 'applied', stage: 'enable', target: packageName, changed: true }),
     installBundle: async () => {
       const manifest = readManifest()
       manifest.dependencies = { ...(manifest.dependencies ?? {}), [packageName]: 'link:' + sourceDir }

@@ -137,16 +137,51 @@ export interface ConfigHandle {
 }
 
 /**
- * 注册本插件的 settings 命名空间。
- *
- * 官方 `register` 在命名空间已注册时**抛错**（同一进程内不允许两个所有者）。
- * 本插件可能在多个 profile 中被加载，但每个 host 进程只有一个 Cordis 根，
- * 所以冲突只会来自"同一个插件被装配两次"——那属于装配错误，让它响亮地失败
- * 比静默让后者覆盖前者更安全。
- *
- * @param ctx - 本插件的 host 上下文。
- * @returns 配置句柄；官方 settings 服务不可用时返回默认配置的只读句柄。
+ * 本插件配置面的当前状态（给 capabilities 用，让"配置不可写"对用户可见）。
  */
+export interface ConfigState {
+  /** 配置是否可以写入（false = 正在用只读的默认配置）。 */
+  readonly writable: boolean
+  /** 不可写的稳定原因码；可写时为 null。 */
+  readonly reason: 'settings-missing' | 'namespace-conflict' | null
+  /** 面向用户的一句话；可写时为 null。 */
+  readonly detail: string | null
+}
+
+/** 最近一次配置降级的事实；null = 配置面正常。 */
+let lastConfigDegradation: { readonly reason: ConfigState['reason']; readonly detail: string } | null = null
+
+/**
+ * 配置面的当前状态。
+ *
+ * 为什么是模块级：装配层用 ctx.inject(['settings'], …) 在 settings 就绪时才注册，
+ * 命名空间冲突发生在那个回调里；而这件事实必须能被 probeOfficialCapabilities 读到、
+ * 进而出现在用户可见的 capabilities 里（不能只在日志里）。
+ *
+ * @returns 当前配置面状态。
+ */
+export function configState(): ConfigState {
+  if (lastConfigDegradation === null) return { writable: true, reason: null, detail: null }
+  return { writable: false, reason: lastConfigDegradation.reason, detail: lastConfigDegradation.detail }
+}
+
+/**
+ * 记录一次配置降级：写日志 + 留给 capabilities 呈现。
+ *
+ * @param ctx - host 上下文（用于日志）。
+ * @param reason - 稳定原因码。
+ * @param detail - 面向用户的原因。
+ */
+function noteConfigDegraded(ctx: Context, reason: ConfigState['reason'], detail: string): void {
+  lastConfigDegradation = { reason, detail }
+  ctx.logger?.warn?.('plugin-manager-companion: ' + detail)
+}
+
+/** 错误消息（本地小工具）。 */
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
 /**
  * 官方 settings 服务尚不可用时的**只读**降级句柄。
  *
@@ -171,20 +206,35 @@ export function fallbackConfigHandle(): ConfigHandle {
 /**
  * 注册本插件的 settings 命名空间。
  *
- * **调用方必须保证 ctx 上 settings 已可用**（装配层用 ctx.inject(['settings'], …) 保证）。
- * 这里保留缺失分支只为防御：真的走到它说明装配层接线错了，此时给只读句柄并记日志，
- * 而不是让整个插件装配失败。
+ * 官方 `register` 在命名空间已被占用时**抛错**。这里的立场是"任何宿主都能加载、
+ * 缺能力就如实降级"：冲突时退回只读的默认配置句柄，并把事实登记给 capabilities，
+ * 而不是让整个插件装配失败（那会让用户看到一个装不上、也没有可读原因的插件）。
  *
- * @param ctx - settings 服务已就绪的上下文。
- * @returns 配置句柄。
+ * 不静默：降级句柄的 `update` 照旧**抛错**而不是丢写入，且 configState() 会让
+ * capabilities.missing 里出现一条"配置不可写"的说明。
+ *
+ * @param ctx - 本插件的 host 上下文。
+ * @returns 配置句柄；settings 不可用或命名空间冲突时返回只读的默认配置句柄。
  */
 export function registerConfig(ctx: Context): ConfigHandle {
   const settings = ctx.get('settings')
   if (settings === undefined) {
-    ctx.logger?.warn?.('plugin-manager-companion: settings 服务未就绪，配置降级为只读——装配层应改用 ctx.inject(["settings"])')
+    noteConfigDegraded(ctx, 'settings-missing',
+      'settings 服务未就绪，配置降级为只读——装配层应改用 ctx.inject(["settings"])')
     return fallbackConfigHandle()
   }
-  const scope = settings.register(SETTINGS_NAMESPACE, ConfigSchema)
+  let scope: ReturnType<typeof settings.register>
+  try {
+    scope = settings.register(SETTINGS_NAMESPACE, ConfigSchema)
+  } catch (error) {
+    // 命名空间已被占用（同进程内另一个本插件实例）：不抛穿装配，退回只读句柄并登记事实。
+    noteConfigDegraded(ctx, 'namespace-conflict',
+      'settings 命名空间 "' + SETTINGS_NAMESPACE + '" 已被占用，配置降级为只读（正在用默认值）：'
+      + messageOf(error))
+    return fallbackConfigHandle()
+  }
+  // 注册成功：清掉可能残留的降级事实（例如重试装配）。
+  lastConfigDegradation = null
   return {
     current: () => scope.get() as CompanionConfig,
     watch: (listener) => scope.watch((next: unknown) => { listener(next as CompanionConfig) }),

@@ -249,7 +249,7 @@ export async function analyzeEnvironment(
     readonly run: () => DiagnosticIssue[]
   }[] = [
     { layer: 'dependency', run: () => dependencyLayer(env, facts, composition) },
-    { layer: 'composition', run: () => compositionLayer(env, facts, composition) },
+    { layer: 'composition', run: () => compositionLayer(env, facts, composition, skipped) },
     { layer: 'runtime', run: () => runtimeLayer(env, facts, composition, runtime) },
     { layer: 'consistency', run: () => consistencyLayer(env, facts, composition, runtime) },
     { layer: 'ecosystem', run: () => ecosystemLayer() },
@@ -384,6 +384,50 @@ export function readInstallAnchor(ctx: Context): string | undefined {
   } catch {
     // ctx.get 在服务缺失时可能抛错：拿不到锚点按 undefined 处理，由调用方记 skipped。
     return undefined
+  }
+}
+
+/**
+ * 这一层的输入是否**确定**（manifest 读不懂时不能把结论当成事实说出去）。
+ *
+ * 存在的理由：官方若改了 dsh.profile.bundles 的名字或位置，读出来就是空数组。
+ * 若不作声，诊断会把"我不知道"说成"这个环境没有层栈"——典型的假阴性。
+ *
+ * @param facts - 静态事实（含 manifest）。
+ * @param skipped - 跳过项收集器。
+ * @returns 输入是否确定。
+ */
+function bundlesFactKnown(facts: StaticFacts, skipped: DiagnosticSkip[]): boolean {
+  const manifest = facts.manifest
+  if (manifest.bundlesKnown !== false) return true
+  skipped.push({
+    check: 'bundles-unknown',
+    reason: '这个环境的 package.json 结构读不懂（' + (manifest.bundlesUnknownReason ?? '原因未知')
+      + '）：层栈相关的结论（bundle 声明、层栈与运行时对照）本次**没有判断**，'
+      + '不要把它当成"这个环境没有层栈"。'
+  })
+  return false
+}
+/**
+ * 这一层的输入是否**确定**（manifest 读不懂时不能把结论当成事实说出去）。
+ *
+ * 存在的理由：官方若改了 dsh.profile.bundles 的名字或位置，读出来就是空数组。
+ * 若不作声，诊断会把"我不知道"说成"这个环境没有层栈"——典型的假阴性。
+ * 放在组合层：受影响的正是"层栈相关"的结论（bundle 声明、层栈与运行时对照），
+ * 依赖层与运行时层照常出结论，不会因此被连带跳过。
+ *
+ * @param facts - 静态事实（含 manifest）。
+ * @param facts.manifest - 该环境的 manifest 解析结果。
+ * @returns 一条跳过项；输入确定时 undefined。
+ */
+function bundlesUnknownSkip(facts: StaticFacts): DiagnosticSkip | undefined {
+  const manifest = facts.manifest
+  if (manifest.bundlesKnown !== false) return undefined
+  return {
+    check: 'bundles-unknown',
+    reason: '这个环境的 package.json 结构读不懂（' + (manifest.bundlesUnknownReason ?? '原因未知')
+      + '）：层栈相关的结论（bundle 声明、层栈与运行时对照）本次**没有判断**，'
+      + '不要把它当成"这个环境没有层栈"。'
   }
 }
 
@@ -1015,8 +1059,12 @@ function compositionLayer(
   env: EnvironmentInfo,
   facts: StaticFacts,
   composition: CompositionFacts,
+  skipped: DiagnosticSkip[],
 ): DiagnosticIssue[] {
   const issues: DiagnosticIssue[] = []
+  // 输入事实先说清：manifest 读不懂时，"层栈为空"不是结论而是未知。
+  const unknownBundles = bundlesUnknownSkip(facts)
+  if (unknownBundles !== undefined) skipped.push(unknownBundles)
 
   // 1. duplicate-row-id：**同一个 insert 列表**里同一个显式 id 出现多次。
   //    官方 loader 的 Group.update() 只对自己那一份 insert 列表查重，命中即抛
