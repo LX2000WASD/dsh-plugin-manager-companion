@@ -277,7 +277,7 @@ test('候选包导致挂载失败 + 默认 block：不装、已回滚、给出�
   assert.equal(result.rolledBack, true)
   assert.ok(manager.calls.includes('removeBundle'), '必须真的回滚')
   assert.ok(!manager.calls.includes('setBundleEnabled'), '未通过就不许激活')
-  assert.match(result.output, /候选包导致挂载失败，已回滚/)
+  assert.match(result.output, /没有安装 dsh-probe-candidate：候选包导致挂载失败。\n已回滚。/)
   assert.match(result.output, /试装结论（替身）：candidate-broken/)
 })
 
@@ -308,7 +308,7 @@ test('无法试装 + block：不许当成通过，回滚并说明原因', async 
   assert.equal(result.ok, false, '无法试装不得当成通过')
   assert.equal(result.trial.conclusion, 'cannot-trial')
   assert.equal(result.trial.policy, 'blocked')
-  assert.match(result.output, /无法试装（不算通过），已回滚/)
+  assert.match(result.output, /没有安装 dsh-probe-candidate：无法试装（不算通过）。\n已回滚。/)
 })
 
 test('快照基线起不来：文案不赖候选包', async () => {

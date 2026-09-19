@@ -2545,13 +2545,13 @@ export async function materializeSnapshot(
       rmSync(path, { recursive: true, force: true })
     } catch (error) {
       throw new EnvironmentError('snapshot-not-shallow',
-        '快照要求目录里只有源环境现在的清单，但上一次物化留下的 ' + stale + ' 删不掉（' + messageOf(error)
-        + '）：不能带着旧依赖去验证（那会让结论假通过），这次试装报无法试装。')
+        '试装环境里还留着上一次试装的依赖文件，这次删不掉（' + messageOf(error)
+        + '）：带着旧依赖验证会得出错误的结论，所以这次不做试装。')
     }
     if (existsSync(path)) {
       throw new EnvironmentError('snapshot-not-shallow',
-        '快照要求目录里只有源环境现在的清单，但上一次物化留下的 ' + stale + ' 删完之后仍然在：'
-        + '不能带着旧依赖去验证（那会让结论假通过），这次试装报无法试装。')
+        '试装环境里还留着上一次试装的依赖文件，删完之后仍然在：'
+        + '带着旧依赖验证会得出错误的结论，所以这次不做试装。')
     }
     cleared.push(stale)
   }
@@ -2580,7 +2580,7 @@ export async function materializeSnapshot(
   } catch (error) {
     throw new EnvironmentError(
       error instanceof EnvironmentError ? error.code : 'official-unavailable',
-      '真实快照需要官方 pnpm 通道，但不可用：' + messageOf(error),
+      '这次试装需要官方安装通道，但它不可用：' + messageOf(error),
     )
   }
   const result = await runPackageOperation(runner, context, ['install', '--prefer-offline'], options)
@@ -3234,24 +3234,19 @@ async function detachCandidate(
 ): Promise<{ readonly removed: boolean; readonly note: string }> {
   const name = candidateName(spec)
   if (name === undefined) {
-    return { removed: false, note: '认不出候选包名（' + spec + '）：没有先卸包，装它时按"新装"处理。' }
+    return { removed: false, note: '认不出候选包的包名，本次按直接安装处理。' }
   }
   if (trialDependencies(target).includes(name)) {
     const removal = await runPackageOperation(runner, context, ['remove', name], options)
     if (removal.exitCode === 0) {
-      return {
-        removed: true,
-        note: '已先走官方通道卸掉 ' + name + '，使候选成为"新装"'
-          + '（否则官方 reconcile 会跳过"既有依赖"，候选进不了层栈，这次试装等于什么都没验证）。',
-      }
+      return { removed: true, note: '已先把 ' + name + ' 从测试环境移除，再重新安装（否则重复安装不会生效）。' }
     }
     return {
       removed: false,
-      note: '官方卸包失败（退出码 ' + String(removal.exitCode) + '），候选可能仍被当作"既有依赖"：'
-        + removal.output.trim().slice(-200),
+      note: '移除旧版本没有成功（退出码 ' + String(removal.exitCode) + '），候选包可能仍是重复安装的状态。',
     }
   }
-  return { removed: false, note: '候选本来就不在测试环境的依赖里，装它天然是"新装"。' }
+  return { removed: false, note: '候选包本来就不在测试环境里，直接安装即可。' }
 }
 
 /**
@@ -3300,22 +3295,24 @@ function trialActivation(
   if (suspects.length === 0) {
     return {
       ok: false,
-      detail: '装完候选包后，测试环境的 dependencies 里没有出现它（装前 ' + String(beforeDeps.length)
-        + ' 项，装后 ' + String(deps.length) + ' 项）：这次试装没有验证到任何东西。',
+      detail: '这次试装没有验证到任何东西：装完之后，测试环境里找不到候选包。',
       fact: fact(false),
     }
   }
   const active = suspects.filter((name) => bundles.includes(name))
   if (active.length > 0) return { ok: true, detail: '', fact: fact(true) }
   const stale = suspects.every((name) => beforeDeps.includes(name))
+  // 面向用户的说法（DESIGN §12.6）：不出现 dsh.profile.bundles / reconcile / node_modules 这些
+  // 实现词汇，也不出现字面 **（web 上是可见星号，§3.6 陷阱 #1）。
+  // 技术细节（层栈快照、判据）仍在 fact 里，界面要展开时读得到。
   return {
     ok: false,
-    detail: '候选（' + suspects.join(', ') + '）装进了 node_modules，但**没有进入组合层栈**'
-      + '（dsh.profile.bundles = ' + JSON.stringify(bundles) + '）——挂载期不会加载它。'
+    detail: '这次试装没有验证到新版本：候选包装上了，但环境的启动列表里没有它，'
+      + '所以启动验证根本没有加载它。'
       + (stale
-        ? '原因：它在本轮之前就已经是测试环境的依赖，官方 reconcile 会跳过"既有的"依赖。'
-          + (detached.removed ? '（已先卸过包，但候选仍被当作既有的——见上面的卸包说明。）' : '')
-        : '原因：官方 reconcile 没有把它写进层栈（它可能没有声明 dsh.bundle）。'),
+        ? '原因：它本来就已经装在这个环境里，重复安装不会让它被重新加载。'
+          + (detached.removed ? '（本次已先把它移除，但仍没被重新加载。）' : '')
+        : '原因：它没有声明自己是一个组合包，所以不会被写进启动列表。'),
     fact: fact(false),
   }
 }
@@ -3414,7 +3411,7 @@ export async function runTrialInstall(
     context = operationContext(target, environmentDir(target), environmentDir(target), options)
     runner = await officialRunner(options)
   } catch (error) {
-    return done('cannot-trial', '无法试装：官方 pnpm 通道不可用（' + messageOf(error) + '）。这不等于通过。',
+    return done('cannot-trial', '无法试装：官方安装通道不可用（' + messageOf(error) + '）。这不等于通过。',
       { baseline })
   }
   // 装之前记下依赖清单：reconcile 会跳过"既有的"依赖，这份事实是下面那条守卫的判据。
@@ -3681,7 +3678,7 @@ export async function backupRestore(
           : '# bundle 层栈：已补回 -> ' + restored.written)
         if (skippedBundles.length > 0) {
           outputs.push('# bundle 层栈：未补回 ' + skippedBundles.join(', ')
-            + '（目标环境既解析不到、也不声明 dsh.bundle，照写会让 profile 下次启动失败）')
+            + '（目标环境既找不到它，它也没声明自己是一个组合包；照写会让环境下次启动失败）')
         }
       } catch (error) {
         outputs.push('# bundle 层栈：失败 ' + messageOf(error))

@@ -292,9 +292,12 @@ test('P4: 回滚后如实陈述磁盘状态——留下链接时不再说「环�
   // 磁盘前提：残留确实在（官方 pnpm remove 之后链接仍在）
   assert.equal(lstatSync(join(envDir, 'node_modules', pkg)).isSymbolicLink(), true, '测试前提：残留链接真的在磁盘上')
   // 文案必须与磁盘一致：manifest 说清了、残留说清了、断言「未改动」消失
-  assert.match(result.output, /package\.json：依赖声明与层栈都已回滚/)
-  assert.match(result.output, /node_modules：仍留有 dsh-probe-bundle-bad 的符号链接/)
-  assert.match(result.output, /手工删除/)
+  // 文案按 DESIGN §12.6 分层：不再以「package.json：」「node_modules：」当句子主语（路径语义不上屏）。
+  // 清单已回滚干净（所以没有"依赖声明还在"那行），但**残留链接必须说出来**——
+  // 这正是这条用例的核心：有残留时不许声称"环境未被改动"。
+  assert.doesNotMatch(result.output, /依赖声明还在|它仍在环境启动时加载的列表里/)
+  assert.match(result.output, /安装目录里还留着指向本地来源的链接/)
+  assert.match(result.output, /需要时可以手动删除/)
   assert.doesNotMatch(result.output, /环境未被改动/)
   assert.equal(result.rolledBack, false, '有残留时不得声称已完整回滚')
 })
@@ -308,7 +311,7 @@ test('P4: 回滚干净时（没有残留）才报 rolledBack=true 并说明无�
   const settled = await settle(deps, jobIdOf((await handleOp('install', { spec: './probe-clean', environment: 'demo-env' }, deps)).value))
   const result = settled.result
   assert.equal(result.ok, false)
-  assert.match(result.output, /node_modules：没有留下 dsh-probe-bundle-clean 的目录或链接/)
+  assert.match(result.output, /没有留下安装残留/)
   assert.equal(result.rolledBack, true)
 })
 

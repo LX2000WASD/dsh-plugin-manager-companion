@@ -459,7 +459,7 @@ test('试装引擎自己摘候选（task-84）：候选已在测试环境依赖�
   assert.equal(stale.conclusion, 'passed', stale.output)
   assert.equal(stale.activation.activated, true, '摘过之后候选才真的进层栈')
   assert.equal(stale.activation.removedFirst, true)
-  assert.match(stale.detached, /使候选成为"新装"/)
+  assert.match(stale.detached, /移除，再重新安装/)
   assert.ok(stale.activation.bundles.includes('probe-plugin'), JSON.stringify(stale.activation.bundles))
 
   // 形态 B：候选既在 deps 也在层栈（**升级场景**：已装且已启用）。同一条路。
@@ -503,7 +503,7 @@ test('金丝雀验证升级：走真引擎，候选先卸再装才进层栈（�
   assert.deepEqual(liveCalls, [['remove', 'probe-plugin'], ['add', spec]], '必须先卸再装')
   assert.equal(canary.activation.activated, true, '证据：候选真的进了层栈')
   assert.equal(canary.activation.removedFirst, true)
-  assert.match(canary.activation.removeNote, /使候选成为"新装"/)
+  assert.match(canary.activation.removeNote, /移除，再重新安装/)
   assert.ok(canary.activation.bundles.includes('probe-plugin'), JSON.stringify(canary.activation.bundles))
   assert.equal(existsSync(join(PROFILES, 'act-live-dpmc')), false, '用完即删')
 })

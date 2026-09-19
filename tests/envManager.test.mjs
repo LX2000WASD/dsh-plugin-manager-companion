@@ -910,7 +910,7 @@ test('task-80 假通过守卫：候选没进层栈一律 cannot-trial（绝不�
   const nothing = async () => ({ exitCode: 0, output: 'ok', truncated: false, logPath: '/dev/null' })
   const a = await env.runTrialInstall('@fake/pkg', 'act-a', { ...base, runCommand: nothing })
   assert.equal(a.conclusion, 'cannot-trial', '装上了但环境没变 → 不算通过')
-  assert.match(a.output, /没有出现它/)
+  assert.match(a.output, /找不到候选包/)
   assert.match(a.output, /不等于通过/)
 
   // ② **真机缺陷的原始形态**：候选已在源环境 dependencies 里（升级/重试同一候选）→ 物化把它
@@ -922,8 +922,8 @@ test('task-80 假通过守卫：候选没进层栈一律 cannot-trial（绝不�
   const keepDirty = async () => ({ exitCode: 0, output: 'ok', truncated: false, logPath: '/dev/null' })
   const b = await env.runTrialInstall('link:' + brokenFixture, 'act-b', { ...base, runCommand: keepDirty })
   assert.equal(b.conclusion, 'cannot-trial', '候选没进层栈 → 假通过的原始形态，必须被拦')
-  assert.match(b.output, /没有进入组合层栈/)
-  assert.match(b.output, /reconcile 会跳过/)
+  assert.match(b.output, /启动列表里没有它/)
+  assert.match(b.output, /重复安装不会让它被重新加载/)
 
   // ③ 装上了且进了层栈 → 允许按启动判定给结论
   makeEnv('act-c', { bundles: ['@deepseek-ai/dsh-base'] })
@@ -936,7 +936,7 @@ test('task-80 假通过守卫：候选没进层栈一律 cannot-trial（绝不�
     ...base, runCommand: installRunner('@fake/pkg', { activate: false }),
   })
   assert.equal(noActivate.conclusion, 'cannot-trial')
-  assert.match(noActivate.output, /没有进入组合层栈/)
+  assert.match(noActivate.output, /启动列表里没有它/)
 });
 
 test('task-84 正常顺序不误拦：引擎先摘候选，已装候选也能真的验证到（task-80 守卫保留作兜底）', async () => {
@@ -991,7 +991,7 @@ test('task-84 正常顺序不误拦：引擎先摘候选，已装候选也能真
   assert.equal(trial.conclusion, 'passed', '正常顺序下不许误拦：' + trial.output)
   assert.equal(trial.activation.activated, true, '证据：候选真的进了层栈')
   assert.equal(trial.activation.removedFirst, true)
-  assert.match(trial.detached, /使候选成为"新装"/)
+  assert.match(trial.detached, /移除，再重新安装/)
 
   // 对照：同样的输入，但引擎**不摘候选**（模拟旧顺序）→ 必然 cannot-trial。
   // 这一条守的是"顺序"本身：改回去就会红。

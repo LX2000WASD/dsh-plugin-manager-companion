@@ -97,11 +97,30 @@ function environmentDirOrNull(name: string): string | null {
  * @returns 标题片段。
  */
 function rollbackHeadline(removed: { application?: string; error?: { code?: string; diagnostic?: string } }): string {
-  if (removed.application === 'failed') {
-    return '回滚失败（' + (removed.error?.code ?? 'unknown')
-      + (removed.error?.diagnostic === undefined ? '' : ' —— ' + removed.error.diagnostic) + '）'
+  if (removed.application !== 'failed') return '已回滚'
+  return '回滚没有完成（' + removalFailureText(removed.error?.code) + '）'
+}
+
+/**
+ * 官方移除失败码 → 人话。
+ *
+ * 用户要的是"发生了什么、我该怎么办"，不是官方内部码名（DESIGN §12.6）。
+ * 码名本身仍留在结果对象的 error 字段里，需要排查时读得到；**文案里不再出现**。
+ * 未知码保留原文——宁可给原始信息，也不编一个可能不对的解释。
+ *
+ * @param code - 官方错误码。
+ * @returns 面向用户的说法。
+ */
+function removalFailureText(code: string | undefined): string {
+  const known: Record<string, string> = {
+    'not-removable': '官方不允许移除这个组合包',
+    'management-required': '这个包由安装方管理，不能在环境里移除',
+    'stop-profile': '环境正在运行，要先停掉它',
+    'bundle-in-use': '这个包正在被使用',
+    'not-bundle': '它不是组合包',
   }
-  return '已回滚'
+  if (code === undefined || code.length === 0) return '官方没有给出原因'
+  return known[code] ?? code
 }
 
 /**
@@ -125,36 +144,37 @@ function rollbackHeadline(removed: { application?: string; error?: { code?: stri
 function rollbackState(dir: string | null, name: string): { lines: string[]; clean: boolean } {
   if (dir === null || !existsSync(join(dir, 'package.json'))) {
     return {
-      lines: ['回滚状态未核对：读不到该环境的 package.json，无法确认清单是否回到原状。'],
+      lines: ['没能核对回滚结果：读不到这个环境的清单文件。'],
       clean: false,
     }
   }
   const manifest = readEnvironmentManifest(dir)
   if (manifest.broken !== undefined) {
     return {
-      lines: ['package.json 解析失败（' + manifest.broken + '），无法核对依赖与层栈是否回滚。'],
+      lines: ['没能核对回滚结果：环境的清单文件读不懂。'],
       clean: false,
     }
   }
   const declared = manifest.dependencies.includes(name)
   const layered = manifest.bundles.includes(name)
-  const manifestLine = declared || layered
-    ? 'package.json：依赖声明' + (declared ? '仍在' : '已移除') + '，层栈' + (layered ? '仍含 ' + name : '已不含 ' + name) + '。'
-    : 'package.json：依赖声明与层栈都已回滚，没有留下 ' + name + '。'
+  // 依赖声明与层栈是**两件事**，各自说各自的状态（旧版把两者拼进一行，读起来是一句长定语）。
+  const lines: string[] = []
+  if (declared) lines.push('依赖声明还在。')
+  if (layered) lines.push('它仍在环境启动时加载的列表里。')
   const entry = join(dir, 'node_modules', name)
-  let leftover: string | null = null
+  let leftover = false
   try {
     const stat = lstatSync(entry)
-    leftover = stat.isSymbolicLink()
-      ? 'node_modules：仍留有 ' + name + ' 的符号链接（-> ' + readlinkSync(entry) + '）。官方 pnpm 通道不会清掉路径安装留下的链接，需要时请手工删除它。'
-      : 'node_modules：仍留有 ' + name + ' 的' + (stat.isDirectory() ? '目录' : '文件') + '。需要时请手工删除它。'
+    leftover = true
+    // 路径安装留下的链接：说清"文件还在、且我们不会替你删"，但不把目录名与箭头当句子主体。
+    lines.push(stat.isSymbolicLink()
+      ? '安装目录里还留着指向本地来源的链接（本次安装的残留），需要时可以手动删除。'
+      : '安装目录里还留着它的文件（本次安装的残留），需要时可以手动删除。')
   } catch {
     // lstat 失败 = 没有残留，这是正常路径。
   }
-  return {
-    lines: [manifestLine, leftover ?? 'node_modules：没有留下 ' + name + ' 的目录或链接。'],
-    clean: !declared && !layered && leftover === null,
-  }
+  if (lines.length === 0) lines.push('依赖声明与加载列表都已回到原状，也没有留下安装残留。')
+  return { lines, clean: !declared && !layered && !leftover }
 }
 
 // ── 试装（质量门第二步，DESIGN §5.2）─────────────────────────────────────
@@ -624,8 +644,15 @@ export async function gatedInstall(
     const state = rollbackState(currentProfileDir(ctx, environmentDirOrNull(targetName)), packageName)
     return {
       ok: false,
-      output: `质量门无法完成扫描，${rollbackHeadline(removed)}：${error instanceof Error ? error.message : String(error)}`
-        + '\n' + state.lines.join('\n'),
+      output: [
+        '没有安装 ' + packageName + '：扫描没能完成。',
+        rollbackHeadline(removed) + '。',
+        '',
+        '原因：' + (error instanceof Error ? error.message : String(error)),
+        '',
+        '环境现状：',
+        ...state.lines.map(line => '  ' + line),
+      ].join('\n'),
       packageName, gateIssues: [], rolledBack: state.clean,
     }
   }
@@ -636,9 +663,16 @@ export async function gatedInstall(
     const state = rollbackState(currentProfileDir(ctx, environmentDirOrNull(targetName)), packageName)
     return {
       ok: false,
-      output: `质量检查未通过，${rollbackHeadline(removed)} ${packageName}：\n`
-        + gate.issues.map(i => "  - " + i).join("\n")
-        + '\n' + state.lines.join('\n'),
+      output: [
+        '没有安装 ' + packageName + '：质量检查未通过。',
+        rollbackHeadline(removed) + '。',
+        '',
+        '发现的问题：',
+        ...gate.issues.map(i => "  - " + i),
+        '',
+        '环境现状：',
+        ...state.lines.map(line => '  ' + line),
+      ].join('\n'),
       packageName, gateIssues: gate.issues, rolledBack: state.clean,
     }
   }
@@ -650,11 +684,20 @@ export async function gatedInstall(
     const removed = await manager.removeBundle(packageName)
     invalidateInstalledIndex(targetName)
     const state = rollbackState(currentProfileDir(ctx, environmentDirOrNull(targetName)), packageName)
+    // 分层呈现（DESIGN §12.6）：第一行是结论与后果，细节降到下面。
+    // 旧版把「结论 + 回滚状态 + 包名」用逗号拼成一行，再接一大段细节，同一件事说三遍；
+    // 这里每层只回答一个问题——发生了什么 / 为什么 / 现在环境是什么样。
     return {
       ok: false,
-      output: `${TRIAL_LABEL[trial.conclusion]}，${rollbackHeadline(removed)} ${packageName}：\n`
-        + trial.output
-        + '\n' + state.lines.join('\n'),
+      output: [
+        '没有安装 ' + packageName + '：' + TRIAL_LABEL[trial.conclusion] + '。',
+        rollbackHeadline(removed) + '。',
+        '',
+        trial.output,
+        '',
+        '环境现状：',
+        ...state.lines.map(line => '  ' + line),
+      ].join('\n'),
       packageName, gateIssues: gate.issues, rolledBack: state.clean, trial,
     }
   }

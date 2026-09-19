@@ -694,7 +694,7 @@ export async function checkUpgrades(options: UpgradeCheckOptions): Promise<Upgra
       if (state === 'up-to-date') {
         reason = 'registry 上没有比当前更新的版本（同线最新：' + String(target?.version ?? '—') + '）'
       } else if (state === 'unknown' && fact.currentVersion === null) {
-        reason = '读不到当前安装的版本（node_modules 里没有这个包或读不出来）'
+        reason = '读不到当前安装的版本（这个环境里没有它，或读不出来）'
       }
     } else if (market !== null) {
       // ① 市场索引（零网络）：有版本事实就能判四态；但没有 tag 列表，界面因此不给"挑版本"。
@@ -1036,9 +1036,8 @@ function activationFor(
       const removal = await runner(context, args, options)
       removedFirst = removal.exitCode === 0
       removeNote = removal.exitCode === 0
-        ? '已先走官方通道卸掉 ' + String(args[1]) + '，使候选成为"新装"'
-          + '（否则官方 reconcile 会跳过"既有依赖"，候选进不了层栈）'
-        : '官方卸包失败（退出码 ' + String(removal.exitCode) + '），候选可能仍被当作"既有依赖"：'
+        ? '已先把 ' + String(args[1]) + ' 从测试环境移除，再重新安装（否则重复安装不会生效）'
+        : '移除旧版本没有成功（退出码 ' + String(removal.exitCode) + '），候选包可能仍是重复安装的状态。'
           + removal.output.trim().slice(-200)
       return removal
     }
@@ -1164,7 +1163,7 @@ export async function upgradePackage(input: UpgradeActionInput): Promise<Upgrade
       ? '通过（深度 ' + String(canary.depth ?? '—') + '，耗时 ' + String(canary.elapsedMs ?? 0) + 'ms）'
       : '未做（' + String(canary.skippedReason ?? '原因未知') + '）'),
     canary.cleanup,
-    isSelf ? '本插件自身：正在运行的是旧代码，新版本**下次启动**后生效（官方口径）' : '生效时机：下次启动后加载（官方口径）',
+    isSelf ? '本插件自身：正在运行的是旧代码，新版本要等下次启动才生效。' : '生效时机：下次启动后加载。',
     '',
     '升级前：',
     ...before.map((line) => '  ' + line),

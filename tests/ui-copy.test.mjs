@@ -38,6 +38,15 @@ import { applyWithMocks, bootBundle, NS } from './client-harness.mjs'
 const SOURCE = 'src/client/locales.ts'
 
 /**
+ * host 侧用户可见文案的真源（DESIGN §12.6）。
+ *
+ * 为什么需要它：本文件原本只扫客户端字典，**host 侧输出零护栏**——于是 2026-09-19 第三轮
+ * 反馈里那段「安装失败：…回滚失败（not-removable）…但**没有进入组合层栈**（dsh.profile.bundles = […]）…」
+ * 一路绿灯上了屏。客户端字典管不到 host 拼出来的字符串，两处必须各有一条护栏。
+ */
+const HOST_SOURCES = ['src/envManager.ts', 'src/index.ts', 'src/upgrade.ts']
+
+/**
  * 以模拟模块表启动产物，取它注册的字典。
  *
  * 桩件（平台表 / SnapshotStore / defineStore / primitives）都在 tests/client-harness.mjs，
@@ -214,6 +223,87 @@ function sourceEntries() {
   return out
 }
 
+// ── host 侧护栏（DESIGN §12.6，2026-09-19 第三轮反馈）────────────────────────
+
+/**
+ * host 侧用户可见文案的提取器：剥注释 → 取字符串字面量 → 只留含中文的那些。
+ *
+ * 为什么必须剥注释：`src/envManager.ts` 的注释里大量出现 `dsh.profile.bundles` / `reconcile`
+ * 这类词——它们是**给维护者看的**，本来就该写清楚。护栏要拦的是「发给用户的字符串」，
+ * 不是「代码里提到过这个词」。剥注释让规则只在真正的文案上生效，否则规则会退化成
+ * 「不许在代码里提这个术语」，那是洁癖（§12.4）。
+ *
+ * 判据「含中文」的理由：host 侧的面向用户文案目前全是中文（客户端字典才管 i18n）；
+ * 纯英文/标识符字面量（'add'、'remove'、'package.json' 这类传给官方通道的参数）
+ * 不是文案，不该被词表误伤。
+ *
+ * @param file - 源文件相对路径。
+ * @returns 文案条目（行号 + 内容）。
+ */
+function hostUserStrings(file) {
+  const out = []
+  let inBlock = false
+  const lines = readFileSync(file, 'utf8').split('\n')
+  for (let index = 0; index < lines.length; index += 1) {
+    let line = lines[index]
+    if (inBlock) {
+      const end = line.indexOf('*/')
+      if (end < 0) continue
+      line = line.slice(end + 2)
+      inBlock = false
+    }
+    for (;;) {
+      const start = line.indexOf('/*')
+      if (start < 0) break
+      const end = line.indexOf('*/', start + 2)
+      if (end < 0) { line = line.slice(0, start); inBlock = true; break }
+      line = line.slice(0, start) + line.slice(end + 2)
+    }
+    const comment = line.indexOf('//')
+    if (comment >= 0) line = line.slice(0, comment)
+    for (const match of line.matchAll(/'([^']*)'|"([^"]*)"/g)) {
+      const value = match[1] ?? match[2] ?? ''
+      if (!/[\u4e00-\u9fff]/.test(value)) continue
+      out.push({ line: index + 1, value })
+    }
+  }
+  return out
+}
+
+/**
+ * host 侧禁止词表（DESIGN §12.6）。每条都写 why 与 source，理由同 §12.4：
+ * 后来人要知道它为什么被禁，而不是把它当成一条凭空的洁癖。
+ *
+ * 与客户端词表分开维护：客户端那边管「文案不该讲什么」，这边管「实现词汇不该上屏」——
+ * 两类问题的修法不同（前者删句，后者换词），混在一张表里会让后来人分不清该改哪边。
+ */
+const HOST_FORBIDDEN = [
+  // ── 规则 H1：字面 ** （DESIGN §3.6 陷阱 #1；task-55/71 已清过客户端一批）──────
+  { id: 'host·字面星号', re: /\*\*/, why: 'web 上会显示成可见星号；本仓库一律用「」或直接陈述，不用 markdown 强调',
+    source: '第三轮反馈 2026-09-19 用户实拍原文：但**没有进入组合层栈**（dsh.profile.bundles = [...]）—— 这段由 host 侧守卫输出，客户端字典护栏扫不到它' },
+  // ── 规则 H2：内部术语上屏 ────────────────────────────────────────────────
+  { id: 'host·dsh.profile.bundles', re: /dsh\.profile\.bundles/, why: '官方清单文件的字段路径，是实现细节；用户要知道的是「会不会被加载」，不是字段叫什么',
+    source: '第三轮反馈 2026-09-19 实拍原文：（dsh.profile.bundles = ["@deepseek-ai/dsh-base", ...]）' },
+  { id: 'host·reconcile', re: /reconcile/, why: '官方内部函数名；用户关心「为什么没生效」，不是它由哪个函数决定',
+    source: '第三轮反馈 2026-09-19 实拍原文：官方 reconcile 会跳过"既有的"依赖' },
+  { id: 'host·beforeDeps', re: /beforeDeps/, why: '内部变量名，纯实现词汇',
+    source: 'DESIGN §12.6（本轮新增清单）：第三轮反馈同类问题的通例' },
+  { id: 'host·官方错误码', re: /\b(?:not-removable|management-required|stop-profile|bundle-in-use)\b/, why: '官方内部错误码；要么翻成人话，要么只在结果对象的 error 字段里保留原文（排查时读得到）',
+    source: '第三轮反馈 2026-09-19 实拍原文：回滚失败（not-removable）' },
+  { id: 'host·node_modules 路径语义', re: /node_modules\s*[：:]/, why: '把安装目录当句子主语（"node_modules：仍留有…"）是路径语义上屏；用户看到的是「安装残留」，不是目录名',
+    source: '第三轮反馈 2026-09-19 实拍原文：node_modules：仍留有 dsh-probe-block 的目录。需要时请手工删除它。' },
+  { id: 'host·dsh.bundle 字段', re: /dsh\.bundle/, why: '清单字段名；用户需要的是「它不是一个组合包」这个结论',
+    source: 'DESIGN §12.6（本轮新增清单）：与 dsh.profile.bundles 同类' },
+  // ── 规则 H3：同一行里堆三个状态（结论 + 回滚状态 + 包名…）──────────────────
+  // 形态判据（可判定）：**同一行**里出现「≥2 个冒号」且至少有一个逗号。
+  // 为什么是形态而不是语义："同一件事说三遍"没有可靠的语义判据，但"三个状态短语用逗号硬拼成
+  // 一行"有——它正是用户实拍里那一行的样子（安装失败：…，回滚失败（…）包名：…）。
+  // 分层写法（结论一行、状态一行、细节降到下面）天然不满足它，所以正例不会被误伤。
+  { id: 'host·一句堆三个状态', re: /^(?=[^\n]*：[^\n]*：)(?=[^\n]*，)/m,
+    why: '三个状态短语用逗号硬拼成一行（结论＋回滚状态＋包名），读者要自己拆句子才知道发生了什么；应当分层：第一行给结论与后果，细节降到下面',
+    source: '第三轮反馈 2026-09-19 实拍原文：安装失败：无法试装（不算通过），回滚失败（not-removable）dsh-probe-block：…' },
+]
+
 describe('UI 文案标准（DESIGN §12）', () => {
   it('产物字典（zh 与 en）零命中禁止词表', () => {
     const dict = dictionaries()
@@ -355,6 +445,177 @@ describe('UI 文案标准（DESIGN §12）', () => {
     }
     // ③ 同屏可见的指路必须仍被拦下——否则「允许项」会退化成漏网
     assert.ok(rule.re.test('点击「开始体检」生成报告。'), '同屏控件的指路句必须仍被拦下')
+  })
+
+  // ── host 侧护栏（DESIGN §12.6，第三轮反馈 2026-09-19）────────────────────────
+
+  it('host 侧用户可见文案零命中禁止词表（字面 ** / 内部术语）', () => {
+    const hits = []
+    for (const file of HOST_SOURCES) {
+      for (const entry of hostUserStrings(file)) {
+        for (const rule of HOST_FORBIDDEN) {
+          if (rule.re.test(entry.value)) {
+            hits.push(file + ':' + entry.line + ' 命中【' + rule.id + '】（' + rule.why + '）：' + entry.value)
+          }
+        }
+      }
+    }
+    assert.deepEqual(hits, [], 'host 侧仍有不该上屏的文案（DESIGN §12.6）：\n' + hits.join('\n'))
+  })
+
+  it('host 侧提取器不空转：真的扫到了文案（否则上面那条会假绿）', () => {
+    for (const file of HOST_SOURCES) {
+      const entries = hostUserStrings(file)
+      assert.ok(entries.length >= 5, file + ' 只扫到 ' + entries.length + ' 条中文文案，提取器可能坏了')
+    }
+    // 提取器必须**剥掉注释**：注释里合法地写着 dsh.profile.bundles / reconcile（给维护者看的）。
+    // 若不剥注释，规则会退化成「不许在代码里提这个术语」——那是洁癖，不是文案标准。
+    const env = hostUserStrings('src/envManager.ts')
+    assert.ok(!env.some(entry => entry.value.includes('beforeDeps')),
+      '提取器把注释里的 beforeDeps 也当成文案了：规则会误伤注释')
+  })
+
+  it('规则 H1/H2 的正反例：第三轮反馈那段实拍原文必须被拦下', () => {
+    // 反例 = 用户实拍原文（逐字）。它必须命中**至少**字面星号、dsh.profile.bundles、reconcile
+    // 三条——这正是「三个问题同时出现」的那段。
+    const realBanner = [
+      '安装失败：无法试装（不算通过），回滚失败（not-removable）dsh-probe-block：无法试装：候选（dsh-probe-block）',
+      '装进了 node_modules，但**没有进入组合层栈**（dsh.profile.bundles = ["@deepseek-ai/dsh-base",',
+      '"@deepseek-ai/dsh-web-app","dsh-plugin-manager-companion"]）——挂载期不会加载它。原因：它在本轮之前',
+      '就已经是测试环境的依赖，官方 reconcile 会跳过"既有的"依赖。这不等于通过。package.json：依赖声明仍在，',
+      '层栈已不含 dsh-probe-block。node_modules：仍留有 dsh-probe-block 的目录。需要时请手工删除它。',
+    ].join('\n')
+    const hitIds = HOST_FORBIDDEN.filter(rule => rule.re.test(realBanner)).map(rule => rule.id)
+    for (const must of ['host·字面星号', 'host·dsh.profile.bundles', 'host·reconcile', 'host·官方错误码', 'host·node_modules 路径语义']) {
+      assert.ok(hitIds.includes(must), '实拍原文必须命中【' + must + '】，实际命中：' + hitIds.join(', '))
+    }
+    // 正例 = 改写后的文案（本轮真实输出），一条都不许命中。
+    const rewritten = [
+      '没有安装 dsh-probe-bad：候选包导致挂载失败。',
+      '已回滚。',
+      '候选包导致挂载失败：dsh-probe-bad 装进 webprobe-dpmc 之后树挂不起来。',
+      '根因链：',
+      'Error: dsh: plugin tree failed to load: duplicate loader entry id: probe-bad-row',
+      '环境现状：',
+      '  依赖声明与加载列表都已回到原状，也没有留下安装残留。',
+    ].join('\n')
+    const rewrittenHits = HOST_FORBIDDEN.filter(rule => rule.re.test(rewritten)).map(rule => rule.id)
+    assert.deepEqual(rewrittenHits, [], '改写后的文案不该命中任何规则：' + rewrittenHits.join(', '))
+  })
+
+  it('规则 H3：三个状态用逗号硬拼成一行必须被拦下，分层呈现必须放行', () => {
+    const rule = HOST_FORBIDDEN.find(item => item.id === 'host·一句堆三个状态')
+    assert.ok(rule !== undefined, 'H3 规则不见了')
+    // 反例（实拍原文的头部）：结论 + 回滚状态 + 包名，三个状态挤在一行
+    assert.ok(rule.re.test('安装失败：无法试装（不算通过），回滚失败（not-removable）dsh-probe-block：无法试装：候选…'),
+      '三个状态硬拼成一行必须被拦下')
+    // 正例：分层（第一行结论，第二行回滚状态，空行后细节）——同一批事实，但一次只说一件事
+    assert.ok(!rule.re.test('没有安装 dsh-probe-bad：候选包导致挂载失败。\n已回滚。\n\n候选包导致挂载失败：…'),
+      '分层呈现被误伤了（H3 要拦的是「一行塞三个状态」，不是「说了状态」）')
+    // 正例边界：一句里带两个逗号但不构成「三个状态 + 冒号」的说明句，必须放行
+    assert.ok(!rule.re.test('依赖声明与加载列表都已回到原状，也没有留下安装残留。'),
+      '普通说明句被误伤：' + '依赖声明与加载列表都已回到原状，也没有留下安装残留。')
+  })
+
+  // ── 规则 H4：**渲染出来的输出**也必须干净（源码扫描抓不到运行时拼接）────────────
+  //
+  // 为什么需要它（变异验证发现的两个洞）：源码里只扫「含中文的字符串字面量」，
+  // 于是这两类改动会溜过去——
+  //   · 官方错误码是**变量插进模板**的（'回滚失败（' + code + '）'），字面量里没有 not-removable；
+  //   · 分层输出是**多行数组 join** 的，任何单个字面量都不含整段拼接后的文本。
+  // 判据因此前移到「用户真正看到的那个字符串」：驱动一次真实的安装失败，拿 result.output 过同一张表。
+  it('规则 H4：真实渲染出来的失败输出也必须过同一张表（源码扫描抓不到运行时拼接）', async () => {
+    const { handleOp } = await import('../dist/index.js')
+    const { mkdtempSync, mkdirSync: mk, writeFileSync: wr, rmSync: rm } = await import('node:fs')
+    const { tmpdir } = await import('node:os')
+    const { join: j } = await import('node:path')
+    const home = mkdtempSync(j(tmpdir(), 'pmc-copy-'))
+    const originalHome = process.env.DSH_HOME
+    process.env.DSH_HOME = home
+    try {
+      const envDir = j(home, 'profiles', 'copy-env')
+      mk(j(envDir, 'node_modules'), { recursive: true })
+      wr(j(envDir, 'package.json'), JSON.stringify({ name: 'p', dependencies: {}, dsh: { profile: { bundles: ['@deepseek-ai/dsh-base'] } } }, undefined, 2))
+      wr(j(envDir, 'cordis.patch.yml'), '[]' + String.fromCharCode(10))
+      const candidate = 'dsh-probe-copy'
+      const pkgDir = j(envDir, 'node_modules', candidate)
+      const manager = {
+        inspect: async () => ({ status: 'ok' }),
+        setPluginEnabled: async () => ({ application: 'applied', stage: 'enable', target: candidate, changed: true }),
+        installBundle: async () => {
+          const m = JSON.parse(readFileSync(j(envDir, 'package.json'), 'utf8'))
+          m.dependencies = { ...(m.dependencies ?? {}), [candidate]: 'link:/probe-src' }
+          wr(j(envDir, 'package.json'), JSON.stringify(m, undefined, 2))
+          mk(pkgDir, { recursive: true })
+          wr(j(pkgDir, 'package.json'), JSON.stringify({ name: candidate, version: '0.0.1', main: 'index.js' }))
+          wr(j(pkgDir, 'index.js'), 'export const x = 1' + String.fromCharCode(10))
+          return { application: 'applied', bundle: candidate, stage: 'install', target: candidate, changed: true }
+        },
+        setBundleEnabled: async () => ({ application: 'applied', stage: 'enable', target: candidate, changed: true }),
+        // 官方移除**失败**——这正是用户实拍里那个「回滚失败（not-removable）」的场景。
+        removeBundle: async () => ({ application: 'failed', error: { code: 'not-removable' }, stage: 'remove', target: candidate }),
+        listBundles: async () => [{ name: '@deepseek-ai/dsh-base', installed: false, enabled: true }],
+      }
+      const ctx = {
+        get(name) {
+          if (name === 'pluginManager') return manager
+          if (name === 'profileContext') return { name: 'copy-env', dir: envDir, installAnchor: '/anchor/package.json', cwd: tmpdir(), home }
+          return undefined
+        },
+        logger: { info() {}, warn() {}, error() {} },
+        effect(fn) { const d = fn(); return typeof d === 'function' ? d : () => {} },
+      }
+      const jobs = new Map()
+      let seq = 0
+      const deps = {
+        ctx,
+        config: () => ({
+          diagnostics: { dependency: true, composition: true, runtime: true, consistency: true, ecosystem: false },
+          qualityGate: { enabled: true, mode: 'block', allowlist: [] },
+          marketplace: { enabled: false, cacheTtlMinutes: 1440, timeoutMs: 15000, indexUrl: '' },
+          trial: { enabled: true, depth: 'shallow', baseline: false, allowNetwork: true, onFailure: 'block', autoCleanup: true, retentionDays: 14, maxKept: 0 },
+        }),
+        configUpdate: async (patch) => patch,
+        capabilities: () => ({ profileBacked: true, manager: true, inventory: false, environmentName: 'copy-env', missing: [] }),
+        jobs: {
+          start(task) { seq += 1; const id = 'job-' + String(seq); const rec = { done: false }; jobs.set(id, rec); void Promise.resolve().then(task).then((v) => { rec.result = v; rec.done = true }, (e) => { rec.error = String(e), rec.done = true }); return id },
+          status(id) { const r = jobs.get(id); return r === undefined ? { done: true, missing: true } : { done: r.done, result: r.result, error: r.error } },
+        },
+        // 试装替身：候选坏 → block → 走回滚失败那条路（用户实拍的同一场景）。
+        trial: async () => ({
+          conclusion: 'candidate-broken', output: '候选包导致挂载失败（替身）',
+          build: { artifactMd5: null, artifactMtime: null, gitHead: null },
+          sourceFingerprint: { manifestHash: null, lockfileHash: null, patchHash: null, bundles: [], bundlesSource: 'manifest', dependencies: [], hash: 'x' },
+          sourceFingerprintAfter: null, changedDuringTrial: false,
+          baseline: { kind: 'mounted' }, candidate: { kind: 'failed' }, elapsedMs: 1, depth: 'shallow', escalated: false,
+        }),
+      }
+      const started = await handleOp('install', { spec: '/probe-src', environment: 'copy-env' }, deps)
+      assert.equal(started.ok, true)
+      let settled
+      for (let i = 0; i < 200; i += 1) {
+        const st = await handleOp('job', { id: started.value.jobId }, deps)
+        if (st.value.done === true) { settled = st.value; break }
+        await new Promise((r) => setTimeout(r, 5))
+      }
+      const output = String(settled?.result?.output ?? '')
+      assert.ok(output.length > 0, '没拿到渲染输出，这条用例会空转')
+      const hits = HOST_FORBIDDEN.filter(rule => rule.re.test(output)).map(rule => rule.id)
+      assert.deepEqual(hits, [], '渲染出来的输出命中了禁止项：' + hits.join(', ') + String.fromCharCode(10) + output)
+      // 反向：这条用例必须真的走到了「回滚失败」那条路，否则它测的不是用户实拍那一幕。
+      assert.match(output, /回滚没有完成/, '这条用例没走到回滚失败路径：' + output)
+      assert.equal(settled.result.rolledBack, false)
+    } finally {
+      if (originalHome === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = originalHome
+      rm(home, { recursive: true, force: true })
+    }
+  })
+
+  it('每条 host 禁止项都写明了来源（哪次反馈 / 用户原文 / 日期）', () => {
+    const missing = HOST_FORBIDDEN.filter(rule => typeof rule.source !== 'string' || rule.source.trim() === '')
+    assert.deepEqual(missing.map(rule => rule.id), [], '这些 host 禁止项没写来源（DESIGN §12.4）')
+    assert.ok(HOST_FORBIDDEN.length >= 7, 'host 禁止项少于 7 条，像是被误删了：' + HOST_FORBIDDEN.length)
   })
 
   it('每条禁止项都写明了来源（哪次反馈 / 用户原文 / 日期）', () => {
