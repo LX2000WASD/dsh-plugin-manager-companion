@@ -285,7 +285,10 @@ test('F2: 就绪判据是官方 HTTP 应答，TCP 可连接（404）不算就绪
   })
   assert.equal(stuck.ok, false)
   assert.equal(stuck.code, 'timeout')
-  assert.match(stuck.output, /404 不算就绪/)
+  // 就绪判据仍要在文案里（用户要知道我们在等什么）；按 copy-review §3.3 删掉的只是「404 不算就绪」那半句
+  // （判据清单本身留着）——这里两边都钉住，防止以后有人把整句判据也删掉。
+  assert.match(stuck.output, /就绪判据：GET \/ 返回 200\/303\/401/)
+  assert.doesNotMatch(stuck.output, /404 不算就绪/)
 })
 
 test('F3: 没有 web 层的环境立刻给出可操作拒绝（不启动、不干等 30s）', async () => {
@@ -307,6 +310,9 @@ test('F3: 没有 web 层的环境立刻给出可操作拒绝（不启动、不�
   assert.match(refused.output, /@deepseek-ai\/dsh-web-app/, '建议的包名来自官方常量')
   assert.match(refused.output, /官方插件页/)
   assert.match(refused.output, /web 模板重建/)
+  // task-71：末句的括注（解释"没有副作用"）删了；「本次没有发起启动」这个事实留。
+  assert.match(refused.output, /本次没有发起启动/)
+  assert.doesNotMatch(refused.output, /不占用端口、不弹窗口/)
 
   // 层里有 web 层（manifest 声明了官方 webserver 依赖）→ 正常往下走
   makeEnv('hasweb', { bundles: ['@deepseek-ai/dsh-base'] })
@@ -359,6 +365,11 @@ test('F3b: 显式端口已被监听 → 立刻 port-in-use，不发起启动', a
     assert.equal(launched.length, 0, '端口被占时不得发起启动')
     assert.match(result.output, new RegExp(String(port)))
     assert.match(result.output, /已经被监听/)
+    // task-71：中段是**为什么不发起启动的原因**，必须留（copy-review 一审建议删，复核修正为留）；
+    // 出路（换端口 / 停进程）同样留。
+    assert.match(result.output, /无法确认它会由本次启动的实例接管/)
+    assert.match(result.output, /请换一个端口/)
+    assert.match(result.output, /停掉占用它的进程/)
   } finally {
     await new Promise((done) => { server.close(done) })
   }
@@ -485,6 +496,11 @@ test('createEnvironment 用官方模板；renameEnvironment 的拒绝面', async
   const patch = readFileSync(join(PROFILES, 'fresh', 'cordis.patch.yml'), 'utf8')
   assert.match(patch, /^# Your patch layer for this dsh profile/)
   assert.equal(existsSync(join(PROFILES, 'fresh', 'pnpm-workspace.yaml')), true)
+  // task-71：成功回执留；「目录：…」与卡片已渲染的 dir 重复 → 删；层栈名字卡片只有计数 → 必须留。
+  assert.match(created.output, /已创建环境 fresh/)
+  assert.doesNotMatch(created.output, /目录：/)
+  assert.match(created.output, /bundle 层栈：/)
+  assert.match(created.output, /@deepseek-ai\/dsh-web-app/)
 
   // 省略模板 = 官方 web 模板（能起得来），不是官方 base-only 默认
   const plain = await env.createEnvironment('plain')
@@ -538,6 +554,9 @@ test('copyPlugins 走官方 operations，只换 profile 参数', async () => {
   const noContext = await env.copyPlugins('src', 'dst', ['pkg-a'])
   assert.equal(noContext.ok, false)
   assert.equal(noContext.code, 'no-profile-context')
+  // task-71：立场句「拒绝猜测路径。」删了；原因（不是以 profile 方式启动、无法定位锚点）必须留。
+  assert.match(noContext.output, /无法定位安装锚点/)
+  assert.doesNotMatch(noContext.output, /拒绝猜测路径/)
 
   assert.equal((await env.copyPlugins('missing', 'dst', ['pkg-a'], { installAnchor: '/anchor/package.json' })).code, 'not-found')
   assert.equal((await env.copyPlugins('src', 'dst', [], { installAnchor: '/anchor/package.json' })).code, 'empty-selection')
@@ -687,7 +706,11 @@ test('backupRestore：先差异、后按官方通道重装、锁下补回 bundle
     runCommand,
   })
   assert.equal(nothing.ok, true, nothing.output)
-  assert.match(nothing.output, /没有需要恢复的内容/)
+  // 结论句「没有需要恢复的内容」已删（紧随其后的 plan 第一行就是同一件事）；
+  // 如实性由 plan 承接：待重装 0 项 + （无）。
+  assert.match(nothing.output, /待重装 0 项/)
+  assert.match(nothing.output, /（无）/)
+  assert.doesNotMatch(nothing.output, /没有需要恢复的内容/, '结论句与 plan 首行重复，不许回来')
 
   // 目标环境不存在
   const missingTarget = await env.backupRestore(backup, 'ghost-target', {
@@ -695,6 +718,10 @@ test('backupRestore：先差异、后按官方通道重装、锁下补回 bundle
     runCommand,
   })
   assert.equal(missingTarget.code, 'not-found')
+  // task-71：括注整句删（前半立场句、后半把同屏控件写进句子的指路式引导）；只留事实。
+  assert.match(missingTarget.output, /目标环境不存在：ghost-target/)
+  assert.doesNotMatch(missingTarget.output, /本模块不代建环境/)
+  assert.doesNotMatch(missingTarget.output, /环境列表/)
 
   // 只有不可恢复条目
   const unrestorableOnly = {
@@ -1241,6 +1268,64 @@ test('就绪行收集器：跨 chunk 也能认；失败先出现就不认后来�
   assert.equal(readyFirst.pushStdout('dsh web: http://127.0.0.1:46141/?token=abc\n'), true)
   readyFirst.pushStderr('Error: 之后的运行时错误\n')
   assert.equal(readyFirst.readyUrl, 'http://127.0.0.1:46141/?token=abc')
+})
+
+// ── task-71：试装文案（字面星号 / 空承诺 / 判不出来的归因） ────────────────────
+
+test('根因链不给源码行与栈帧当原因（用户读到的必须是错误消息）', () => {
+  const source = readFileSync(new URL('../dist/envManager.js', import.meta.url), 'utf8')
+  void source
+  const verbose = [
+    'Error: dsh: plugin tree failed to load: failed to apply loader entry probe (probe): boom',
+    'Error: boom',
+    '    at updateError (file:///x/cordis-plugin-loader/lib/index.js:309:9)',
+    'throw new Error(`${binName}: ${stage}: ${detail}${stack}`, { cause });',
+    '[cause]: Error: failed to apply loader entry probe (probe): boom',
+  ].join('\n')
+  const verdict = env.judgeBootStderr(verbose)
+  assert.equal(verdict.kind, 'failed')
+  assert.match(verdict.reason, /^Error: dsh: plugin tree failed to load/, '第一条原因必须是错误消息，不是源码行')
+  assert.ok(verdict.chain.every((line) => !/^at\s/.test(line)), '栈帧不许进根因链')
+  assert.ok(verdict.chain.every((line) => !/^throw\s/.test(line)), '抛错处源码行不许进根因链')
+  assert.ok(verdict.chain.some((line) => line.includes('[cause]')), 'cause 链要保住')
+})
+
+test('试装文案：不带字面星号、不写空承诺、判不出来不说成"基线起不来"', async () => {
+  makeEnv('copy-src', { bundles: ['@deepseek-ai/dsh-base'] })
+  const anchor = '/anchor/package.json'
+  const build = env.buildIdentity()
+  const runnerOk = async () => ({ exitCode: 0, output: 'ok', truncated: false, logPath: '/dev/null' })
+  const runnerCold = async () => ({ exitCode: 1, output: 'ERR_PNPM_NO_OFFLINE_TARBALL 冷包', truncated: false, logPath: '/dev/null' })
+  const mounted = async () => ({ verdict: { kind: 'mounted' }, elapsedMs: 1, stderr: '', exitCode: 1, build })
+  const failed = async () => ({
+    verdict: { kind: 'failed', reason: 'Error: dsh: plugin tree failed to load: boom', chain: ['Error: dsh: plugin tree failed to load: boom'] },
+    elapsedMs: 1, stderr: 'x', exitCode: 1, build,
+  })
+  const undetermined = async () => ({
+    verdict: { kind: 'undetermined', reason: '子进程没有输出任何 stderr 文本' }, elapsedMs: 1, stderr: '', exitCode: null, build,
+  })
+  const base = { installAnchor: anchor, depth: 'shallow', runCommand: runnerOk }
+
+  const cold = await env.runTrialInstall('@fake/pkg', 'copy-src', { ...base, runCommand: runnerCold, allowNetwork: false, verify: mounted })
+  const broken = await env.runTrialInstall('@fake/pkg', 'copy-src', { ...base, verify: failed })
+  const unclear = await env.runTrialInstall('@fake/pkg', 'copy-src', { ...base, verify: undetermined })
+
+  assert.equal(cold.conclusion, 'cannot-trial')
+  assert.equal(broken.conclusion, 'baseline-broken')
+  assert.equal(unclear.conclusion, 'cannot-trial')
+
+  for (const [label, result] of [['冷包', cold], ['基线坏', broken], ['判不出来', unclear]]) {
+    // 字面星号在 web 卡片上是噪声（task-55 同类）；这里连一处都不许有。
+    assert.doesNotMatch(result.output, /\*\*/, label + '：试装文案不许带字面星号')
+    // 空承诺：我们从不发这条诊断，写出来就是骗人。
+    assert.doesNotMatch(result.output, /应当升级成一条诊断/, label + '：不许写"应当升级成一条诊断"这类空承诺')
+  }
+  assert.match(broken.output, /快照基线本身就起不来/)
+  assert.match(broken.output, /根因：/)
+  // 判不出来是"不知道"，不是"基线坏了"——两句话不许混。
+  assert.match(unclear.output, /这次验证没有给出判定/)
+  assert.doesNotMatch(unclear.output, /快照基线/, '判不出来不许写成基线起不来')
+  assert.match(unclear.output, /判不出来：/)
 })
 
 test('残留删不掉时如实报「无法试装」，绝不静默沿用旧依赖', async (t) => {

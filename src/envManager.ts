@@ -884,7 +884,9 @@ export async function createEnvironment(name: string, template?: string): Promis
     } catch (error) {
       return failure('io-failed', '创建环境失败 ' + name + '（' + dir + '）：' + messageOf(error))
     }
-    return success('已创建环境 ' + name + '\n目录：' + dir + '\nbundle 层栈：\n  ' + bundles.join('\n  '))
+    // 目录不写：环境卡片每一行都渲染 dir（ConsolePage 的环境行），这里是①（重复屏幕已有信息）。
+    // 层栈名字必须留：卡片只显示「N 个组合包」计数，名字在别处看不见。
+    return success('已创建环境 ' + name + '\nbundle 层栈：\n  ' + bundles.join('\n  '))
   })
 }
 
@@ -1101,6 +1103,7 @@ export async function startEnvironment(
   // 显式端口是调用方指定的：已经被监听就根本不该进入「等就绪」流程 —— HTTP 探针
   // 无法判断应答来自谁，会把别人的实例当成我们刚启动的那个报 ok。
   if (options.port !== undefined && await tcpListening(port)) {
+    // 中段是"为什么不发起启动"的原因（copy-dev 复核修正：删了用户不知道缘由），必须留。
     return failure('port-in-use', '端口 ' + String(port) + ' 已经被监听：无法确认它会由本次启动的实例接管，'
       + '所以不发起启动。请换一个端口，或先停掉占用它的进程。')
   }
@@ -1151,7 +1154,7 @@ function noWebLayerMessage(name: string, layers: readonly string[]): string {
     + '  1. 在官方插件页给它启用 web 层（'
     + (suggestion.length === 0 ? '官方 web 模板里的 app 层' : suggestion.join(', ')) + '）；\n'
     + '  2. 用官方 web 模板重建一个环境。\n'
-    + '本次没有发起启动（不占用端口、不弹窗口）。'
+    + '本次没有发起启动。'
 }
 
 /**
@@ -1171,6 +1174,8 @@ function noWebLayerMessage(name: string, layers: readonly string[]): string {
 function startedMessage(
   name: string, port: number, status: number, spec: LaunchSpec, outcome: LaunchOutcome,
 ): string {
+  // 回执（已启动 X）**必须留**：卡片上的运行标记是异步的（进程表扫描 + 3s 缓存，甚至可能显示"未知"），
+  // 不能替代"你刚点的这一下成功了"这个即时事实（copy-dev 复核结论）。启动方式与降级原因同样必须留。
   const lines = ['已启动 ' + name
     + '（启动方式：' + (outcome.mode === 'terminal' ? '终端窗口 ' + (outcome.terminal ?? '') : '后台')
     + (outcome.reason === undefined ? '' : '；' + outcome.reason)
@@ -1207,7 +1212,7 @@ function startTimeoutMessage(
   name: string, port: number, spec: LaunchSpec, outcome: LaunchOutcome, options: StartEnvironmentOptions,
 ): string {
   const lines = [name + ' 已启动，但 ' + String(options.readyTimeoutMs ?? START_READY_TIMEOUT_MS)
-    + 'ms 内端口 ' + String(port) + ' 没有给出官方 web 应答（GET / 需要返回 200/303/401；404 不算就绪）。'
+    + 'ms 内端口 ' + String(port) + ' 没有给出官方 web 应答（就绪判据：GET / 返回 200/303/401）。'
     + (outcome.reason === undefined ? '' : '\n启动方式：' + (outcome.mode === 'terminal' ? '终端窗口' : '后台') + '（' + outcome.reason + '）')]
   if (outcome.logPath === undefined) {
     lines.push('请看刚打开的终端窗口里 dsh 的输出。')
@@ -1908,7 +1913,7 @@ function operationContext(
   const installAnchor = options.installAnchor ?? context?.installAnchor
   if (installAnchor === undefined || installAnchor.length === 0) {
     throw new EnvironmentError('no-profile-context', '拿不到官方 installAnchor（ctx.profileContext.installAnchor）：'
-      + '当前进程不是由 dsh 以 profile 方式启动的，跨环境包操作无法定位安装锚点。拒绝猜测路径。')
+      + '当前进程不是由 dsh 以 profile 方式启动的，跨环境包操作无法定位安装锚点。')
   }
   return {
     profile,
@@ -1994,7 +1999,7 @@ export async function repairDependencies(
       return failure('package-operation-failed',
         '修复安装失败（官方 install 退出码 ' + String(result.exitCode) + '）：' + (tail === '' ? result.output.slice(-600) : '\n' + tail))
     }
-    return success('已修复安装 ' + target + '（官方 install 通道，环境 ' + profile + '）')
+    return success('已修复安装 ' + target + '（环境 ' + profile + '）')
   } catch (error) {
     if (error instanceof EnvironmentError) return failure(error.code, messageOf(error))
     return failure('io-failed', messageOf(error))
@@ -2266,6 +2271,24 @@ const BOOT_TREE_FAILED = /plugin tree failed to load/
 const BOOT_UNRESOLVED_LAYER = /cannot resolve profile bundle/
 
 /**
+ * 一行是不是"根因链上的噪声"：栈帧、抛错处的源码行、Node 自己的警告前缀。
+ *
+ * 为什么必须滤：官方失败输出里既有错误消息，也有整段堆栈。堆栈里出现的
+ * `throw new Error(\`${binName}: ${stage}: …`)` 这类**源码行**同样含 "Error" 字样，
+ * 早先的过滤器会把它当成第一条原因——用户看到的"根因"是一行源码，读不出任何信息。
+ *
+ * @param line - stderr 里的一行（已 trim）。
+ * @returns 是噪声行时 true。
+ */
+function isChainNoise(line: string): boolean {
+  if (/^at\s/.test(line)) return true          // 栈帧：at fn (file:line:col)
+  if (/^throw\s/.test(line)) return true       // 抛错处源码
+  if (/^\(node:\d+\)/.test(line)) return true // Node 运行期警告
+  if (/^node:internal\//.test(line)) return true
+  return false
+}
+
+/**
  * 从 stderr 文本判定挂载结果（纯函数，可注入文本测试）。
  *
  * 判据（§5.2 实测）：健康环境 stderr 只有一行 dsh: a task is required…，而**退出码仍是 1**，
@@ -2279,6 +2302,9 @@ export function judgeBootStderr(stderr: string): BootVerdict {
   if (lines.some((line) => BOOT_TREE_FAILED.test(line))) {
     const chain = lines
       .filter((line) => /Error|\[cause\]|Cannot find|has been registered/.test(line))
+      // 再滤一层：栈帧与"抛错处源码行"也含 "Error"，但它们不是原因（实测这条把
+      // `throw new Error(\`${binName}: …`)` 当成了第一行原因，用户读到的是一行源码）。
+      .filter((line) => !isChainNoise(line))
       .slice(0, 8)
     const reason = chain[0] ?? lines[0] ?? '未知挂载失败'
     return { kind: 'failed', reason, chain }
@@ -2784,6 +2810,7 @@ export async function cleanupTrialEnvironments(options: TrialCleanupPlanOptions 
       logLine('kept ' + entry.name + '：删除被拒（' + String(result.code) + '）')
     }
   }
+  // 整块留（copy-dev 复核结论）：计数与「保留明细」里的原因是用户判断"为什么留着"的唯一依据。
   const lines = ['测试环境清理：删除 ' + String(removed.length) + ' 个'
     + (removed.length === 0 ? '' : '（' + removed.join(', ') + '）')
     + '，保留 ' + String(plan.keep.length + failures.length) + ' 个']
@@ -3144,7 +3171,7 @@ export async function runTrialInstall(
   let materialized = await materialize(depth)
   if (!materialized.ok) {
     return done('cannot-trial', '无法试装：测试环境没有物化成功（' + String(materialized.code) + '）。\n'
-      + materialized.output + '\n这**不等于通过**。', { depth })
+      + materialized.output + '\n这不等于通过。', { depth })
   }
 
   let baseline: BootVerdict | null = null
@@ -3159,23 +3186,26 @@ export async function runTrialInstall(
       materialized = await materialize(depth)
       if (!materialized.ok) {
         return done('cannot-trial', '无法试装：浅快照基线失败后升级为完整快照，但重新物化失败（'
-          + String(materialized.code) + '）。\n' + materialized.output + '\n这**不等于通过**。',
+          + String(materialized.code) + '）。\n' + materialized.output + '\n这不等于通过。',
           { depth, escalated, escalationReason })
       }
       verified = await verify(target)
       baseline = verified.verdict
     }
     if (baseline.kind !== 'mounted') {
-      const head = escalated
-        ? '快照基线本身就起不来（**浅快照与完整快照都试过**，两次都没挂载起来）—— 这不是 ' + spec + ' 的问题。\n'
-          + '浅快照为什么不给力：' + String(escalationReason) + '\n'
-        : '快照基线本身就起不来 —— 这不是 ' + spec + ' 的问题，试装无法判断它。\n'
+      // 三种形态各说各的话：判不出来 ≠ 基线坏了（下面这两句以前共用一条"基线起不来"，是错误归因）。
+      const head = baseline.kind === 'undetermined'
+        ? '这次验证没有给出判定（既没挂载成功，也没报挂载失败）—— 这不是 ' + spec + ' 的问题，试装无法判断它。\n'
+        : escalated
+          ? '快照基线本身就起不来（浅快照与完整快照都试过，两次都没挂载起来）—— 这不是 ' + spec + ' 的问题。\n'
+            + '浅快照为什么不给力：' + String(escalationReason) + '\n'
+          : '快照基线本身就起不来 —— 这不是 ' + spec + ' 的问题，试装无法判断它。\n'
       const detail = baseline.kind === 'failed'
         ? '根因：' + baseline.reason + '\n' + baseline.chain.join('\n')
         : '判不出来：' + baseline.reason
       // failed → baseline-broken；undetermined → cannot-trial（判不出来就是无法试装，不许算通过）。
       return done(judgeTrialOutcome(baseline, null),
-        head + detail + '\n（这条发现应当升级成一条诊断：真实环境 ' + realName + ' 的当前状态有问题。）\n'
+        head + detail + '\n'
         + '实际深度：' + depth + (escalated ? '（由 shallow 升级）' : '') + '\n'
         + '构建：' + describeBuild(build), { baseline, depth, escalated, escalationReason })
     }
@@ -3187,7 +3217,7 @@ export async function runTrialInstall(
     context = operationContext(target, environmentDir(target), environmentDir(target), options)
     runner = await officialRunner(options)
   } catch (error) {
-    return done('cannot-trial', '无法试装：官方 pnpm 通道不可用（' + messageOf(error) + '）。这**不等于通过**。',
+    return done('cannot-trial', '无法试装：官方 pnpm 通道不可用（' + messageOf(error) + '）。这不等于通过。',
       { baseline })
   }
   const installArgs = options.allowNetwork === false ? ['add', '--offline', spec] : ['add', spec]
@@ -3197,7 +3227,7 @@ export async function runTrialInstall(
       ? '已禁用联网，且本地 store 里没有这个包'
       : '官方安装失败（exitCode=' + String(installed.exitCode) + '）'
     return done('cannot-trial', '无法试装：' + reason + '。\n'
-      + installed.output.trim().slice(-800) + '\n这**不等于通过**。', { baseline })
+      + installed.output.trim().slice(-800) + '\n这不等于通过。', { baseline })
   }
 
   const after = await verify(target)
@@ -3243,7 +3273,7 @@ function describeConclusion(conclusion: TrialConclusion, spec: string, target: s
     case 'candidate-broken':
       return '候选包导致挂载失败：' + spec + ' 装进 ' + target + ' 之后树挂不起来。'
     default:
-      return '无法试装：这次没有得到有效判定（**不等于通过**）。'
+      return '无法试装：这次没有得到有效判定（不等于通过）。'
   }
 }
 // ── 备份：导出 / 差异 / 恢复 ──────────────────────────────────────────────
@@ -3390,14 +3420,16 @@ export async function backupRestore(
     return failure(error instanceof EnvironmentError ? error.code : 'unsafe-backup', messageOf(error))
   }
   if (diff.missingProfiles.length > 0) {
-    return failure('not-found', '目标环境不存在：' + diff.missingProfiles.join(', ')
-      + '（本模块不代建环境，请先在环境列表里创建）')
+    // 整句括注删（copy-dev 复核）：前半是立场句（②），后半「在环境列表里创建」是把同屏控件写进句子
+    // （DESIGN §12.3.2 指路式引导）。「环境不存在」这个事实本身已经够用户决定下一步。
+    return failure('not-found', '目标环境不存在：' + diff.missingProfiles.join(', '))
   }
   const plan = describeDiff(diff)
   if (diff.missing.length === 0 && diff.bundlesMissing.length === 0) {
+    // 结论句删：紧随其后的 plan 第一行就是「待重装 0 项：（无）」，同一件事不必说两遍。
     return diff.unrestorable.length === 0
-      ? success('没有需要恢复的内容\n' + plan)
-      : failure('unrestorable', '没有需要恢复的内容，但存在不可恢复条目\n' + plan)
+      ? success(plan)
+      : failure('unrestorable', plan)
   }
   if (options.dryRun === true) return success('（演练）将执行：\n' + plan)
   const targetDir = environmentDir(target)
