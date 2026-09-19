@@ -12,8 +12,8 @@ DSH 0.1.6-alpha.2 起官方自带插件管理页，旧仓库"遮蔽官方页面 
 
 | | |
 |---|---|
-| ![环境控制台 · 体检](docs/images/readme/01-console-health.png)<br>五层诊断：分组折叠、逐条证据、分级修复 | ![环境控制台 · 环境](docs/images/readme/02-console-envs.png)<br>多环境启停、复制与备份恢复 |
-| ![插件市场](docs/images/readme/03-marketplace.png)<br>市场卡片：风险与可装性徽标、详情含校验证据 | ![官方插件页](docs/images/readme/04-official-plugin-page.png)<br>在官方插件页里管理本插件配置 |
+| ![环境控制台 · 体检](docs/images/readme/01-console-health.png)<br>五层诊断：分组折叠、每条带严重度与证据，查不到的层如实标「未查」 | ![环境控制台 · 环境](docs/images/readme/02-console-envs.png)<br>多环境启停、复制与备份恢复，路径显示成 `~/…` |
+| ![插件市场](docs/images/readme/03-marketplace.png)<br>市场卡片：风险、分类与主题徽标；详情是上游事实原文（风险明细、许可证、npm 包名） | ![官方插件页](docs/images/readme/04-official-plugin-page.png)<br>注册进官方插件页，点开自己的条目就是配置表单 |
 
 ## 目录
 
