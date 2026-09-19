@@ -223,8 +223,16 @@ export const zh = {
   'trial.overCap': '已达保留上限，新的试装会拒绝执行',
   'trial.cleanup': '清理过期',
   'trial.cleanupTitle': '清理过期测试环境',
-  'trial.cleanupDesc': '按保留期删除过期的测试环境；正在运行的不删',
+  // R1（§12.9）：结论紧随主语、先给量化事实。原来那句「按保留期删除过期的测试环境；正在运行的不删」
+  // 是**条件从句**（"按保留期"先讲规则再讲动作），读者要自己拆出"到底删几个"。
+  // 注意措辞：**不说"将删除 N 个"**——那是把计划当成承诺，而计划是查询那一刻的快照，
+  // 执行时以当时的盘上事实为准（引擎的"运行中永不删"会让实际删除数 ≤ 计划数）。
+  // "按当前计划"把这件事说准了，且不需要多一句解释（见 docs/REST-CONTRACT.md 的已知边界）。
+  'trial.cleanupDesc': '按当前计划删除 {count} 个测试环境；正在运行的不会被删',
   'trial.cleanupNone': '没有需要清理的测试环境',
+  // 计划**读不到**（旧宿主/载荷不全）时用这条：它是"不知道会删几个"，不是"没有需要清理的"。
+  // 两者混起来就是替宿主下结论（§12.3.3）——而且这里下错的结论会让人以为按下去没事。
+  'trial.cleanupUnknown': '读不到清理计划，无法确认会删几个',
   'trial.cleanupDone': '已删除 {count} 个测试环境',
   'trial.planTitle': '下次清理',
   'trial.planRemove': '会删这 {count} 个',
@@ -662,8 +670,9 @@ export const en: Record<CompanionLocaleKey, string> = {
   'trial.overCap': 'At the retention cap; a new trial refuses to run',
   'trial.cleanup': 'Clean up expired',
   'trial.cleanupTitle': 'Clean up expired trial environments',
-  'trial.cleanupDesc': 'Deletes trial environments past the retention window; a running one is not deleted.',
+  'trial.cleanupDesc': 'Deletes {count} trial environments per the current plan; a running one is not deleted',
   'trial.cleanupNone': 'Nothing to clean up',
+  'trial.cleanupUnknown': 'The cleanup plan is unreadable; the number to delete cannot be confirmed',
   'trial.cleanupDone': 'Deleted {count} trial environments',
   'trial.planTitle': 'Next cleanup',
   'trial.planRemove': 'Will delete these {count}',

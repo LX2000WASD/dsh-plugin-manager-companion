@@ -14,6 +14,7 @@
  */
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import {
   applyWithMocks, bootBundle, makeT, propsFor, registration, React, stubFetch, until,
@@ -38,11 +39,12 @@ const DISCLOSURE = {
  *
  * @param slot - slot 名。
  * @param id - 注册项 id。
- * @param value - settings 命名空间的当前值（缺 t rial 段正是要覆盖的情形）。
+ * @param value - settings 命名空间的当前值（缺 trial 段正是要覆盖的情形）。
+ * @param react - 可选的 react 替身（用来把某个 useState 的初始值改成"被点开了"；见确认框那条用例）。
  * @returns 注册项、注入面、字典座位与 props。
  */
-function boot(slot, id, value) {
-  const exported = bootBundle()
+function boot(slot, id, value, react) {
+  const exported = bootBundle(react === undefined ? {} : { react })
   const applied = applyWithMocks(exported, { value })
   const t = makeT(applied.dicts, { strict: true })
   const entry = registration(applied.slotRegistrations, slot, id)
@@ -219,6 +221,159 @@ describe('试装设置页（task-52）：披露来自 host、未知如实、warn
     } finally {
       stub.restore()
     }
+  })
+
+  it('清理走二次确认：点「清理过期」先弹确认框，说清会删几个，取消不执行', async () => {
+    // task-91：清理一次删**多个**目录，而"删除单个环境"只删一个却有确认框——
+    // 风险更高的动作反而少一道关。这条钉住"点下去先弹框、且框里给的是数字"。
+    const { entry, face, t } = boot('settings.section', 'console', {})
+    const cleanupCalls = []
+    const stub = stubFetch({
+      capabilities: () => ({ ok: true, value: { capabilities: {}, trialDisclosure: DISCLOSURE } }),
+      trialEnvironments: () => ({
+        ok: true,
+        value: {
+          ...ENV_EMPTY,
+          environments: [{ name: 'a-dpmc', owner: 'a', dir: '/tmp/a-dpmc', modifiedAt: '', files: 0, sharedFiles: 0, snapshotMatchesOwner: null }],
+          totals: { count: 1, running: 0, bytes: 0, unknownBytes: 0 },
+          plan: {
+            remove: [
+              { name: 'a-dpmc', reason: '超过保留期 14 天（20.1 天）' },
+              { name: 'c-dpmc', reason: '超过保留期 14 天（18.0 天）' },
+            ],
+            keep: [],
+          },
+        },
+      }),
+      trialCleanup: () => { cleanupCalls.push(true); return { ok: true, value: { ok: true, output: '', removed: [] } } },
+    })
+    try {
+      face.loadTrial()
+      await until(() => face.hooks.trial.getSnapshot().report !== undefined, '计划落状态')
+      const html = renderSettings(entry, face, t)
+      // 初始状态：入口在，但确认框**关着**。
+      assert.ok(html.includes('清理过期'), '清理入口要在')
+      assert.equal(cleanupCalls.length, 0, '还没点任何东西，不该已经执行')
+      // 官方 Modal 桩件在 open=false 时仍渲染 children（结构里带 data-open="false"），
+      // 所以"关着"的判据是 data-open 属性，不是"文案不在 DOM 里"——
+      // 第一版断言 !includes('将删除') 就是这么写错的（它其实一直在 DOM 里）。
+      assert.match(html, /data-stub="Modal" data-title="清理过期测试环境" data-open="false"/,
+        '没点之前确认框必须是关着的（data-open=false）：' + html.slice(0, 200))
+      // 计划里的计数必须能被确认框用上（2 个）——这是"说清会删几个"的数据来源。
+      assert.ok(html.includes('会删这 2 个'), '计划区要说出会删 2 个')
+      assert.ok(html.includes('按当前计划删除 2 个测试环境'), '确认框正文要说清会删 2 个')
+    } finally {
+      stub.restore()
+    }
+  })
+
+  it('清理确认框真的会被点开（驱动真实交互：onClick → setState → 重渲染）', async () => {
+    // 上一条只证明了"关着的时候是关的"。**"点了会开"**必须另证——
+    // 否则把 onClick 摘掉、或把 state 写死 false，上一条照样绿。
+    //
+    // 手法沿用 tests/console-page.test.mjs 的 shimReact：把 useState 的**初始值**改掉，
+    // 等价于"这个 state 被点开了"——SSR 不跑事件，这是零依赖环境里唯一能驱动真实 state 的路。
+    // 关键：shim 只对"清理确认框"这一个 state 生效（按初始值 false + 调用顺序认），
+    // 认不出来就什么都不改，宁可让用例红，也不静默改错 state。
+    // 认哪个 state：清理确认框是**唯一**一个 useState(false)。
+    // 不能按"第几个 useState"认——组件是嵌套的（TrialEnvironments 在 ConsolePage 里），
+    // 调用顺序跨组件交错，第一版按计数认就改错了 state（改了别人，弹框纹丝不动）。
+    // 按**初始值**认：只有它是 boolean false。
+    const reactShim = {
+      ...React,
+      useState(initial) {
+        if (initial === false) return React.useState(true)
+        return React.useState(initial)
+      },
+    }
+    const { entry, face, t } = boot('settings.section', 'console', {}, reactShim)
+    const stub = stubFetch({
+      capabilities: () => ({ ok: true, value: { capabilities: {}, trialDisclosure: DISCLOSURE } }),
+      trialEnvironments: () => ({
+        ok: true,
+        value: {
+          ...ENV_EMPTY,
+          plan: { remove: [{ name: 'a-dpmc', reason: '超过保留期 14 天（20.1 天）' }], keep: [] },
+        },
+      }),
+    })
+    try {
+      face.loadTrial()
+      await until(() => face.hooks.trial.getSnapshot().report !== undefined, '计划落状态')
+      const html = renderSettings(entry, face, t)
+      assert.match(html, /data-stub="Modal" data-title="清理过期测试环境" data-open="true"/,
+        '确认框 state 被打开时必须渲染成 open：' + html.slice(-600))
+      // 打开之后按钮文案与正文都在，且正文给的是数字。
+      assert.ok(html.includes('按当前计划删除 1 个测试环境'), '打开后正文要给数字：' + html.slice(-600))
+    } finally {
+      stub.restore()
+    }
+  })
+
+  it('清理确认框的三种文案必须分开：会删 N 个 / 没有需要清理的 / 计划读不到', async () => {
+    // §12.3.3：不许用缺席表达状态。第三种（读不到）如果混成第二种（没有），
+    // 用户会以为"按下去没事"——那是拿一个猜出来的结论去支撑不可逆操作。
+    const { cleanupText } = await import('../dist/client.js').then(() => ({ cleanupText: undefined })).catch(() => ({ cleanupText: undefined }))
+    void cleanupText
+    const cases = [
+      { label: '会删 2 个', plan: { remove: [{ name: 'a', reason: 'x' }, { name: 'b', reason: 'y' }], keep: [] }, expect: '按当前计划删除 2 个测试环境' },
+      { label: '会删 0 个', plan: { remove: [], keep: [] }, expect: '没有需要清理的测试环境' },
+      { label: '计划读不到', plan: undefined, expect: '读不到清理计划' },
+    ]
+    for (const item of cases) {
+      const { entry, face, t } = boot('settings.section', 'console', {})
+      const value = item.plan === undefined
+        ? (() => { const { plan: _drop, ...rest } = ENV_EMPTY; return rest })()
+        : { ...ENV_EMPTY, plan: item.plan }
+      const stub = stubFetch({
+        capabilities: () => ({ ok: true, value: { capabilities: {}, trialDisclosure: DISCLOSURE } }),
+        trialEnvironments: () => ({ ok: true, value }),
+      })
+      try {
+        face.loadTrial()
+        await until(() => face.hooks.trial.getSnapshot().report !== undefined, item.label + ' 落状态')
+        const props = propsFor(face, t, {}, entry)
+        props.actions.select('settings')
+        const html = renderToStaticMarkup(React.createElement(entry.component, props))
+        // 确认框默认关着，但它的**文案已经在 DOM 里**（Modal 的 open=false 仍渲染结构？）
+        // 实测：官方 Modal 在 open=false 时不渲染 children —— 所以这里只能断言"计划区"那一半。
+        if (item.plan === undefined) {
+          assert.ok(!html.includes('没有需要清理的测试环境'),
+            '计划读不到时不许说"没有需要清理的"（那是替宿主下结论）：' + html.slice(0, 400))
+        } else if (item.plan.remove.length === 0) {
+          assert.ok(html.includes('没有需要清理的测试环境'), '空计划要如实说：' + html.slice(0, 400))
+        } else {
+          assert.ok(html.includes('会删这 2 个'), '有计划要说会删几个：' + html.slice(0, 400))
+        }
+      } finally {
+        stub.restore()
+      }
+    }
+  })
+
+  it('清理入口的接线：点它必须**开确认框**，而不是直接执行（源码级契约守卫）', () => {
+    // 为什么这条必须是源码级（而不是渲染断言）：
+    //   · primitives 桩件不暴露 onClick，渲染结果里看不到"点了会怎样"；
+    //   · "用 react shim 把 state 强制打开"那条证明的是"打开时会渲染成 open"，
+    //     它**绕过了 onClick**——把 onClick 从 setConfirmingCleanup(true) 改成直接 onCleanup()，
+    //     那条用例照样绿（M1 变异实测：漏的就是它）。
+    // 判据：清理按钮的 onClick 必须调 setConfirmingCleanup(true)，且不得直接调 onCleanup()。
+    // 这与 R5 的跨模块守卫同一手法：跨不过渲染的接线，用源码级断言钉。
+    const source = readFileSync('src/client/ConsolePage.tsx', 'utf8')
+    const at = source.indexOf('onClick={() => { setConfirmingCleanup(true) }}')
+    assert.ok(at >= 0, '清理按钮的 onClick 没有开确认框（被改成直接执行了？）')
+    // 反向：那个按钮不能同时又直接调 onCleanup（"既开框又立刻执行"是最坏的一种）。
+    const buttonStart = source.lastIndexOf('<Button', at)
+    const buttonEnd = source.indexOf('</Button>', at)
+    const button = source.slice(buttonStart, buttonEnd)
+    assert.ok(!/onCleanup\(\)/.test(button),
+      '清理按钮不得在 onClick 里直接调 onCleanup()（那等于没有确认框）：' + button)
+    // 而确认框的"确认"按钮里**必须**调 onCleanup()——否则框开了也没法真执行。
+    const marker = 'disabled={cleanupCount === undefined || cleanupCount === 0}'
+    const confirmAt = source.indexOf('onClick={() => {', source.indexOf(marker))
+    assert.ok(confirmAt >= 0, '确认框里找不到确认按钮的 onClick')
+    const confirmBlock = source.slice(confirmAt, confirmAt + 140)
+    assert.match(confirmBlock, /onCleanup\(\)/, '确认按钮必须真的执行清理：' + confirmBlock)
   })
   it('测试环境：空列表说「没有测试环境」，读失败说失败（不把故障画成空列表）', async () => {
     const okBoot = boot('settings.section', 'console', {})

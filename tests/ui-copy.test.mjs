@@ -722,12 +722,11 @@ describe('UI 文案标准（DESIGN §12）', () => {
     //   · 有过但现在没了 = 被取代（该删，不该留）。
     // 下面这些**全部是"从未有过"**（实测），也就是说它们是**没接完的界面**，不是历史包袱。
     const KNOWN_DEAD = [
-      // ── 试装清理：计划已接（task-90），但"清理动作本身的确认框"还没做 ──────────────
-      // task-90 把 plan.remove/keep 画出来了（TrialCleanupPlan），所以 trial.planTitle/
-      // planRemove/planKeep 三个键已复活、trial.planRow 已删除（它触发 §12.9 R2）。
-      // 剩下这两个属于**清理这个动作**：现在点「清理过期」直接执行，不弹确认框。
-      { key: k('trial', 'cleanupTitle'), why: '清理确认框的标题；现在点「清理过期」直接执行（计划已在旁边列出，但没做二次确认）' },
-      { key: k('trial', 'cleanupDesc'), why: '同上：确认框里那句"会删什么、不可撤销"' },
+      // ── 试装清理：计划与确认框都已接（task-90 / task-91）──────────────────────
+      // task-90 画了 plan.remove/keep（TrialCleanupPlan）：planTitle/planRemove/planKeep 复活、
+      // planRow 删除（它触发 §12.9 R2）。
+      // task-91 补了清理的二次确认框（TrialEnvironments 里的第二个 Modal）：cleanupTitle/
+      // cleanupDesc 复活，并新增 cleanupUnknown（计划读不到时那句"无法确认会删几个"）。
       // ── 市场页：标签超额时的折叠提示 ────────────────────────────────────────
       { key: k('market', 'moreTags'), why: '市场卡片标签超上限时的"还有 N 个"；MarketplacePage 目前全量渲染 tagsOf(item)' },
       // ── 升级：task-77（关于 → 软件升级）要用的那几档状态 ────────────────────

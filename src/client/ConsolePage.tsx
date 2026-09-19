@@ -1613,6 +1613,18 @@ interface TrialEnvironmentsProps {
 }
 
 /**
+ * 清理确认框里的那句话（三种情况分开说，见 cleanupCount 的注释）。
+ *
+ * @param t - 字典座位。
+ * @param count - 计划里"会删"的条数；undefined = 计划读不到。
+ * @returns 给用户看的那一句。
+ */
+function cleanupText(t: T, count: number | undefined): string {
+  if (count === undefined) return t('trial.cleanupUnknown')
+  return count === 0 ? t('trial.cleanupNone') : t('trial.cleanupDesc', { count })
+}
+
+/**
  * 渲染"下次清理会删谁、留谁"。
  *
  * 为什么必须画出来（task-90）：清理是**删目录**的不可逆操作，而用户点「清理过期」之前
@@ -1736,7 +1748,20 @@ function TrialEnvironmentRow({ t, entry, busy, onRemove }: {
 function TrialEnvironments({
   t, report, loading, busy, action, error, errorKey, onRemove, onCleanup,
 }: TrialEnvironmentsProps) {
+  // 两件不同的确认：删**一个**环境（confirming = 那个名字）与清理**一批**（confirmingCleanup）。
+  // 分成两个 state 而不是一个联合类型：它们的确认框文案与动作都不同，
+  // 合成一个会让"点清理时误删某个环境"这种串线成为可能。
   const [confirming, setConfirming] = useState<string | undefined>(undefined)
+  const [confirmingCleanup, setConfirmingCleanup] = useState(false)
+  // 计划里"会删"的条数 = 确认框里那个数字。
+  //
+  // 三种情况必须分开（§12.3.3：不许用缺席表达状态）：
+  //   · 有计划且会删 0 个 → "没有需要清理的"（这是**结论**，宿主给的）；
+  //   · 有计划且会删 N 个 → "将删除 N 个"；
+  //   · **读不到计划** → 既不能说 0 也不能说 N，只能说"读不到、无法确认会删几个"，且**禁用按钮**。
+  // 第三种如果混成第一种，用户会以为"按下去没事"——那是拿一个猜出来的结论去支撑不可逆操作。
+  const cleanupPlan = report?.plan
+  const cleanupCount = cleanupPlan === undefined ? undefined : cleanupPlan.remove.length
   const failed = error !== undefined || errorKey !== undefined
   // 上一次操作的结果：成功也必须说出来（清理 0 个与清理 2 个是两件不同的事），
   // 失败走失败行——绝不把失败渲染成"完成"（task-14/18 的护栏）。
@@ -1765,7 +1790,12 @@ function TrialEnvironments({
                 <Tag tone="warning">{t('trial.unknownBytes', { count: report.totals.unknownBytes })}</Tag>
               ) : null}
               {report.overCap === true ? <Tag tone="warning">{t('trial.overCap')}</Tag> : null}
-              <Button variant="outline" size="sm" disabled={busy !== undefined} onClick={onCleanup}>
+              {/*
+                清理走二次确认（task-91）：它一次删**多个**目录，而"删除单个环境"只删一个却有确认框——
+                风险更高的动作反而少一道关。而且计划是**查询那一刻的快照**，
+                点下去时真正会删的可能与计划不同，更需要一道关。
+              */}
+              <Button variant="outline" size="sm" disabled={busy !== undefined} onClick={() => { setConfirmingCleanup(true) }}>
                 {t('trial.cleanup')}
               </Button>
             </div>
@@ -1833,6 +1863,39 @@ function TrialEnvironments({
         )}
       >
         <p className={css.warn}>{t('trial.removeDesc')}</p>
+      </Modal>
+      {/*
+        清理确认框：与「删除单个环境」**同一套组件与形态**（同一个 Modal、同样的按钮排布），
+        只是文案与动作不同——不另造一套确认 UI。
+        那句话**只说一次**：放在 children 里（与上面那个 Modal 同形），不用 description——
+        官方 Modal 会把 description 与 children 都画出来，两处都写就是同一句话在屏上出现两次
+        （§12.3.1；真机截图实测过）。
+        内容上**说清会删几个**（用计划里的计数，不是"可能删一些"）：
+        那是用户按下去之前唯一能拿到的量化事实。计划为空时说"没有需要清理的"，与计划区一致。
+      */}
+      <Modal
+        open={confirmingCleanup}
+        onClose={() => { setConfirmingCleanup(false) }}
+        title={t('trial.cleanupTitle')}
+        closeLabel={t('common.close')}
+        footer={(
+          <>
+            <Button variant="ghost" size="md" onClick={() => { setConfirmingCleanup(false) }}>{t('common.cancel')}</Button>
+            <Button
+              variant="primary"
+              size="md"
+              disabled={cleanupCount === undefined || cleanupCount === 0}
+              onClick={() => {
+                setConfirmingCleanup(false)
+                onCleanup()
+              }}
+            >
+              {t('trial.cleanup')}
+            </Button>
+          </>
+        )}
+      >
+        <p className={css.warn}>{cleanupText(t, cleanupCount)}</p>
       </Modal>
     </fieldset>
   )
