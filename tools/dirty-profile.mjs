@@ -21,18 +21,28 @@
  * 同一个 insert 列表内两行同 id（`duplicate loader entry id`；**per-group** 判定——同一个 id 落在两个不同
  * insert 列表并不致命）。详见 docs/private/visual-audit.md §11.1。
  *
- * 用法：
- *   node tools/dirty-profile.mjs --profile pm-dirty-$$ [--port 3411] [--keep] [--out /tmp/vis-dirty]
+ * 用法（**目标 DSH_HOME 必须显式给出**，理由见下）：
+ *   node tools/dirty-profile.mjs --dsh-home /tmp/vis-home --profile pm-dirty-$$ \
+ *        [--port 3411] [--keep] [--out /tmp/vis-dirty]
+ *   DSH_HOME=/tmp/vis-home node tools/dirty-profile.mjs --profile pm-dirty-$$
  *   不提 --keep 时跑完自行清理（杀实例 + 删 profile）；--keep 起完停在端口上，供
  *   tools/dirty-ui-audit.mjs 取证，之后自行 kill 并删除 profile。
+ *
+ * **为什么必须显式给 home**：本脚本会往 `<DSH_HOME>/profiles/` 里真建/真删 profile。
+ * 它曾经默认用 `os.homedir()/.dsh` —— 按文档不带 DSH_HOME 跑一次，就在**用户真实家目录**里
+ * 造出了一个 demo profile（task-70 期间的真实事故）。现在：
+ *   · 既没有 `--dsh-home` 也没有 `DSH_HOME` → **拒绝运行**（退出码 2，并打印怎么给）；
+ *   · 目标是真实 harness home（`~/.dsh` 及其等价写法，含符号链接）→ **拒绝**，
+ *     除非显式加 `--allow-real-home`；
+ *   · 判据集中在 tools/dsh-home-guard.mjs（同一口径，别在这里再写一套）。
  * 输出：脏环境事实（落了哪些）、diagnose 的 issues 摘要（按层/严重度）与
  *   `<out>/dirty-report.json`；退出码 0 表示"脏得能被诊断命中"，1 表示脏得不够，2 表示环境失败。
  */
 
 import { execFileSync, spawn } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
-import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { resolveTargetDshHome } from './dsh-home-guard.mjs'
 
 // ── 参数 ───────────────────────────────────────────────────────────────────
 
@@ -52,7 +62,19 @@ function parseArgv(argv) {
 }
 
 const argv = parseArgv(process.argv.slice(2))
-const profilesRoot = join(homedir(), '.dsh', 'profiles')
+
+// 目标 home 必须显式给出（--dsh-home / DSH_HOME），且默认拒绝写真实 harness home。
+// 判据与理由见 tools/dsh-home-guard.mjs：这里**绝不**回退到 os.homedir()。
+const targetHome = resolveTargetDshHome({
+  argvHome: argv['dsh-home'],
+  envHome: process.env.DSH_HOME,
+  allowRealHome: argv['allow-real-home'] === 'true',
+})
+if (!targetHome.ok) {
+  console.error(targetHome.message)
+  process.exit(2)
+}
+const profilesRoot = join(targetHome.dshHome, 'profiles')
 const sourceProfile = argv.source ?? 'pm-test'
 const profile = argv.profile ?? ('pm-dirty-' + process.pid)
 const port = Number(argv.port ?? (3400 + Math.floor(Math.random() * 200)))
@@ -204,8 +226,11 @@ if (argv['no-build'] === 'true' && existsSync(profileDir)) {
 writeFileSync(logPath, '')
 const { openSync } = await import('node:fs')
 const logFd = openSync(logPath, 'a')
+// 必须把解析出来的目标 home **传给子进程**：否则 `--dsh-home /tmp/x` 只是我们写文件的位置，
+// 而 dsh 会按继承来的 DSH_HOME（可能是真实家目录）去找/建 profile —— 那正是我们要根除的形态。
 const child = spawn('dsh', ['--profile', profile, '--port', String(port), '--no-open'], {
   detached: true, stdio: ['ignore', logFd, logFd],
+  env: { ...process.env, DSH_HOME: targetHome.dshHome },
 })
 child.unref()
 
