@@ -15,12 +15,15 @@
  * 硬约束（任务描述）：不复述官方侧栏已有的构建标签；不显示 token 或完整启动命令行。
  */
 
-import { useEffect, useId, useRef } from 'react'
+import { useEffect, useId, useMemo, useRef } from 'react'
 import { Button, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
-import { defineStore, type HandleOf } from '@deepseek-ai/dsh-client-store'
-import type { ComposedProps, EntryKeyOf, TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
+import { defineStore, type HandleOf, type SnapshotStore } from '@deepseek-ai/dsh-client-store'
+import type { ComposedProps, EntryKeyOf, SnapshotSelectorHook, TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
 import { NS } from './locales.ts'
-import { formatRelative, type AboutFace, type AboutState } from './shared.ts'
+import { formatRelative, softwareUnits, type AboutState, type UpgradeFace, type UpgradeState } from './shared.ts'
+import { rowKindOf } from '../upgradeView.ts'
+import { UpgradeResult, UpgradeRow } from './UpgradeRow.tsx'
+import type { UpgradeUnitView } from './wire.ts'
 import type { AboutFactView } from './wire.ts'
 import css from './AboutPage.module.css'
 
@@ -62,13 +65,40 @@ export interface AboutStoreState {
 /** 「关于」页 store 的句柄类型（句柄在 apply 里创建；模块级不放句柄）。 */
 export type AboutStoreHandle = ReturnType<typeof createAboutStore>
 
+/**
+ * 「关于」页的注入面：关于页自己的面 + 升级面。
+ *
+ * 为什么写成一个显式接口（而不是 `AboutFace & UpgradeFace`）：与
+ * {@link MarketplaceConsoleFace} 同一个坑——官方 `PropsHooks` 的映射类型在**交叉类型**上
+ * 推导不出 `useAbout` / `useUpgrade` 两个成员（实测编译报 "Property 'useAbout' is missing"）。
+ * 一个显式的 hooks 记录把两件事说清楚，也省掉一处会被读错的类型体操。
+ */
+export interface AboutConsoleFace {
+  hooks: {
+    about: SnapshotStore<AboutState>
+    upgrade: SnapshotStore<UpgradeState>
+  }
+  loadAbout(refresh: boolean): void
+  ensureUpgrades(): void
+  loadUpgrades(refresh: boolean): void
+  upgradePackage(name: string, version: string, spec?: string): void
+  rollbackPackage(name: string, version: string, spec?: string): void
+  dismissUpgradeNotice(): void
+}
+
+/** 软件升级子页要用的升级动作（与 UpgradeRow 的入参同形）。 */
+export type AboutUpgradeActions = Pick<
+  UpgradeFace,
+  'ensureUpgrades' | 'loadUpgrades' | 'upgradePackage' | 'rollbackPackage' | 'dismissUpgradeNotice'
+>
+
 /** 「关于」页的注册项 props（官方组合别名 + store 座位 + 本插件字典）。 */
 export type AboutPageProps = ComposedProps<
   'settings.section',
   EntryKeyOf<'settings.section'>,
   never,
   HandleOf<AboutStoreHandle>,
-  AboutFace,
+  AboutConsoleFace,
   never,
   typeof NS
 >
@@ -187,12 +217,160 @@ function DshInfoTab({ t, facts, loading, error, errorKey, onRetry }: {
 }
 
 /**
+ * 一个软件单元的卡片：类名 + 升级行 + 结果块。
+ *
+ * 为什么单独一个组件（而不是在 map 里内联）：结果块要按**包名**订阅
+ * `state.action` / `state.rollback`，而 Hook 不能在循环里调。抽成组件后每个单元各订阅一次。
+ *
+ * 结果的归属由控制器按包名记下，这里只认自己的——**A 包的结果不能挂在 B 包的卡片上**
+ * （那会让用户以为 B 也被改了）。
+ *
+ * @param props - 字典座位、单元、升级状态选择器与动作。
+ * @returns 一个单元的卡片。
+ */
+function SoftwareUnitCard({ t, unit, useUpgrade, busy, actions }: {
+  readonly t: T
+  readonly unit: UpgradeUnitView
+  readonly useUpgrade: SnapshotSelectorHook<UpgradeState>
+  readonly busy: boolean
+  readonly actions: AboutUpgradeActions
+}) {
+  const action = useUpgrade((state: UpgradeState) => state.action?.name === unit.name ? state.action : undefined)
+  const rollback = useUpgrade((state: UpgradeState) => state.rollback?.name === unit.name ? state.rollback : undefined)
+  return (
+    <div className={css.unit} data-unit-kind={unit.kind}>
+      {/*
+        类名与**包名**各一行。
+        包名必须有：官方插件页里包名由页面自己的卡片标题渲染，而这一页**没有那个 chrome**——
+        少了它，用户看到的是"官方实验包 / 当前 0.2.1 → 0.3.0"，却不知道说的是哪个包。
+        这条是写测试时抓到的（第一版只画了类名，测试断言包名在不在就红了）。
+      */}
+      <p className={css.unitKind}>{t(UNIT_KIND_KEY[unit.kind as keyof typeof UNIT_KIND_KEY] ?? 'about.unit.other')}</p>
+      <p className={css.unitName}>{unit.name}</p>
+      {/*
+        "已是最新"这一态：官方插件页**不画这一行**（那一节的可见性由注册对账管，DESIGN §5.5 的表格）。
+        但这一页没有"注册对账"那一层——卡片是我自己 map 出来的——所以必须在这里显式说出来，
+        否则用户看到的是一个只有类名与包名的**空壳**。
+        这条是**真机取证时抓到的**：官方实验包那一档已经是最新，卡片上只有两行标签、
+        没有任何说明（单测没暴露它：既有用例都用 update-available 的单元）。
+
+        判据用 rowKindOf（与插件页同一个出口），不另写一份可见性判断。
+      */}
+      {rowKindOf(unit) === 'hidden'
+        ? <p className={css.hint}>{t('about.unitUpToDate')}</p>
+        : (
+          <>
+            <UpgradeRow t={t} unit={unit} checked view="page" busy={busy} actions={actions} />
+            <UpgradeResult
+              t={t}
+              action={action}
+              rollback={rollback}
+              onDismiss={() => { actions.dismissUpgradeNotice() }}
+            />
+          </>
+        )}
+    </div>
+  )
+}
+
+/**
+ * 渲染「软件升级」子页（task-96）。
+ *
+ * 范围（DESIGN §5.5 的用户裁决）：**只列这套软件本身**——① 官方运行时 ② 官方实验包 ③ 本插件自身。
+ * 第三方插件不进这一页（它们的入口在官方插件页与市场页卡片）。筛选是纯函数（shared.softwareUnits），
+ * 判据用 host 分好的 `kind` + 官方作用域，不在这里按包名猜。
+ *
+ * **复用** UpgradeRow / UpgradeResult（view='page'），不重造：
+ * 那套已经承载了四态显示、dist-tags 多线选择、金丝雀四态、结果四档与自我升级措辞
+ * （`upgrade.result.selfRestart`），并且有 task-74/87 的真机取证与护栏。
+ * 这一页的增量只有两件：**筛选**（只留三类官方）与**总览**（检查按钮 + 上次检查时间 + 说明）。
+ *
+ * @param props - 字典座位、升级状态选择器、单元与动作。
+ * @returns 软件升级子页。
+ */
+function SoftwareUpgradeTab({ t, useUpgrade, actions }: {
+  readonly t: T
+  readonly useUpgrade: SnapshotSelectorHook<UpgradeState>
+  readonly actions: AboutUpgradeActions
+}) {
+  const check = useUpgrade((state: UpgradeState) => state.check)
+  const loading = useUpgrade((state: UpgradeState) => state.loading)
+  const error = useUpgrade((state: UpgradeState) => state.error)
+  const errorKey = useUpgrade((state: UpgradeState) => state.errorKey)
+  const busy = useUpgrade((state: UpgradeState) => state.busy)
+  const units = useMemo<readonly UpgradeUnitView[]>(() => softwareUnits(check?.units ?? []), [check])
+
+  // 进入即查（与插件页同一条纪律，去重在控制器里）。
+  useEffect(() => { actions.ensureUpgrades() }, [actions])
+
+  // 检查自己失败（op 挂了）：必须说出来 + 重试——**绝不**画成"已是最新"（DESIGN §5.5）。
+  if (error !== undefined || errorKey !== undefined) {
+    return (
+      <p className={css.error} role="status">
+        {t('upgrade.loadFailed', { message: errorKey === undefined ? error ?? t('env.unknown') : t(errorKey) })}
+        <Button variant="ghost" size="sm" onClick={() => { actions.loadUpgrades(true) }}>{t('upgrade.retry')}</Button>
+      </p>
+    )
+  }
+  // 还没查过：这一态必须画出来（"没查"与"查不到"都不能靠缺席表达，§12.3.3）。
+  if (check === undefined) {
+    return (
+      <p className={css.hint} role="status">
+        {t('upgrade.notChecked')}
+        <Button variant="ghost" size="sm" disabled={loading} onClick={() => { actions.loadUpgrades(true) }}>{t('upgrade.check')}</Button>
+      </p>
+    )
+  }
+  return (
+    <>
+      <div className={css.checkBar}>
+        <Button variant="outline" size="sm" disabled={loading} onClick={() => { actions.loadUpgrades(true) }}>
+          {loading ? t('upgrade.checking') : t('upgrade.check')}
+        </Button>
+        {/* 时间性（§12.9 R6）："最新"这个断言必须有时间坐标，否则读者不知道它有多新。 */}
+        <span className={css.hint}>
+          {check.lastCheckAt === null
+            ? t('upgrade.neverChecked')
+            : t('upgrade.checkedAt', { at: formatRelative(t, check.lastCheckAt) })}
+        </span>
+      </div>
+      {check.notes.length === 0 ? null : (
+        <section className={css.group}>
+          <h3 className={css.groupTitle}>{t('upgrade.notes')}</h3>
+          {check.notes.map(note => <p key={note} className={css.hint}>{note}</p>)}
+        </section>
+      )}
+      {units.length === 0 ? (
+        // 一个都没有也要说出来，且**不是**"已是最新"——本页范围里没有任何可检查的单元，
+        // 那是"没有对象"，与"检查过了、是最新的"是两件事（§12.3.3）。
+        <p className={css.hint} role="status">{t('about.software.none')}</p>
+      ) : units.map(unit => (
+        <SoftwareUnitCard
+          key={unit.name}
+          t={t}
+          unit={unit}
+          useUpgrade={useUpgrade}
+          busy={busy === unit.name}
+          actions={actions}
+        />
+      ))}
+    </>
+  )
+}
+
+/** 三类单元 → 字典键（显式表：新增一类时编译期就会在这里暴露，不会静默显示成空白）。 */
+const UNIT_KIND_KEY = {
+  'installation-provided': 'about.unit.installation',
+  'profile-dependency': 'about.unit.experimental',
+  self: 'about.unit.self',
+} as const
+/**
  * 渲染「关于」页。
  *
  * @param props - 字典座位、子页选择、事实与读动作。
  * @returns 带本地子页面切换的关于页。
  */
-export function AboutPage({ t, useStore, actions, useAbout, loadAbout }: AboutPageProps) {
+export function AboutPage({ t, useStore, actions, useAbout, loadAbout, useUpgrade, ...upgradeActions }: AboutPageProps) {
   const tabsId = useId()
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([])
   // 子页选择来自声明式 store（与 ConsolePage 同一理由）：store 发布或条目重挂载都不能把用户弹回第一个子页。
@@ -200,6 +378,7 @@ export function AboutPage({ t, useStore, actions, useAbout, loadAbout }: AboutPa
   const visitedIds = useStore((state: { activeId: string | undefined; visitedIds: readonly string[] }) => state.visitedIds)
   const tabs: readonly AboutTab[] = [
     { id: 'dsh', label: t('about.tab.dsh') },
+    { id: 'software', label: t('about.tab.software') },
   ]
   const active = tabs.find(tab => tab.id === activeId)?.id ?? tabs[0]?.id
 
@@ -264,7 +443,9 @@ export function AboutPage({ t, useStore, actions, useAbout, loadAbout }: AboutPa
             不是"首屏要不要渲染"。这条是**真机取证时抓到的**（单测因为显式调了 select 而没暴露）。
           */}
           {tab.id === tabs[0]?.id || visitedIds.includes(tab.id)
-            ? <DshInfoTab t={t} facts={facts} loading={loading} error={error} errorKey={errorKey} onRetry={() => { loadAbout(true) }} />
+            ? tab.id === 'dsh'
+              ? <DshInfoTab t={t} facts={facts} loading={loading} error={error} errorKey={errorKey} onRetry={() => { loadAbout(true) }} />
+              : <SoftwareUpgradeTab t={t} useUpgrade={useUpgrade} actions={upgradeActions} />
             : null}
         </div>
       ))}

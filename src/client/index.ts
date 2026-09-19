@@ -28,7 +28,7 @@ import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 import type { CompanionConfig } from '../settings.ts'
-import { AboutPage, createAboutStore } from './AboutPage.tsx'
+import { AboutPage, createAboutStore, type AboutConsoleFace } from './AboutPage.tsx'
 import { ConsolePage, createConsoleStore } from './ConsolePage.tsx'
 import { KindsPage } from './KindsPage.tsx'
 import { MarketplacePage } from './MarketplacePage.tsx'
@@ -158,7 +158,22 @@ export function apply(ctx: ClientContext): void {
     label: () => t('nav.about'),
     locale: NS,
     store: aboutStore,
-    inject: () => aboutController.inject(),
+    // 注入面 = 关于页自己的面 + 升级面：软件升级子页直接复用 UpgradeRow / UpgradeResult，
+    // 那套已经承载四态、dist-tags 选择、金丝雀四态与结果四档（task-74/87），这一页不重造。
+    inject: (): AboutConsoleFace => {
+      const own = aboutController.inject()
+      return {
+        // hooks 必须**显式合并**：两个面的 `hooks` 是各自的对象，展开后者会整个覆盖前者
+        // （upgradeFace 的 hooks 里只有 upgrade）。这个坑在 MarketplaceConsoleFace 上已经踩过一次。
+        hooks: { ...own.hooks, ...upgradeFace.hooks },
+        loadAbout: own.loadAbout,
+        ensureUpgrades: upgradeFace.ensureUpgrades,
+        loadUpgrades: upgradeFace.loadUpgrades,
+        upgradePackage: upgradeFace.upgradePackage,
+        rollbackPackage: upgradeFace.rollbackPackage,
+        dismissUpgradeNotice: upgradeFace.dismissUpgradeNotice,
+      }
+    },
   }, AboutPage))
 
   // 一级入口 3：技能与预设（order 22，插在官方 agent-presets=20 之后）。

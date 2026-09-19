@@ -245,8 +245,17 @@ export function UpgradeRow({
       {/* 查不到：必须画出来，并给重试 —— 绝不显示"已是最新"。 */}
       {kind !== 'unknown' ? null : (
         <>
+          {/*
+            这一行**只写原因**，不再加「查不到：」前缀。两条理由：
+              · §12.9 R2（原因不许冒号套冒号）：host 给的原因自己就带冒号
+                （`registry 查询失败：fetch failed`），再套一层前缀就是**同一行两个冒号**——
+                正是用户说的"并行与分句，让人的理解很困难"。这是 task-96 真机取证抓到的
+                （单测没暴露：既有用例用的原因恰好不带冒号）。
+              · §12.3.1（屏幕已有的事实不再念一遍）：结论「查不到」由上面那个 Tag 承担，
+                再写一遍是同一件事说两遍。summary 视图没有 Tag，所以那一支仍带前缀。
+          */}
           <p className={css.upgradeWarn}>
-            {t('upgrade.unknown', { reason: unit.reason ?? t('upgrade.unknownReason') })}
+            {t('upgrade.unknownDetail', { reason: unit.reason ?? t('upgrade.unknownReason') })}
           </p>
           {source === undefined ? null : <p className={css.upgradeNote}>{source}</p>}
           <div className={css.upgradeActions}>

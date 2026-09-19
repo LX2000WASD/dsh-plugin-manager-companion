@@ -352,7 +352,7 @@ describe('升级行：四态各自可辨（DESIGN §5.5）', () => {
     } finally { stub.restore() }
   })
 
-  it('查不到：必须显示「查不到：<原因>」+ 重试，且绝不显示"已是最新"', async () => {
+  it('查不到：必须显示「查不到」+ 原因 + 重试，且绝不显示"已是最新"', async () => {
     const handle = boot({ bundles: [{ name: 'probe-plugin', installed: true }] })
     const stub = stubFetch({
       upgradeCheck: () => checkEnvelope([unit({
@@ -363,7 +363,19 @@ describe('升级行：四态各自可辨（DESIGN §5.5）', () => {
     try {
       await untilChecked(handle, 'probe-plugin')
       const html = renderRow(handle, 'probe-plugin')
-      assert.match(html, /查不到：registry 查询失败：ETIMEDOUT/, '查不到必须带上原因：' + html)
+      // 判据从「查不到：<原因>」改成「查不到（Tag）+ 原因（另一行）」。
+      // 为什么改（task-96 真机取证抓到的缺陷）：host 给的原因**自己就带冒号**
+      // （真实值形如 `registry 查询失败：fetch failed`），套上前缀就是**同一行两个冒号**——
+      // §12.9 R2 明禁的形态，正是用户说的"并行与分句，让人的理解很困难"。
+      // 而且结论「查不到」已由 Tag 承担，再写一遍是同一件事说两遍（§12.3.1）。
+      // 本用例原先用的原因是 `registry 查询失败：ETIMEDOUT`——**恰好也带冒号**，
+      // 但断言只 match 前缀，所以没暴露；真机换上 fetch failed 之后 R2 当场红。
+      assert.match(html, /查不到/, '结论要在（Tag）：' + html)
+      assert.match(html, /registry 查询失败：ETIMEDOUT/, '查不到必须带上原因：' + html)
+      // 反向钉住 R2：那一行**不许**出现两个冒号。
+      for (const line of html.replace(/<[^>]*>/g, String.fromCharCode(10)).split(String.fromCharCode(10))) {
+        assert.ok((line.match(/：/g) ?? []).length < 2, '同一行不许两个冒号（§12.9 R2）：' + JSON.stringify(line))
+      }
       assert.match(html, /重新检查/, '查不到必须给重试入口')
       // 这是本用例的核心：查不到 ≠ 已是最新。
       assert.ok(!html.includes('已是最新'), '查不到绝不能显示"已是最新"：' + html)

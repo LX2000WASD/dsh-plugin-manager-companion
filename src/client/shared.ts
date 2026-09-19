@@ -1562,6 +1562,69 @@ export interface UpgradeFace {
   dismissUpgradeNotice(): void
 }
 
+// ── 「关于 → 软件升级」的子页筛选（task-96）──────────────────────────────
+
+/**
+ * 本页只列"这套软件本身"的单元（DESIGN §5.5 的用户裁决）。
+ *
+ * 三类都在，但**第三方插件一律不出现在这一页**——它们的升级入口是官方插件页里该包自己的页面
+ * 与市场页卡片。所以这里不能简单地"把 units 全画出来"，必须筛。
+ *
+ * 判据用 **host 已经分好的 `kind`**，不自己按包名猜：
+ *   · `installation-provided` → ① 官方运行时（全局安装的那份）；
+ *   · `profile-dependency`    → ② 官方自带实验包（与第三方在**同一类**里，靠包名分）；
+ *   · `self`                  → ③ 本插件自身。
+ * ②与第三方同 kind，所以还需要一条"是不是官方的"判据，见 {@link isOfficialPackage}。
+ */
+export const SOFTWARE_UNIT_KINDS: readonly string[] = ['installation-provided', 'profile-dependency', 'self']
+
+/**
+ * 一个包名是否属于官方（`@deepseek-ai/` 作用域）。
+ *
+ * 为什么用作用域而不是维护一张白名单：官方包名会随版本增删（`dsh-experimental-*` 尤其），
+ * 白名单一过期就会**静默漏掉一个该显示的单元**；作用域是发布方自己定的、稳定的。
+ * 与仓库既有判据同源（`src/diagnostics.ts` 的 `name.startsWith('@deepseek-ai/')`）。
+ *
+ * 注意：本插件自身（`dsh-plugin-manager-companion`）**不在**这个作用域里，
+ * 但它必须显示——所以判据是"官方 或 本插件自身"，见 {@link isSoftwareUnit}。
+ *
+ * @param name - 包名。
+ * @returns 是否官方作用域。
+ */
+export function isOfficialPackage(name: string): boolean {
+  return name.startsWith('@deepseek-ai/')
+}
+
+/**
+ * 一个升级单元是否属于"这套软件本身"（本页要显示的）。
+ *
+ * @param unit - 单元视图（只要有 name / kind 两个字段）。
+ * @returns 是否显示在这一页。
+ */
+export function isSoftwareUnit(unit: { readonly name: string; readonly kind: string }): boolean {
+  if (!SOFTWARE_UNIT_KINDS.includes(unit.kind)) return false
+  return isOfficialPackage(unit.name) || unit.kind === 'self'
+}
+
+/**
+ * 从全部单元里挑出本页要显示的，并按三类排好（① → ② → ③，类内按包名）。
+ *
+ * 为什么固定顺序：用户来这一页是依次看"官方运行时能不能升 / 实验包能不能升 / 我自己能不能升"，
+ * 顺序随检查结果的返回次序变会让每次打开都长得不一样。
+ *
+ * @param units - 检查结果里的全部单元。
+ * @returns 本页要显示的单元（已排序）。
+ */
+export function softwareUnits<T extends { readonly name: string; readonly kind: string }>(
+  units: readonly T[],
+): readonly T[] {
+  const rank = (kind: string): number => SOFTWARE_UNIT_KINDS.indexOf(kind)
+  return units
+    .filter(isSoftwareUnit)
+    .slice()
+    .sort((left, right) => rank(left.kind) - rank(right.kind) || (left.name < right.name ? -1 : left.name > right.name ? 1 : 0))
+}
+
 // ── 「关于」页（task-95）─────────────────────────────────────────────────
 
 /** 「关于」页的状态。 */

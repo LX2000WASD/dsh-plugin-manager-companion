@@ -731,13 +731,12 @@ describe('UI 文案标准（DESIGN §12）', () => {
       // cleanupDesc 复活，并新增 cleanupUnknown（计划读不到时那句"无法确认会删几个"）。
       // ── 市场页：标签超额时的折叠提示 ────────────────────────────────────────
       { key: k('market', 'moreTags'), why: '市场卡片标签超上限时的"还有 N 个"；MarketplacePage 目前全量渲染 tagsOf(item)' },
-      // ── 升级：task-77（关于 → 软件升级）要用的那几档状态 ────────────────────
-      { key: k('upgrade', 'loadFailed'), why: 'task-77 的检查失败提示（task-87 的插件页用共享的 errorKey 通道，不走这个键）' },
-      { key: k('upgrade', 'checkedAt'), why: 'task-77：上次检查时间（插件页的版本事实行已自带"来自 registry（刚刚）"）' },
-      { key: k('upgrade', 'neverChecked'), why: 'task-77：从未成功检查过' },
-      { key: k('upgrade', 'checking'), why: 'task-77：检查中…（插件页用的是按钮禁用态，没写这句）' },
-      { key: k('upgrade', 'notes'), why: 'task-77：检查说明（check.notes 目前无处渲染）' },
-      { key: k('upgrade', 'rollback.action'), why: 'task-77：回滚按钮（插件页只有结果块，没有触发回滚的入口）' },
+      // ── 升级：task-96（关于 → 软件升级）已接上五档 ──────────────────────────
+      // task-96 落了这一页：loadFailed / checkedAt / neverChecked / checking / notes
+      // 五档全部复活（总览条 + 说明区），所以它们已从这张表里删掉。
+      // 只剩回滚按钮那一档：本页复用 UpgradeResult（有结果块）但**没有触发回滚的入口**——
+      // 与插件页同一个状态。要不要在这一页给回滚入口，等 Lead 定。
+      { key: k('upgrade', 'rollback.action'), why: '回滚按钮：两处都只有结果块，没有触发回滚的入口（task-96 沿用插件页的现状）' },
     ]
     const known = new Set(KNOWN_DEAD.map(item => item.key))
     const unexpected = dead.filter(key => !known.has(key))

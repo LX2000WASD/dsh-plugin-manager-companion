@@ -90,6 +90,44 @@
   word-break: break-all;
 }
 
+/* 软件升级子页（task-96）：检查条 + 单元卡片。 */
+
+/* 检查按钮与"上次检查"同一行：时间性（§12.9 R6）必须紧挨着它修饰的断言。 */
+.checkBar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* 一个单元一张卡：类名一行、升级行一块、结果块一块。 */
+.unit {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 0.5px solid var(--dsw-alias-border-l1);
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-layer-1);
+}
+
+/* 包名：用户来这一页要知道"升的是哪个包"，所以给正文的字重与颜色。 */
+.unitName {
+  margin: 0;
+  font-family: var(--dsw-font-markdown-code-font-family);
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-primary);
+  word-break: break-all;
+}
+
+/* 类名比正文轻一档：它是分组标签，不是内容（内容在下面的升级行里）。 */
+.unitKind {
+  margin: 0;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
 /* 来源与原因同档："这条事实怎么来的"与"为什么读不到"都是排查要看的。 */
 .factSource,
 .factReason {

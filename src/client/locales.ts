@@ -48,6 +48,16 @@ export const zh = {
   'about.settingsPath': '设置文件',
   'about.registryCache': '市场索引缓存',
   'about.registryCacheAge': '缓存年龄',
+  'about.tab.software': '软件升级',
+  // 范围为空时那句：说的是"没有对象"，**不是**"已是最新"（§12.3.3）。
+  'about.software.none': '这套软件里没有可检查的升级单元',
+  'about.unit.installation': '官方运行时（全局安装的那份）',
+  'about.unit.experimental': '官方实验包',
+  'about.unit.self': '本插件自身',
+  'about.unit.other': '其它单元',
+  // "已是最新"那一态：官方插件页不画这一行，但本页的卡片是自己 map 的，必须显式说出来
+  // （否则是一个只有类名与包名的空壳——真机取证抓到的）。
+  'about.unitUpToDate': '已经是最新版本',
 
   'common.cancel': '取消',
   'common.readOnly': '只读',
@@ -462,6 +472,9 @@ export const zh = {
   'upgrade.effect': '已安装，下次启动后加载。',
   'upgrade.retry': '重新检查',
   'upgrade.unknown': '查不到：{reason}',
+  // 详情行（page 视图）：**不带前缀**——结论由 Tag 承担（§12.3.1），且 host 给的原因自带冒号，
+  // 加前缀会变成同一行两个冒号（§12.9 R2）。summary 视图没有 Tag，仍用上面那条。
+  'upgrade.unknownDetail': '{reason}',
   'upgrade.unknownReason': '没有可用的版本事实',
   'upgrade.installationProvided': '由安装方提供，无法在当前环境内升级',
   'upgrade.loadFailed': '检查更新失败：{message}',
@@ -533,6 +546,13 @@ export const en: Record<CompanionLocaleKey, string> = {
   'about.settingsPath': 'Settings file',
   'about.registryCache': 'Marketplace index cache',
   'about.registryCacheAge': 'Cache age',
+  'about.tab.software': 'Software upgrade',
+  'about.software.none': 'Nothing in this software can be checked for upgrades',
+  'about.unit.installation': 'DSH runtime (the global install)',
+  'about.unit.experimental': 'Official experimental packages',
+  'about.unit.self': 'This plugin',
+  'about.unit.other': 'Other unit',
+  'about.unitUpToDate': 'Already up to date',
 
   'common.cancel': 'Cancel',
   'common.readOnly': 'Read-only',
@@ -925,6 +945,7 @@ export const en: Record<CompanionLocaleKey, string> = {
   'upgrade.effect': 'Installed; it loads at the next start.',
   'upgrade.retry': 'Check again',
   'upgrade.unknown': 'Unavailable: {reason}',
+  'upgrade.unknownDetail': '{reason}',
   'upgrade.unknownReason': 'no version fact available',
   'upgrade.installationProvided': 'Supplied by the installation; it cannot be upgraded inside this environment',
   'upgrade.loadFailed': 'Checking for updates failed: {message}',
