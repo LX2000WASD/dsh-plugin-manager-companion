@@ -226,7 +226,42 @@ export function detectCurrentEnvironmentName(argv: readonly string[] = process.a
 /** 官方内置环境：只读，环境管理不修改它们的层栈。 */
 export const BUILTIN_ENVIRONMENTS = ['web', 'headless'] as const
 
-/** 是否为官方内置环境。 */
+/**
+ * 是否为官方内置环境。
+ *
+ * **必须大小写不敏感**：Windows 与 macOS 的默认文件系统大小写不敏感，
+ * 于是 `WEB` 与 `web` 指向**同一个目录**。若这里按精确大小写比较，
+ * `removeEnvironment('WEB')` 会删掉官方内置 web 环境的目录，还返回成功——
+ * 不可逆、且 Linux 门禁永远测不出来（审计 W-01，已在真 win32 Node 上复现）。
+ * 判据取"这个名字在这台机器上会落到哪个目录"，而不是"字符串是否逐字相等"。
+ *
+ * @param name - 环境名（调用方给的原始大小写）。
+ * @returns 是否指向官方内置环境。
+ */
 export function isBuiltinEnvironment(name: string): boolean {
-  return (BUILTIN_ENVIRONMENTS as readonly string[]).includes(name)
+  const lower = name.toLowerCase()
+  return BUILTIN_ENVIRONMENTS.some((builtin) => builtin.toLowerCase() === lower)
+}
+
+/**
+ * 两个环境名在这台机器上是否指向**同一个目录**。
+ *
+ * Windows 与 macOS 默认文件系统大小写不敏感：`web` 与 `WEB` 是同一个目录。
+ * 所有"拒绝在某个环境上操作"的护栏（当前环境不可删/不可停、内置环境只读）都必须用它，
+ * 否则非规范大小写就能绕过护栏——审计 W-01 是它的最坏形态（删掉官方内置环境并报成功）。
+ * Linux 是大小写敏感的，那里两个名字确实是两个目录，所以不能无条件忽略大小写。
+ *
+ * @param a - 环境名之一。
+ * @param b - 环境名之二。
+ * @returns 是否指向同一个环境。
+ */
+export function sameEnvironment(a: string | null, b: string | null): boolean {
+  if (a === null || b === null) return a === b
+  if (a === b) return true
+  return caseInsensitiveFs() && a.toLowerCase() === b.toLowerCase()
+}
+
+/** 默认文件系统是否大小写不敏感（保守取向：这里判"是"只会让人被多拒绝一次，判"否"可能删错东西）。 */
+function caseInsensitiveFs(): boolean {
+  return process.platform === 'win32' || process.platform === 'darwin'
 }

@@ -42,7 +42,7 @@ import type { PackageResult } from '@deepseek-ai/dsh-plugin-manager/types'
 import { probeOfficialCapabilities, type OfficialCapabilities } from './official.ts'
 import {
   OUR_PACKAGE_NAME, detectCurrentEnvironmentName, dshHome, enqueueMutation, environmentDir,
-  isBuiltinEnvironment, isSafeEnvironmentName, profilesRoot, readEnvironmentManifest,
+  isBuiltinEnvironment, isSafeEnvironmentName, profilesRoot, readEnvironmentManifest, sameEnvironment,
 } from './paths.ts'
 import type {
   BackupFormat, BackupMissingEntry, EnvironmentBackup, EnvironmentBackupDiff,
@@ -795,7 +795,9 @@ export async function removeEnvironment(
   const dir = environmentDir(name)
   if (!existsSync(dir)) return failure('not-found', '环境不存在：' + name)
   const current = resolveCurrent(options)
-  if (current === name) {
+  // 用 sameEnvironment 而不是 ===：大小写不敏感的文件系统上（Windows/macOS）`WEB` 与 `web`
+  // 是同一个目录，逐字比较会让护栏被非规范大小写绕过——那一步的后果是不可逆的。
+  if (sameEnvironment(current, name)) {
     return failure('current', name + ' 是当前正在运行的环境，不能删除（要删请先停止本进程）')
   }
   // 删除不可逆：不拿 3s 陈旧缓存当依据，用即时扫描。
@@ -1403,7 +1405,8 @@ export async function stopEnvironment(
   const dir = environmentDir(name)
   if (!existsSync(dir)) return failure('not-found', '环境不存在：' + name)
   const current = resolveCurrent(options)
-  if (current === name) {
+  // 同上：这里是"别把自己杀掉"的护栏，被绕过等于杀死正在服务本页面的进程。
+  if (sameEnvironment(current, name)) {
     return failure('current', name + ' 是当前正在运行的环境：在这里停止它等于结束本进程，请在它的终端里停止')
   }
   // 缓存先看（Windows 全表扫描可达数秒）；缓存里没有时用即时扫描复核一次，免得把
