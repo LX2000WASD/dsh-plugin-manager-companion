@@ -155,6 +155,61 @@ try {
   check('盘上版本回到旧版本', afterRoll.version, OLD_VERSION)
   check('层栈回到原样', JSON.stringify(afterRoll.bundles), JSON.stringify(before.bundles))
 
+  // ── 4. 自升级：job 不会因为"自己的代码被替换"而中断 ────────────────────
+  // task-73 证据④。自升级的特别之处：正在运行的就是旧代码。这里用**真 JobRegistry**
+  // 起一个升级 job（与 op 层同一条路），并让被升级的正是本插件自己（link: 到副本）。
+  // 判据是 job 自己落定成 done 且带结果——不是"我们没看到崩溃"。
+  console.log(NL + '=== 4. 自升级：job 在自己代码被替换时仍要跑完 ===')
+  const self = makeEnv('real-self')
+  const prepSelf = await up.runOfficialAdd('real-self', 'link:' + REPO, { installAnchor: anchor })
+  check('官方 install 把本插件装进环境', prepSelf.exitCode, 0)
+  const selfBefore = factsOf(self, 'dsh-plugin-manager-companion')
+  check('本插件装上了（版本 0.1.0）', selfBefore.version, '0.1.0')
+
+  // 造"新版本"：本仓库的副本 + 改版本号（真实存在、能真装）。
+  // 说明（如实）：升级的目标 spec 一律是 name@version（registry 版本）——引擎刻意
+  // **不接受**调用方指定"装哪个来源"，因为把 link: 换成 registry 版本会改变来源，
+  // 那是另一件事（报告里有 changesSource 标它）。本插件当前**没有发布到 npm**
+  // （npm view dsh-plugin-manager-companion → 404），所以"真的换成新版"这一步在这台机器上
+  // 做不成。这条只验 task-73 证据④要的那件事：**job 本身不会被打断**，
+  // 且拿不到版本时引擎如实报失败（不许假成功）。
+  const { JobRegistry } = await import(join(REPO, 'dist/rest.js'))
+  const { handleOp } = await import(join(REPO, 'dist/index.js'))
+  const jobs = new JobRegistry()
+  const deps = {
+    ctx: { get: () => undefined, logger: { info() {}, warn() {} }, effect: (fn) => { const d = fn(); return typeof d === 'function' ? d : () => {} } },
+    config: () => ({ ...settings.DEFAULT_CONFIG, trial: { ...settings.DEFAULT_TRIAL_CONFIG, enabled: false } }),
+    configUpdate: async (patch) => ({ ...settings.DEFAULT_CONFIG, ...patch }),
+    capabilities: () => ({ profileBacked: true, manager: false, inventory: false, environmentName: 'real-self', missing: [] }),
+    jobs,
+    upgrade: { installAnchor: anchor, log: (line) => note('[清理日志] ' + line) },
+  }
+  const started = await handleOp('upgrade', {
+    environment: 'real-self', name: 'dsh-plugin-manager-companion', version: '0.1.99',
+  }, deps)
+  check('自升级首包是 jobId（不是裸结果）', typeof started.value?.jobId, 'string')
+  // 轮询到落定（job 是异步的：这里真的等它跑完）。
+  let status = jobs.status(started.value.jobId)
+  for (let i = 0; i < 120 && !status.done; i += 1) {
+    await new Promise((done) => setTimeout(done, 500))
+    status = jobs.status(started.value.jobId)
+  }
+  check('自升级 job 落定（没因自身代码被替换而中断）', status.done, true)
+  check('job 没报错', status.error, undefined)
+  const selfAfter = factsOf(self, 'dsh-plugin-manager-companion')
+  const selfOutput = String(status.result?.output ?? '')
+  check('结论里写明"下次启动生效"（官方口径）', /下次启动/.test(selfOutput), true)
+  check('结论里点明是本插件自身', /本插件自身/.test(selfOutput), true)
+  // 未发布 → 官方 add 必然失败。引擎必须**如实报**：盘上版本没变 + 退出码非零，
+  // 不许因为"这是自升级"就把它说成成功。
+  check('拿不到版本时如实报失败（不假成功）', status.result?.ok, false)
+  check('盘上版本没被改动（失败就是失败）', selfAfter.version, selfBefore.version)
+  check('失败结论里带上官方退出码', /退出码 \d+/.test(selfOutput), true)
+  note('（未覆盖）真·自升级到新版本：本插件未发布到 npm，这台机器上做不成')
+  note('自升级前 = ' + JSON.stringify(selfBefore))
+  note('自升级后 = ' + JSON.stringify(selfAfter))
+  note('job 结果摘录 = ' + String(status.result?.output ?? '').split(NL).slice(0, 3).join(' / '))
+
   console.log(NL + '断言：' + passed + ' 通过' + (failed ? '，有失败' : '，全部通过'))
 } finally {
   if (!KEEP) rmSync(HOME, { recursive: true, force: true })
