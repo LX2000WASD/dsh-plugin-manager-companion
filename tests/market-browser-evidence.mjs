@@ -130,12 +130,20 @@ try {
     report.shots.push(await capture(tab, join(OUT, 'market-search-en.png'), { settleMs: 600 }))
   } else {
     // 等索引那趟走完：六跳全失败仍要跑一遍（每跳一次连接尝试），固定 1.2s 会读到"还没加载完"的状态。
+    // 等索引那趟走完（六跳全失败仍要跑一遍），并按住**出厂文案**判定——文案改了这里就要跟着改，
+    // 否则截图与代码会悄悄对不上（copy-dev 于 task-47 精简过 market.stale / market.unavailableHint）。
     await waitFor(tab, '(function(){var d=document.querySelector("[role=dialog]");var o=d&&d.querySelector("[class*=options]");var t=o?(o.innerText||""):"";'
-      + 'return t.indexOf("插件索引不可用")>=0 || t.indexOf("这是缓存索引")>=0})()', 25_000)
-    report.checks.marketText = String(await evaluate(tab, OPTIONS_TEXT) ?? '').slice(0, 600)
-    report.checks.hasUnavailable = String(await evaluate(tab, OPTIONS_TEXT) ?? '').includes('插件索引不可用')
-    report.checks.hasStale = String(await evaluate(tab, OPTIONS_TEXT) ?? '').includes('这是缓存索引')
-    report.shots.push(await capture(tab, join(OUT, 'market-index-' + PHASE + '.png'), { settleMs: 1000 }))
+      + 'return t.indexOf("插件索引不可用")>=0 || t.indexOf("可能不是最新")>=0})()', 25_000)
+    const text = String(await evaluate(tab, OPTIONS_TEXT) ?? '')
+    report.checks.marketText = text.slice(0, 600)
+    report.checks.hasUnavailable = text.includes('插件索引不可用')
+    report.checks.hasStale = text.includes('可能不是最新')
+    report.checks.hasUnavailableHint = text.includes('索引不可用，暂无条目。')
+    report.checks.hasRetry = text.includes('重试')
+    // 两种索引异常态分开命名：都叫 market-index-dead.png 会互相覆盖（后一段把前一段的图顶掉，
+    // 结果"不可用"那张截图只剩 json 里的文本，评审时看不到）。
+    const name = report.checks.hasUnavailable ? 'market-index-unavailable.png' : 'market-index-stale.png'
+    report.shots.push(await capture(tab, join(OUT, name), { settleMs: 1000 }))
   }
 } finally {
   await tab.close().catch(() => {})
