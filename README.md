@@ -50,7 +50,7 @@ dsh plugin --profile <name> add dsh-plugin-manager-companion@latest
 | L2 组合 | 官方 composeEntries + patch 层栈 | 行 id 重复、被禁用依赖、孤儿行、不可寻址行 |
 | L3 运行时 | 官方 inventory / Loader 直读 | 失败 fiber、长期 pending（点名缺哪个服务）、注册名冲突 |
 | L4 一致性 | 官方 inventory vs 本地 manifest | 声明未加载、加载未声明、未挂载依赖 |
-| L5 生态 | 市场索引（默认关闭） | 更新可用（需要联网时用户显式开启） |
+| L5 生态 | 市场索引 | **当前是骨架**：诊断路径上不联网、不做判定，报告里如实标为「未查」而不是「0 问题」 |
 
 每条发现都带**证据链**（可点到文件行/运行时对象），并分三级处置：`safe-fix` / `confirm-fix` / `report-only`。
 
@@ -68,13 +68,31 @@ dsh plugin --profile <name> add dsh-plugin-manager-companion@latest
 零竞态窗口、零自建 pnpm、零 patch 写入。检查项：未声明 import、声明了但没装、
 官方包被声明成普通 `dependencies`（模块身份分裂会劫持官方 loader 行）、Node 内置模块豁免。
 
+## 命令行（`dshpmc`）
+
+Web UI 之外还有一条命令行通道，**它的主要用途是逃生口**：环境因为 patch 或依赖问题
+启动阶段就硬失败时，界面根本打不开，这时 `dshpmc analyze` 能脱离活着的 loader 只读磁盘跑完诊断
+并指出根因（`duplicate loader entry id` / `cannot resolve profile bundle` / `ERR_MODULE_NOT_FOUND`）与文件行号。
+
+```sh
+dshpmc analyze --profile <name>     # 深度体检；发现问题退出码 1，关键层没跑完时也不会报成"健康"
+dshpmc list   --profile <name>     # 层栈 / 依赖 / 本插件装过的技能与预设
+dshpmc install | remove | update | mount | uninstall-kind
+```
+
 ## 开发
 
 ```sh
 pnpm install
 pnpm run build   # host: tsc; client: tsc + tsdown
 pnpm test        # build + node --test（测试 import dist 产物）
+
+bash tools/e2e-lifecycle.sh   # 真机：建环境 → 启动 → 可达 → 停止（14 项断言）
+bash tools/e2e-visual.sh      # 真机浏览器：三个页面 + 官方插件页内注册（16 项断言）
 ```
+
+验收命令是 `pnpm test`（它先 build）。直接跑 `node --test` 会拿碰巧躺在 `dist` 里的那份当被测物，
+属静默假绿——见 [docs/CODE-POLICY.md](docs/CODE-POLICY.md) §7.6。
 
 约定见 [docs/CODE-POLICY.md](docs/CODE-POLICY.md)（"参考不复制"三分类准入 + 工具红线），
 设计权威见 [docs/DESIGN.md](docs/DESIGN.md)，host↔client 契约见 [docs/REST-CONTRACT.md](docs/REST-CONTRACT.md)。
@@ -87,6 +105,11 @@ pnpm test        # build + node --test（测试 import dist 产物）
 - 环境变量敏感键过滤是形态匹配而非全集；未匹配形态仍会进入 git 源安装的子进程
 - L3 的注册名冲突只覆盖 profile 本地包源码，不扫官方 scope 的行
 - 端口只在实例命令行带 `--port` 时可知，GUI 宿主那种默认端口启动的实例显示"端口未知"
+- **L5 生态层是骨架**：不联网、不判定，如实记为「未查」
+- "真实宿主拒绝安装"（`result.ok=false` 形态）没有真机取证：能产生它的动作要么真的改动环境、
+  要么依赖网络随机性；该行为由单测钉住（含 `callOp` 抛异常的形态）
+- 官方仍在 prerelease 快速迭代（基线 `0.1.6-alpha.2`）。旧仓库正是被官方新增一行 `id: plugin-manager`
+  撞死的，所以升级官方版本前应先跑一遍本仓库的门禁与真机脚本
 
 ## 许可证
 
