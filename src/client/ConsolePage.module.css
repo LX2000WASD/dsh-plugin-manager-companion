@@ -432,6 +432,20 @@
   align-items: flex-start;
 }
 
+/* 只读标记那一行：标记承载状态，句子只讲后果。 */
+
+.readOnlyLine {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+}
+
+.readOnlyConsequence {
+  font-size: 13px;
+  color: var(--dsw-alias-state-warn-label);
+}
+
 /* 层栈读不懂时：标签 + 可见的原因（不挂在 title 上）。 */
 
 .envUnknown {

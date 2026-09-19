@@ -22,6 +22,7 @@ export const zh = {
   'nav.kinds': '技能与预设',
 
   'common.cancel': '取消',
+  'common.readOnly': '只读',
   'common.close': '关闭',
   'common.confirm': '确认',
   'common.loading': '加载中…',
@@ -148,7 +149,7 @@ export const zh = {
   'config.unavailable': '当前宿主没有提供本插件的设置命名空间，配置暂不可编辑。',
   'config.loading': '正在读取配置…',
   'config.incomplete': '宿主只提供了部分配置字段：缺失项按默认值显示，保存时只写入你改动过的字段。',
-  'config.readOnly': '本部署的设置是只读的，改动无法保存。',
+  'config.readOnly': '改动无法保存。',
   'config.save': '保存',
   'config.saving': '保存中…',
   'config.discard': '放弃修改',
@@ -296,6 +297,7 @@ export const en: Record<CompanionLocaleKey, string> = {
   'nav.kinds': 'Skills & presets',
 
   'common.cancel': 'Cancel',
+  'common.readOnly': 'Read-only',
   'common.close': 'Close',
   'common.confirm': 'Confirm',
   'common.loading': 'Loading…',
@@ -421,7 +423,7 @@ export const en: Record<CompanionLocaleKey, string> = {
   'config.unavailable': 'This host does not serve our settings namespace, so the configuration cannot be edited here.',
   'config.loading': 'Reading the configuration…',
   'config.incomplete': 'The host served only part of this configuration: missing fields are shown at their defaults, and saving writes only the fields you changed.',
-  'config.readOnly': 'Settings are read-only in this deployment.',
+  'config.readOnly': 'Changes cannot be saved.',
   'config.save': 'Save',
   'config.saving': 'Saving…',
   'config.discard': 'Discard',

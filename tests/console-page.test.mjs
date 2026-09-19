@@ -766,3 +766,64 @@ describe('环境列表：按字段显示「未知」而不是 0（task-43 字段
     assert.ok(html.includes('环境事实不完整'), '兜底行要标明"事实不完整"：' + html.slice(0, 500))
   })
 })
+
+describe('只读标记（task-48）：状态用标记承载，不用句子', () => {
+  const ENVIRONMENTS = [
+    { name: 'pm-now', dir: '/tmp/pm-now', current: true, builtin: false, bundles: ['@deepseek-ai/dsh-base'], dependencies: [], runs: [] },
+    { name: 'pm-other', dir: '/tmp/pm-other', current: false, builtin: false, bundles: ['@deepseek-ai/dsh-base'], dependencies: [], runs: [] },
+  ]
+  const okOps = {
+    listEnvironments: () => ({ ok: true, value: ENVIRONMENTS }),
+    diagnose: () => ({ ok: true, value: { jobId: 'job-1' } }),
+    job: () => ({
+      ok: true,
+      value: {
+        done: true,
+        result: {
+          environment: 'pm-other', generatedAt: '2026-09-19T03:00:00.000Z',
+          counts: { dependency: 0, composition: 0, runtime: 0, consistency: 0, ecosystem: 0 },
+          issues: [], skipped: [],
+        },
+      },
+    }),
+  }
+
+  it('诊断目标不是当前环境时显示「只读」标记；是当前环境时不显示', async () => {
+    const booted = boot()
+    const stub = stubFetch(okOps)
+    try {
+      booted.face.refreshEnvironments()
+      await until(() => booted.face.hooks.environments.getSnapshot().loading === false, '环境列表落地')
+      const home = renderTab(booted.entry, booted.face, booted.t, 'health')
+      assert.ok(!home.includes('只读'), '当前环境下不该出现只读标记：' + home.slice(0, 300))
+
+      booted.face.setDiagnosticTarget('pm-other')
+      await until(() => booted.face.hooks.health.getSnapshot().target === 'pm-other', '目标切到另一个环境')
+      const away = renderTab(booted.entry, booted.face, booted.t, 'health')
+      assert.ok(away.includes('只读'), '不是当前环境时要显示只读标记：' + away.slice(0, 400))
+      // §12.5：被删掉的那句状态说明，语义要由标记承载——所以"标记在、句子不在"要能同时看出来。
+      assert.ok(!away.includes('本页只读'), '状态句不得回来（已由标记承载）')
+      assert.ok(!away.includes('默认诊断当前环境'), '被删的那句不得回来')
+    } finally { stub.restore() }
+  })
+
+  it('设置只读时显示「只读」标记 + 后果半句；可写时不显示', () => {
+    const booted = boot()
+    const value = {
+      diagnostics: { dependency: true, composition: true, runtime: true, consistency: true, ecosystem: false },
+      qualityGate: { enabled: true, mode: 'block', allowlist: [] },
+      marketplace: { enabled: true, cacheTtlMinutes: 1440, timeoutMs: 15000, indexUrl: '' },
+    }
+    booted.face.hooks.config.update((draft) => {
+      draft.status = 'ready'; draft.writable = true; draft.value = value; draft.draft = value
+    })
+    const writable = renderTab(booted.entry, booted.face, booted.t, 'settings')
+    assert.ok(!writable.includes('只读'), '可写时不该出现只读标记：' + writable.slice(0, 300))
+
+    booted.face.hooks.config.update((draft) => { draft.writable = false })
+    const readOnly = renderTab(booted.entry, booted.face, booted.t, 'settings')
+    assert.ok(readOnly.includes('只读'), '只读时要显示标记：' + readOnly.slice(0, 400))
+    assert.ok(readOnly.includes('改动无法保存'), '后果半句要保留：' + readOnly.slice(0, 400))
+    assert.ok(!readOnly.includes('本部署的设置是只读的'), '状态句不得回来（已由标记承载）')
+  })
+})
