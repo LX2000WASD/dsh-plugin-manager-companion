@@ -62,8 +62,21 @@ export interface EnvironmentInfo {
    * `0 个组合包` 就是把"我不知道"说成"这个环境没有层栈"。其余字段判断未知请读 unknownFields。
    */
   readonly bundlesKnown?: boolean
-  /** 进程表扫描到的运行实例；空数组表示未运行。 */
+  /** 进程表扫描到的运行实例；**空数组 + runsKnown !== false 才表示未运行**。 */
   readonly runs: readonly EnvironmentRun[]
+  /**
+   * 运行实例是不是**确定**的事实（缺省等价 true）。
+   *
+   * 与 unknownFields / bundlesKnown **不是一个来源**：那两个来自环境自己的 package.json
+   * （同一份 manifest），本字段来自**进程表读取**（/proc、ps 或 powershell CIM）—— 另一个源、
+   * 另一种失败方式。所以这一对单独存在是刻意的，**不要**并进 ManifestField：合并会让
+   * 「manifest 读不懂」与「进程事实读不到」共用一种表达，调用方就分不清该少说哪句话。
+   *
+   * `runs: []` 且 runsKnown === false 时**不代表「未运行」**，而是「我不知道」。
+   */
+  readonly runsKnown?: boolean
+  /** 进程事实读不到的原因（面向用户）；可读时为 undefined。 */
+  readonly runsUnknownReason?: string
 }
 
 /** 一个运行中的环境实例。 */
@@ -244,6 +257,29 @@ export interface EnvironmentResult {
  */
 export type MarketItemKind = 'cordis-plugin' | 'skill' | 'agent-preset' | 'unknown'
 
+/**
+ * 上游的可装性标记（索引 installable 字段，原样透传）。
+ *
+ * - `manual`：上游判定它不能走一键安装（724/13,998 条，其中 646 条确实没有 npm 包名）
+ * - `non-plugin`：上游判定它**不是插件**（1,018 条，样本里有 96,949★ 的蹭话题仓库）
+ *
+ * 只呈现上游结论：我们既不猜原因，也不在 host 侧过滤（过滤是展示决策，见 marketView.filterInstallable）。
+ */
+export type MarketInstallable = 'manual' | 'non-plugin'
+
+/**
+ * 上游静态扫描的风险等级（索引 risk_tier 字段）。
+ * 覆盖全部条目：safe 13,794 / caution 133 / risk 71。我们只展示，不折算、不重新分级。
+ */
+export type MarketRiskTier = 'safe' | 'caution' | 'risk'
+
+/** 一条上游风险明细（索引 risk_flags 的元素）：原样展示 id + severity + 类别，不翻译成我们的结论。 */
+export interface MarketRiskFlag {
+  readonly id: string
+  readonly severity: string
+  readonly category: string
+}
+
 /** 一条市场条目（host 聚合后交给 client 渲染）。 */
 export interface MarketItem {
   /** owner/repo。 */
@@ -276,6 +312,36 @@ export interface MarketItem {
    * 索引字段变了只改那一个函数。契约上可选：老载荷没有这个字段时客户端不会瞎猜（见 shared.ts）。
    */
   readonly installSpec?: string
+  /**
+   * 上游可装性标记（installable）。缺省 = 上游没有标记（12,256 条），不代表"可一键安装"。
+   */
+  readonly installable?: MarketInstallable
+  /**
+   * 上游风险等级（risk_tier）。可选：老载荷没有这个字段时**不显示风险徽标**，
+   * 而不是默认成 safe——"没扫过"与"扫过是安全"是两回事。
+   */
+  readonly riskTier?: MarketRiskTier
+  /** 上游风险明细（risk_flags），仅详情展示（卡片只放结论 riskTier）。 */
+  readonly riskFlags?: readonly MarketRiskFlag[]
+  /** 上游独立验证报告外链（reportUrl）；与 verdict/verifiedBy/verifiedAt 同属一个证据簇。 */
+  readonly reportUrl?: string
+  /** 上游收录标记（market_tags）：community-pick 是编辑推荐，verified-install 是另一套收录标记。 */
+  readonly marketTags?: readonly string[]
+  /** 仓库是否已归档（archived）。 */
+  readonly archived?: boolean
+  /** 近 7 天 star 增量（stars_delta_7d）；只用于"热度"排序，不做徽标（60% 为 0）。 */
+  readonly starsDelta7d?: number
+  /** 仓库许可证（SPDX id；88% 有值、其中 78.8% 是 MIT）——按政策进详情，不做徽标。 */
+  readonly license?: string
+  /**
+   * 独立校验证据：verdict=pass 时上游给出"谁在何时验的"。
+   *
+   * 必须与 verified-install 收录标记**分开呈现**：两者交集只有 2 条（政策 §2.2），
+   * 合并成一个"已验证"会让同一插件在两个徽标上自相矛盾。
+   */
+  readonly verifiedBy?: string
+  /** 独立校验时间（ISO 日期）。 */
+  readonly verifiedAt?: string
 }
 
 /** 市场查询结果。 */

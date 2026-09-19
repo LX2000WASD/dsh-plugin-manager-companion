@@ -846,6 +846,23 @@ test('W-04/W-05: 读取器不再把失败折叠成空表，且没有 -match 预�
   assert.match(source, /Get-CimInstance Win32_Process/, '进程表查询本身还在')
 })
 
+test('P-58b: 环境列表区分「确定没有实例」与「进程事实读不到」（另一来源，单独成对）', async () => {
+  makeEnv('listdemo')
+  const known = env.listEnvironments(undefined, { facts: env.processFactsNow({ reader: () => [] }) })
+  const knownItem = known.find((item) => item.name === 'listdemo')
+  assert.equal(knownItem.runs.length, 0)
+  assert.notEqual(knownItem.runsKnown, false, '可读时不得标成未知（缺省等价 true）')
+
+  const facts = await withPlatformAsync('win32', () => env.processFacts({ fresh: true }))
+  assert.equal(facts.readable, false)
+  const unknown = env.listEnvironments(undefined, { facts })
+  const unknownItem = unknown.find((item) => item.name === 'listdemo')
+  assert.equal(unknownItem.runsKnown, false, '读不到必须标成未知，而不是让 runs: [] 冒充「未运行」')
+  assert.match(String(unknownItem.runsUnknownReason), /powershell/)
+  assert.equal(unknownItem.runs.length, 0)
+  assert.equal(unknownItem.unknownFields, undefined, '进程事实不可读不应污染 manifest 的 unknownFields（两个来源）')
+})
+
 test('W-12: 权限说辞如实（Linux 0600 / Windows 依赖目录 ACL），不再宣称 0600 是保证', () => {
   const source = readFileSync(new URL('../dist/envManager.js', import.meta.url), 'utf8')
   assert.match(source, /Windows：权限位\*\*不生效\*\*|权限位不生效/, '要写明 Windows 上权限位不生效')

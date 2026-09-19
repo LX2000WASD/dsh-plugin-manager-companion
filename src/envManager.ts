@@ -669,6 +669,8 @@ export function currentEnvironment(ctx?: Context): string | null {
 export interface ListEnvironmentsOptions extends CurrentEnvironmentOptions {
   /** 复用的进程扫描结果；省略时走 scanRuns 的缓存扫描。 */
   readonly runs?: ReadonlyMap<string, readonly EnvironmentRun[]>
+  /** 复用的进程事实（带可读性）；省略时自行读取。 */
+  readonly facts?: ProcessFacts
 }
 
 /**
@@ -682,7 +684,10 @@ export function listEnvironments(ctx?: Context, options: ListEnvironmentsOptions
   const current = options.current !== undefined
     ? options.current
     : currentEnvironmentName(ctx ?? options.ctx, options.capabilities)
-  const runs = options.runs ?? scanRuns()
+  // 进程事实与 manifest 是两个来源（见 types.ts 的注释）：可读性要一并带出去，
+  // 否则界面会把「读不到」渲染成「未运行」——那正是审计 W-19 的形态。
+  const facts: ProcessFacts = options.facts
+    ?? (options.runs === undefined ? processFacts() : { runs: options.runs, readable: true })
   const out: EnvironmentInfo[] = []
   let entries: string[]
   try {
@@ -713,7 +718,12 @@ export function listEnvironments(ctx?: Context, options: ListEnvironmentsOptions
         bundlesKnown: !manifest.unknownFields.includes('bundles'),
       }),
       dependencies: manifest.dependencies,
-      runs: runs.get(name) ?? [],
+      runs: runsForName(facts.runs, name),
+      // 进程事实读不到时**不能**让调用方把空数组当「未运行」：把未知如实带出去。
+      ...(facts.readable ? {} : {
+        runsKnown: false,
+        ...(facts.reason === undefined ? {} : { runsUnknownReason: facts.reason }),
+      }),
     })
   }
   return out.sort((left, right) => left.name.localeCompare(right.name))
