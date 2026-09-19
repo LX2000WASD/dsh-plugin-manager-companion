@@ -144,14 +144,14 @@ function removalFailureText(code: string | undefined): string {
 function rollbackState(dir: string | null, name: string): { lines: string[]; clean: boolean } {
   if (dir === null || !existsSync(join(dir, 'package.json'))) {
     return {
-      lines: ['没能核对回滚结果：读不到这个环境的清单文件。'],
+      lines: ['没能核对回滚结果：读不到这个环境的清单文件'],
       clean: false,
     }
   }
   const manifest = readEnvironmentManifest(dir)
   if (manifest.broken !== undefined) {
     return {
-      lines: ['没能核对回滚结果：环境的清单文件读不懂。'],
+      lines: ['没能核对回滚结果：环境的清单文件读不懂'],
       clean: false,
     }
   }
@@ -159,8 +159,8 @@ function rollbackState(dir: string | null, name: string): { lines: string[]; cle
   const layered = manifest.bundles.includes(name)
   // 依赖声明与层栈是**两件事**，各自说各自的状态（旧版把两者拼进一行，读起来是一句长定语）。
   const lines: string[] = []
-  if (declared) lines.push('依赖声明还在。')
-  if (layered) lines.push('它仍在环境启动时加载的列表里。')
+  if (declared) lines.push('依赖声明还在')
+  if (layered) lines.push('它仍在环境启动时加载的列表里')
   const entry = join(dir, 'node_modules', name)
   let leftover = false
   try {
@@ -168,12 +168,12 @@ function rollbackState(dir: string | null, name: string): { lines: string[]; cle
     leftover = true
     // 路径安装留下的链接：说清"文件还在、且我们不会替你删"，但不把目录名与箭头当句子主体。
     lines.push(stat.isSymbolicLink()
-      ? '安装目录里还留着指向本地来源的链接（本次安装的残留），需要时可以手动删除。'
-      : '安装目录里还留着它的文件（本次安装的残留），需要时可以手动删除。')
+      ? '安装目录里还留着指向本地来源的链接（本次安装的残留），需要时可以手动删除'
+      : '安装目录里还留着它的文件（本次安装的残留），需要时可以手动删除')
   } catch {
     // lstat 失败 = 没有残留，这是正常路径。
   }
-  if (lines.length === 0) lines.push('依赖声明与加载列表都已回到原状，也没有留下安装残留。')
+  if (lines.length === 0) lines.push('依赖声明与加载列表都已回到原状，也没有留下安装残留')
   return { lines, clean: !declared && !layered && !leftover }
 }
 
@@ -319,7 +319,7 @@ async function runTrialStep(
   }
   const realName = currentEnvironmentName(ctx) ?? runtime?.capabilities.environmentName ?? ""
   if (realName.length === 0) {
-    return cannotTrial("读不到当前是哪个环境，无法确定候选包会落进哪里，也就没有可以对照的快照源。")
+    return cannotTrial("读不到当前是哪个环境，无法确定候选包会落进哪里，也就没有可以对照的快照源")
   }
   if (targetName.length > 0 && !sameEnvironment(targetName, realName)) {
     return cannotTrial("这次安装的目标是 " + targetName + "，但官方安装通道只作用于当前环境 " + realName
@@ -354,10 +354,10 @@ async function runTrialStep(
     // 而端口冲突下这两句都不成立（真机实测：GUI 占着 3080，验证启动必然撞上它）。
     conclusion = "cannot-trial"
     output = trialNarrative(result, [
-      "无法试装：验证启动绑不上端口（" + baselineConflict + " 已被占用）。",
+      "无法试装：验证启动绑不上端口（" + baselineConflict + " 已被占用）",
       "这不是候选包的问题，也不是环境坏了：含 web app 的环境在验证启动时（不给任务、不指定端口）"
         + "会去绑它自己的默认端口，而那个端口正被别的进程占着。占用者是谁需要你自己确认；"
-        + "端口空出来之后，这次验证才有意义。",
+        + "端口空出来之后，这次验证才有意义",
     ])
   } else if (baselineUndetermined) {
     // 基线"判不出来"这一支同样替换：引擎会说"快照基线本身就起不来"，但那句话没被任何事实支持
@@ -366,7 +366,7 @@ async function runTrialStep(
     output = trialNarrative(result, [
       "无法试装：验证启动没有给出判定——它既没挂载成功，也没报挂载失败"
         + (result.baseline !== null && result.baseline.kind === "undetermined" ? "（" + result.baseline.reason + "）" : "") + "。",
-      "这是验证形态给不出结论，不是候选包的问题，也不是环境坏了。",
+      "这是验证形态给不出结论，不是候选包的问题，也不是环境坏了",
     ])
   }
   // 候选启动失败时的端口冲突是**有歧义**的（可能是候选包自己要绑那个端口），
@@ -374,7 +374,7 @@ async function runTrialStep(
   const candidateConflict = bootPortConflict(result.candidate)
   if (candidateConflict !== null) {
     output += "\n注意：候选启动的失败形态是端口冲突（" + candidateConflict + " 已被占用）："
-      + "可能是候选包自己要绑这个端口，也可能是与环境里已有进程冲突，需要人工判断。"
+      + "可能是候选包自己要绑这个端口，也可能是与环境里已有进程冲突，需要人工判断"
   }
   const { policy, policyNote } = trialPolicyFor(trial, conclusion)
   const cleanupNote = await maybeAutoCleanupTrialEnvironments(config)
@@ -524,7 +524,7 @@ async function trialEnvironmentReport(config: CompanionConfig): Promise<TrialEnv
   const notes: string[] = []
   if (!listed.factsReadable) {
     notes.push("进程事实读不到（" + String(listed.reason ?? "原因未知") + "）：运行状态按未知处理，"
-      + "清理计划因此不会删任何东西（不在未知状态下动磁盘）。")
+      + "清理计划因此不会删任何东西（不在未知状态下动磁盘）")
   }
   const now = Date.now()
   const environments: TrialEnvironmentInfo[] = []
@@ -645,8 +645,8 @@ export async function gatedInstall(
     return {
       ok: false,
       output: [
-        '没有安装 ' + packageName + '：扫描没能完成。',
-        rollbackHeadline(removed) + '。',
+        '没有安装 ' + packageName + '：扫描没能完成',
+        rollbackHeadline(removed),
         '',
         '原因：' + (error instanceof Error ? error.message : String(error)),
         '',
@@ -664,8 +664,8 @@ export async function gatedInstall(
     return {
       ok: false,
       output: [
-        '没有安装 ' + packageName + '：质量检查未通过。',
-        rollbackHeadline(removed) + '。',
+        '没有安装 ' + packageName + '：质量检查未通过',
+        rollbackHeadline(removed),
         '',
         '发现的问题：',
         ...gate.issues.map(i => "  - " + i),
@@ -690,8 +690,8 @@ export async function gatedInstall(
     return {
       ok: false,
       output: [
-        '没有安装 ' + packageName + '：' + TRIAL_LABEL[trial.conclusion] + '。',
-        rollbackHeadline(removed) + '。',
+        '没有安装 ' + packageName + '：' + TRIAL_LABEL[trial.conclusion],
+        rollbackHeadline(removed),
         '',
         trial.output,
         '',

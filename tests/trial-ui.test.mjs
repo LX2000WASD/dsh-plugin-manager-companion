@@ -115,7 +115,7 @@ describe('试装设置页（task-52）：披露来自 host、未知如实、warn
       okBoot.face.loadTrial()
       await until(() => okBoot.face.hooks.trial.getSnapshot().report !== undefined, '空列表落状态')
       const html = renderSettings(okBoot.entry, okBoot.face, okBoot.t)
-      assert.ok(html.includes('没有测试环境。'), '空列表要如实说')
+      assert.ok(html.includes('没有测试环境'), '空列表要如实说')
     } finally {
       okStub.restore()
     }
@@ -130,7 +130,7 @@ describe('试装设置页（task-52）：披露来自 host、未知如实、warn
       await until(() => badBoot.face.hooks.trial.getSnapshot().error !== undefined, '读失败落状态')
       const html = renderSettings(badBoot.entry, badBoot.face, badBoot.t)
       assert.ok(html.includes('读取测试环境失败：op 挂了'), '失败要如实说：' + html.slice(0, 400))
-      assert.ok(!html.includes('没有测试环境。'), '读失败不得渲染成空列表')
+      assert.ok(!html.includes('没有测试环境'), '读失败不得渲染成空列表')
     } finally {
       badStub.restore()
     }
@@ -185,12 +185,12 @@ describe('试装设置页（task-52）：披露来自 host、未知如实、warn
       }
     }
     const two = await run({ ok: true, output: '删了 2 个', removed: ['a-dpmc', 'b-dpmc'] })
-    assert.ok(two.includes('已删除 2 个测试环境。'), '删了几个要说数字')
+    assert.ok(two.includes('已删除 2 个测试环境'), '删了几个要说数字')
     const none = await run({ ok: true, output: '无事可做', removed: [] })
-    assert.ok(none.includes('没有需要清理的测试环境。'), '什么都没删也要说')
+    assert.ok(none.includes('没有需要清理的测试环境'), '什么都没删也要说')
     const failed = await run({ ok: false, code: 'locked', output: '删不掉：正在运行' })
     assert.ok(failed.includes('删不掉：正在运行'), '失败要说原因')
-    assert.ok(!failed.includes('已删除 0 个测试环境。'), '失败不得渲染成完成')
+    assert.ok(!failed.includes('已删除 0 个测试环境'), '失败不得渲染成完成')
   })
 
   it('市场页安装结果：warn 放行的成功路径必须说出「未通过」', async () => {
@@ -217,7 +217,7 @@ describe('试装设置页（task-52）：披露来自 host、未知如实、warn
       await until(() => face.hooks.marketplace.getSnapshot().trial !== undefined, '试装结论落状态')
       const html = renderToStaticMarkup(React.createElement(entry.component, propsFor(face, t, {}, entry)))
       assert.ok(html.includes('未通过，按警告模式放行'), '成功路径必须说未通过：' + html.slice(0, 600))
-      assert.ok(html.includes('放行不等于通过：这次安装没有通过验证。'), '关键那句必须在')
+      assert.ok(html.includes('放行不等于通过：这次安装没有通过验证'), '关键那句必须在')
       assert.ok(html.includes('候选包导致挂载失败'), '结论要说出来')
     } finally {
       stub.restore()
@@ -251,10 +251,10 @@ describe('试装设置页（task-52）：披露来自 host、未知如实、warn
     assert.ok(blocked.includes('候选包导致挂载失败'), 'blocked 要说结论（不是一句泛化错误）')
     const skipped = await run({ conclusion: 'cannot-trial', policy: 'skipped', policyNote: '质量门关闭', output: 'x' })
     assert.ok(skipped.includes('这次没有执行试装'), 'skipped 要有处置标签')
-    assert.ok(skipped.includes('按设置或豁免名单跳过了试装。'), 'skipped 不静默')
+    assert.ok(skipped.includes('按设置或豁免名单跳过了试装'), 'skipped 不静默')
     const cannot = await run({ conclusion: 'cannot-trial', policy: 'blocked', policyNote: '无法试装', output: 'x' })
     assert.ok(cannot.includes('无法试装：这次没有完成验证'), 'cannot-trial 要说"没验证"')
-    assert.ok(cannot.includes('这次没有完成验证，结论不是「通过」。'), '不能读成"验证失败"')
+    assert.ok(cannot.includes('这次没有完成验证，结论不是「通过」'), '不能读成"验证失败"')
     const weird = await run({ conclusion: 'brand-new-conclusion', policy: 'brand-new-policy', policyNote: '未知处置', output: 'x' })
     assert.ok(weird.includes('未识别：brand-new-conclusion'), '未知结论保留原始值')
     assert.ok(weird.includes('未识别：brand-new-policy'), '未知处置保留原始值')

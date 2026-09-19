@@ -183,7 +183,7 @@ describe('客户端渲染健壮性（残缺载荷不许变成空白页）', () =
       await until(() => face.hooks.marketplace.getSnapshot().result, '市场结果落到状态里')
       const { html, error } = renderSafely(reg.component, propsFor(face, t))
       assert.equal(error, undefined, '残缺索引不该让市场页抛异常')
-      assert.ok(html.includes('插件市场') && html.includes('没有匹配的条目。'), html.slice(0, 300))
+      assert.ok(html.includes('插件市场') && html.includes('没有匹配的条目'), html.slice(0, 300))
     } finally { empty.restore() }
 
     const bad = stubFetch({ marketplace: () => ({ ok: true, value: 'nonsense' }) })

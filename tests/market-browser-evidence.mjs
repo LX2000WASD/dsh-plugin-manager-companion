@@ -138,7 +138,7 @@ try {
     report.checks.marketText = text.slice(0, 600)
     report.checks.hasUnavailable = text.includes('插件索引不可用')
     report.checks.hasStale = text.includes('可能不是最新')
-    report.checks.hasUnavailableHint = text.includes('索引不可用，暂无条目。')
+    report.checks.hasUnavailableHint = text.includes('索引不可用，暂无条目')
     report.checks.hasRetry = text.includes('重试')
     // 两种索引异常态分开命名：都叫 market-index-dead.png 会互相覆盖（后一段把前一段的图顶掉，
     // 结果"不可用"那张截图只剩 json 里的文本，评审时看不到）。

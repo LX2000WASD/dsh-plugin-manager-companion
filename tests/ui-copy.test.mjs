@@ -151,7 +151,8 @@ const FORBIDDEN = [
 const GUIDE_ALLOWED = [
   {
     file: 'src/envManager.ts',
-    text: '请看刚打开的终端窗口里 dsh 的输出。',
+    // 文案随 §12.8 去掉了结尾句号（短文本）；「允许」的判据与理由都没变，只同步字面量。
+    text: '请看刚打开的终端窗口里 dsh 的输出',
     because: '目标是另一个窗口、本屏不可点，且是日志缺失分支唯一的信息来源（§12.3.2 判据不满足）',
   },
 ]
@@ -271,6 +272,186 @@ function hostUserStrings(file) {
 }
 
 /**
+ * 把一条语句里收集到的字面量切成**用户真正看到的那些行**。
+ *
+ * 两种写法在源码里长得像，渲染结果却不同：
+ *   · `'甲' + x + '乙。'`            → 一行（相邻字面量相接）
+ *   · `['甲', '乙。'].join('\n')`     → 两行（每个数组元素一行）
+ *
+ * 判据必须按后者切，否则同一数组里另一行的句号会把本行的 periodCount 顶上去，
+ * 短句就被误判成多句而放行（task-86 的 M6 变异正是从这个缝里溜过去的）。
+ *
+ * 切法：遇到 `.join(` 时，把已收集的字面量按**元素边界**分组——源码里两个相邻字面量之间
+ * 若隔着逗号（数组元素分隔）就断行；若只隔着 `+` 就同行。
+ *
+ * @param statement - 语句原文（已剥注释）。
+ * @param literals - 该语句里按顺序取到的字面量（动态部分已折叠为占位符）。
+ * @returns 逐行结果。
+ */
+function splitRenderedLines(statement, literals) {
+  if (!/\.join\(/.test(statement)) return [{ value: literals.join('') }]
+  // 按「字面量之间的分隔符」切：逗号 = 换元素 = 换行；加号/空白 = 同一行。
+  const groups = []
+  let current = ''
+  let cursor = 0
+  for (const match of statement.matchAll(/'([^']*)'|"([^"]*)"|`([^`]*)`/g)) {
+    const value = (match[1] ?? match[2] ?? match[3] ?? '').replace(/\\n/g, String.fromCharCode(10))
+    const between = statement.slice(cursor, match.index)
+    if (current !== '' && between.includes(',')) { groups.push(current); current = '' }
+    // 元素之间的动态部分（如 rollbackHeadline(removed)）也要占位，否则两段字面量会被接在一起，
+    // 拼出一个源码里不存在的句子（曾把 '没有安装 X：' 与 '。' 接成 '没有安装 X：。'）。
+    if (/[a-zA-Z_$]/.test(between.replace(/[+\s]/g, ''))) current += '[expr]'
+    current += value
+    cursor = match.index + match[0].length
+  }
+  if (current !== '') groups.push(current)
+  return groups.map(value => ({ value }))
+}
+
+/**
+ * 把 host 侧源码里**拼出来的那一行**还原出来：同一语句内的字面量按顺序相接，
+ * 动态部分（变量、表达式）折叠成一个占位符（它既不是中文也不是句号，不影响判据）。
+ *
+ * 为什么需要它（DESIGN §12.8 的「拼接片段」提醒）：host 侧文案大量写成
+ * `'甲' + x + '乙。'`。单看 `'乙。'` 是 9 个字的短句，但用户看到的整行可能是 60 字的多句说明——
+ * 句号在那里是**分隔符**，按字面量机械判会把它误删。判据是「用户看到的那一行」。
+ *
+ * 语句切分用分号与闭合括号：足以覆盖本仓库的写法（一行一条 push / 一个 return）。
+ * 取不到语句边界时退化为单行，此时行为与逐字面量判一致——不会漏判，只会更保守。
+ *
+ * @param file - 源文件相对路径。
+ * @returns 拼出来的行（行号 + 内容），只保留含中文的。
+ */
+/**
+ * host 侧 P1 的检查单位：**用户会看到的那一行**。
+ *
+ * 为什么不能逐字面量判：host 侧文案大量写成
+ *   `'这个进程不是以某个环境启动的，'` +
+ *   `  '所以无法定位该环境的安装位置，跨环境的包操作做不了。'`
+ * 单看第二段是 26 字的短句，但拼出来是 42 字的一句话——§12.8 要求**保留**句号。
+ * 逐字面量判会把这些分隔句号误删（判据退化成「不许有句号」）。
+ *
+ * 也不能按「语句」判：一条语句里往往有多个分支与数组元素，全接起来会拼出源码里并不存在的
+ * 长串，短句反而被误判成多句而放行。
+ *
+ * 所以按**拼接链**判：只用 `+` 相连的部分算一行；遇到顶层逗号（数组/参数分隔）或三元
+ * `?`/`:`（互斥分支，只会渲染其中一个）就断开。动态部分折叠成 `[expr]` 占位符——
+ * 它既不是中文也不含句号，不影响长度与句号计数，但能让 `'甲' + x + '。'` 的收尾句号
+ * 落进同一条链里被看见（task-86 的 M6c/M6d 变异正是从这个缝里溜过去的）。
+ */
+
+/**
+ * 收集 host 侧源码里**用户可见的那些行**（拼接链粒度）。
+ * @param file - 源文件相对路径。
+ * @returns 行条目（行号 + 拼出来的内容）。
+ */
+function hostUserLines(file) {
+  const raw = readFileSync(file, 'utf8').split('\n')
+  // 先剥注释（注释里合法地写着 dsh.profile.bundles / reconcile 这些词，那是给维护者看的）。
+  const code = []
+  let inBlock = false
+  raw.forEach((line) => {
+    let s = line
+    if (inBlock) { const end = s.indexOf('*/'); if (end < 0) { code.push(''); return } s = s.slice(end + 2); inBlock = false }
+    for (;;) {
+      const start = s.indexOf('/*')
+      if (start < 0) break
+      const end = s.indexOf('*/', start + 2)
+      if (end < 0) { s = s.slice(0, start); inBlock = true; break }
+      s = s.slice(0, start) + s.slice(end + 2)
+    }
+    const comment = s.indexOf('//')
+    if (comment >= 0) s = s.slice(0, comment)
+    code.push(s)
+  })
+  // 所有字面量（含位置），以及它们在整份源码里的全局偏移。
+  const hits = []
+  const offsets = []
+  let base = 0
+  code.forEach((line, index) => {
+    offsets.push(base)
+    base += line.length + 1
+    for (const match of line.matchAll(/'([^']*)'|"([^"]*)"|`([^`]*)`/g)) {
+      hits.push({
+        line: index + 1,
+        value: (match[1] ?? match[2] ?? match[3] ?? '').replace(/\\n/g, String.fromCharCode(10)),
+        start: offsets[index] + match.index,
+        end: offsets[index] + match.index + match[0].length,
+      })
+    }
+  })
+  const whole = code.join('\n')
+  const out = []
+  let i = 0
+  while (i < hits.length) {
+    let j = i
+    while (j + 1 < hits.length && !breaksLine(whole.slice(hits[j].end, hits[j + 1].start))) j += 1
+    let joined = ''
+    for (let k = i; k <= j; k += 1) {
+      if (k > i) joined += '[expr]'
+      joined += hits[k].value
+    }
+    // 保留条件：含中文，**或**含句号/点。
+    // 后者不能少：`rollbackHeadline(removed) + '。'` 这条链里唯一的字面量就是那个 '。'，
+    // 不含中文——只按中文过滤会把它整条丢掉，短句于是带着句号留在界面上
+    // （task-86 的 M6d 变异正是从这个缝里溜过去的）。
+    // 含中文的链一律收；此外只收**以中文句号结尾**的链（`[expr]。`）。
+    // 不能放宽到「含任意点」：`split('.')` / `startsWith('.')` 里的那个点是在做字符匹配，
+    // 不是标点——收进来会变成纯噪声（判据退化成「不许出现点」）。
+    if (/[\u4e00-\u9fff]/.test(joined) || /。$/.test(joined)) out.push({ line: hits[i].line, value: joined })
+    i = j + 1
+  }
+  return out
+}
+
+/**
+ * 两个字面量之间的源码片段是否**断开**它们（不在同一渲染行）。
+ * @param between - 两字面量之间的源码。
+ * @returns 断开返回 true。
+ */
+function breaksLine(between) {
+  // 语句/块边界一律断开：两个字面量之间出现 `;` 或 `}`，说明它们分属不同语句或不同分支
+  // （`if (a) notes.push('甲')\n if (b) notes.push('乙')` 就是这种——曾把两条独立的提示接成一句）。
+  // 这段区间里只有代码（字符串内容本身已是字面量），所以 `;` / `}` 一定是真边界。
+  if (/[;}]/.test(between)) return true
+  let depth = 0
+  for (let i = 0; i < between.length; i += 1) {
+    const ch = between[i]
+    if (ch === '(' || ch === '[' || ch === '{') { depth += 1; continue }
+    if (ch === ')' || ch === ']') { depth -= 1; continue }
+    if (depth !== 0) continue
+    // 顶层逗号 = 数组元素/参数分隔 → 两行；顶层 ? : = 互斥分支 → 只会渲染其中一个。
+    if (ch === ',') return true
+    if (ch === '?' && between[i + 1] !== '.' && between[i + 1] !== '?') return true
+    if (ch === ':' && between[i + 1] !== ':') return true
+    // 换行后另起一行、且不是续接（`+` / `)` / `]` / `,` / `.`）也算断开。
+    if (ch === '\n') {
+      const rest = between.slice(i + 1)
+      if (rest.trim() !== '' && !/^\s*[+)\].,]/.test(rest)) return true
+    }
+  }
+  return false
+}
+
+/**
+ * 孤句号字面量的**显式登记**：`'甲' + expr + '。'` 这种写法里，收尾句号单独成一个字面量。
+ *
+ * 为什么需要登记而不是自动放行：静态判不出那个 expr 渲染出来有多长——它可能是 9 个字的短句，
+ * 也可能是 60 字的多句说明。所以必须人来裁定并写下理由；**没登记就是失败**，
+ * 宁可要人看一眼，也不让「无法判定」静默变成「没问题」。
+ *
+ * 每项写清：在哪个文件哪一行、补的是哪一段、为什么它属于 §12.8 允许保留的那两类。
+ */
+const PERIOD_APPEND_ALLOWED = [
+  {
+    file: 'src/index.ts',
+    line: 368,
+    because: '补的是「无法试装：验证启动没有给出判定——它既没挂载成功，也没报挂载失败（原因）」'
+      + '这一整段多句说明的收尾（§12.8「两句话的说明」：句号在这里是分隔符）',
+  },
+]
+
+/**
  * host 侧禁止词表（DESIGN §12.6）。每条都写 why 与 source，理由同 §12.4：
  * 后来人要知道它为什么被禁，而不是把它当成一条凭空的洁癖。
  *
@@ -306,6 +487,56 @@ const HOST_FORBIDDEN = [
   { id: 'host·一句堆三个状态', re: /^(?=[^\n]*：[^\n]*：)(?=[^\n]*，)/m,
     why: '三个状态短语用逗号硬拼成一行（结论＋回滚状态＋包名），读者要自己拆句子才知道发生了什么；应当分层：第一行给结论与后果，细节降到下面',
     source: '第三轮反馈 2026-09-19 实拍原文：安装失败：无法试装（不算通过），回滚失败（not-removable）dsh-probe-block：…' },
+]
+
+// ── 规则 P1：短文本结尾不得有句号（DESIGN §12.8，第四次反馈 2026-09-19）──────────
+
+/**
+ * 判据（照 §12.8 表格第一行，逐字实现）：**单句、无换行、≤40 字、整条只有一个句号** → 去句号。
+ *
+ * 为什么长度阈值分中英两档：中英的字数不是一个量纲。中文 40 字已经把一句话说完；
+ * 英文 40 个字符往往只是半句。阈值不是拍的——实测本仓库英文语料的分带句号占比：
+ *   0–40 字符 5% ｜ 41–60 字符 36% ｜ 61–80 字符 83% ｜ 81–100 字符 100%
+ * 规范在 60 附近翻转（≤60 里 93% 不带句号），所以英文取 60。中文侧 ≤40 字里 86% 不带句号，
+ * 与 §12.8 写的 40 一致。两档都来自**现有语料的多数派**，不是新立的规矩。
+ */
+const SHORT_MAX_ZH = 40
+const SHORT_MAX_EN = 60
+
+/** 句号计数：中文 。 与英文句末 .（后面是空白或串尾，排除 3.5 / e.g. 这类串内点）。 */
+function periodCount(value) {
+  return (value.match(/。/g) ?? []).length + (value.match(/\.(?=\s|$)/g) ?? []).length
+}
+
+/**
+ * §12.8 的判定：这条文案是不是「短文本」。
+ * @param value - 文案原文。
+ * @returns 是否短文本（短文本**不得**以句号结尾）。
+ */
+function isShortCopy(value) {
+  const limit = /[\u4e00-\u9fff]/.test(value) ? SHORT_MAX_ZH : SHORT_MAX_EN
+  if (/\n/.test(value)) return false
+  if ([...value].length > limit) return false
+  return periodCount(value) === 1
+}
+
+/**
+ * §12.8 的边界：这些键**刻意保留**句号（长文本/多句），是 P1 的永久正例。
+ * 清单显式写出来，是为了让「规则有没有退化成一刀切」可被当场验证。
+ */
+/**
+ * §12.8「边界」**显式点名**的例外：机械判据说它是短文本，但标准明文要求保留句号。
+ * 目前只有一条。它的存在被单独断言（见 P1 正例用例③），所以它不是「悄悄豁免」。
+ */
+const PERIOD_KEPT_EXPLICIT = ['health.scoreHint']
+
+const PERIOD_KEPT = [
+  'env.removeDesc',        // 两句话：句号是分隔符，删了会粘成一句
+  'env.restoreWarnDesc',   // 一句长说明（56 字 / 160 字符）
+  'config.marketplace.indexUrlHint', // 一句长说明（42 字 / 143 字符）
+  'config.trial.baselineHint',       // 一句长说明（48 字 / 172 字符）
+  'kinds.uninstallDesc',   // 两句话
+  'health.scoreHint',      // §12.8 边界点名的「带分号的长说明」，刻意保留
 ]
 
 describe('UI 文案标准（DESIGN §12）', () => {
@@ -438,7 +669,7 @@ describe('UI 文案标准（DESIGN §12）', () => {
     assert.ok(rule !== undefined, '指路式引导规则（规则5）不见了')
     // 清单必须显式且恰好是这些项：删条目、加条目都要回到 §12.3.2 判据重新裁定，
     // 不能靠动清单让测试变绿（task-79 的变异验证打的就是这一条）。
-    assert.deepEqual(GUIDE_ALLOWED.map(item => item.text), ['请看刚打开的终端窗口里 dsh 的输出。'],
+    assert.deepEqual(GUIDE_ALLOWED.map(item => item.text), ['请看刚打开的终端窗口里 dsh 的输出'],
       '允许项清单被改动：任何增删都要重新裁定，不能靠删条目让护栏变绿')
     for (const item of GUIDE_ALLOWED) {
       // ① 允许项必须仍在源文件里：它被删/改写时，这里先红，逼人来重新裁定（而不是悄悄消失）
@@ -697,6 +928,106 @@ describe('UI 文案标准（DESIGN §12）', () => {
       else process.env.DSH_HOME = originalHome
       rm(home, { recursive: true, force: true })
     }
+  })
+
+  // ── 规则 P1：短文本不用句号（DESIGN §12.8，第四次反馈 2026-09-19）─────────────
+
+  it('P1：客户端字典（zh + en）的短文本一律不以句号结尾', () => {
+    const dict = dictionaries()
+    const hits = []
+    for (const lang of ['zh', 'en']) {
+      for (const [key, value] of Object.entries(dict[lang])) {
+        if (typeof value !== 'string') continue
+        // 只跳过 §12.8「边界」**点名**的那一条（health.scoreHint：长度像短句，但标准明文要求保留）。
+        // 其余保留项（长文本/多句）不跳过——它们本来就该被机械判据放行；一旦被人改短，
+        // 这条护栏就会当场红，而不是靠一份豁免清单兜着。
+        if (PERIOD_KEPT_EXPLICIT.includes(key)) continue
+        if (!isShortCopy(value)) continue
+        if (!/[。.]$/.test(value)) continue
+        hits.push(lang + ' ' + key + ' :: ' + JSON.stringify(value))
+      }
+    }
+    assert.deepEqual(hits, [], '短文本不该以句号结尾（DESIGN §12.8）：' + String.fromCharCode(10) + hits.join(String.fromCharCode(10)))
+  })
+
+  it('P1：host 侧用户可见文案的短句同样不以句号结尾（判「用户看到的那一行」）', () => {
+    // 判据单位是拼接链（见 hostUserLines 的头注释）：只用 `+` 相连的算一行，
+    // 遇到数组元素/互斥分支就断开。这样 `'甲，' + '乙。'` 会被当成一句长话（句号保留），
+    // 而 `'甲' + x + '。'` 的收尾句号也落进同一行被看见（不会因为那个字面量不含中文而漏掉）。
+    const hits = []
+    for (const file of HOST_SOURCES) {
+      for (const entry of hostUserLines(file)) {
+        if (!isShortCopy(entry.value)) continue
+        if (!/[。.]$/.test(entry.value)) continue
+        // 孤句号写法（`'甲' + expr + '。'`）静态判不出整行多长，只能靠显式登记放行。
+        if (PERIOD_APPEND_ALLOWED.some(item => item.file === file && item.line === entry.line)) continue
+        hits.push(file + ':' + entry.line + ' :: ' + JSON.stringify(entry.value))
+      }
+    }
+    assert.deepEqual(hits, [], 'host 侧短句不该以句号结尾（DESIGN §12.8）：' + String.fromCharCode(10) + hits.join(String.fromCharCode(10)))
+  })
+
+  it('P1：孤句号登记表必须逐条仍然成立（不能靠它静默放行）', () => {
+    for (const item of PERIOD_APPEND_ALLOWED) {
+      const hit = hostUserLines(item.file).some(entry => entry.line === item.line && /。$/.test(entry.value))
+      assert.ok(hit, '登记表里的 ' + item.file + ':' + item.line + ' 已经没有孤句号了，请删掉这条登记')
+      assert.ok(typeof item.because === 'string' && item.because.trim() !== '',
+        item.file + ':' + item.line + ' 没写保留理由（§12.8 要求说清为什么它是长文本/多句）')
+    }
+  })
+
+  it('P1：拼接链判据本身必须可靠（正反例各一，防止它退化成「逐字面量」）', () => {
+    // 用真实源码验证：host 侧确实存在「靠拼接才成句」的文案，
+    // 若判据退化成逐字面量，下面第一条会红。
+    const env = hostUserLines('src/envManager.ts')
+    // 反例面：单段 26 字的片段，拼出来超过 40 字 → 必须被判为「不是短文本」
+    const fragment = env.find(entry => entry.value.includes('跨环境的包操作做不了'))
+    assert.ok(fragment !== undefined, '拼接链没抓到 no-profile-context 那条（判据退化成逐字面量了？）')
+    assert.ok([...fragment.value].length > SHORT_MAX_ZH,
+      '拼接链应把两段接起来，实际长度 ' + String([...fragment.value].length) + '：' + JSON.stringify(fragment.value))
+    assert.ok(!isShortCopy(fragment.value), '拼出来的长句不该被判成短文本（否则句号会被误删）')
+    // 正例面：真正的短句必须仍被认出来（否则规则会空转）
+    assert.ok(isShortCopy('未发现任何环境。'), '真实短句没被认出来，规则会空转')
+  })
+
+  it('P1 的正例面：长文本/多句/点名的例外必须放行（否则规则退化成「不许有句号」）', () => {
+    const dict = dictionaries()
+    // §12.8 是**两层**标准：第一层是表格的机械判据（isShortCopy），第二层是「边界」点名的例外。
+    // 例外分两种，测试对它们的断言方式也不同——不能混成一句「都不许有句号」。
+    //
+    // ① 机械判据自然放行的（长文本 / 多句）：必须被判为「不是短文本」
+    const naturallyLong = PERIOD_KEPT.filter(key => key !== 'health.scoreHint')
+    for (const key of naturallyLong) {
+      for (const lang of ['zh', 'en']) {
+        const value = dict[lang][key]
+        assert.ok(typeof value === 'string' && value.length > 0, key + ' 的 ' + lang + ' 侧不见了')
+        assert.ok(!isShortCopy(value), key + '（' + lang + '）被判成了短文本，规则退化成一刀切：' + JSON.stringify(value))
+      }
+    }
+    // ② 逐条证明「为什么它被机械判据放行」（两种理由各自有实例，不是靠清单豁免）
+    assert.ok(periodCount(dict.zh['env.removeDesc']) >= 2, 'env.removeDesc 是「两句话」的实例，句号在这里是分隔符')
+    assert.ok(periodCount(dict.en['env.removeDesc']) >= 2, 'env.removeDesc（en）同样是两句话')
+    assert.ok([...dict.zh['config.marketplace.indexUrlHint']].length > SHORT_MAX_ZH,
+      'config.marketplace.indexUrlHint 是「超过 40 字」的实例')
+    assert.ok([...dict.en['config.marketplace.indexUrlHint']].length > SHORT_MAX_EN,
+      'config.marketplace.indexUrlHint（en）超过 60 字符')
+    // ③ §12.8「边界」点名的**显式例外**：health.scoreHint 长度像短句，但标准明文要求保留。
+    //    它是唯一一个「机械判据说该去、标准说要留」的条目，所以单独钉住：
+    //    断言它确实短（证明例外是真的在起作用，不是碰巧），且确实以句号结尾。
+    const score = dict.zh['health.scoreHint']
+    assert.ok(isShortCopy(score), 'health.scoreHint 应当**是**短文本——否则它就不是「点名的例外」，这条断言失去意义')
+    assert.match(score, /；/, 'health.scoreHint 靠分号承载长说明，这是 §12.8 保留它的理由')
+    assert.ok(/。$/.test(score), 'health.scoreHint 必须保留句号（§12.8 边界点名）')
+    assert.ok(PERIOD_KEPT.includes('health.scoreHint'), 'health.scoreHint 必须在显式例外清单里，否则上面的跳过就是隐式的')
+    // ③ 反例面：真实条目必须被拦下（`未发现任何环境。` 是用户实际看到的形态）
+    assert.ok(isShortCopy('未发现任何环境。'), '反例没被认成短文本，P1 会空转')
+    assert.ok(isShortCopy('No environments found.'), '英文反例没被认成短文本')
+    // ④ 边界：加长/加句/加换行都应让它不再是「短文本」
+    assert.ok(!isShortCopy('未发现任何环境'), '没句号的短文本不该被当成违规')
+    assert.ok(!isShortCopy('未发现任何环境。请检查配置。'), '两句不再是短文本')
+    assert.ok(!isShortCopy('未发现任何环境。' + String.fromCharCode(10) + '更多说明'), '含换行不再是短文本')
+    assert.ok(!isShortCopy('环'.repeat(41) + '。'), '超过 40 字不再是短文本')
+    assert.ok(!isShortCopy('x'.repeat(61) + '.'), '英文超过 60 字符不再是短文本')
   })
 
   it('每条 host 禁止项都写明了来源（哪次反馈 / 用户原文 / 日期）', () => {

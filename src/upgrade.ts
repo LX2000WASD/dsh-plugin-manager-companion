@@ -729,9 +729,9 @@ export async function checkUpgrades(options: UpgradeCheckOptions): Promise<Upgra
   }
 
   if (budgetExceeded) {
-    notes.push('本次检查在 ' + String(CHECK_BUDGET_MS) + 'ms 预算内没查完所有包：没查到的显示"查不到"，下次进入会接着查。')
+    notes.push('本次检查在 ' + String(CHECK_BUDGET_MS) + 'ms 预算内没查完所有包：没查到的显示"查不到"，下次进入会接着查')
   }
-  if (!upgrade.autoCheck) notes.push('自动检查已关闭：只有手动检查会出网。')
+  if (!upgrade.autoCheck) notes.push('自动检查已关闭：只有手动检查会出网')
   // 记账写回本环境那一格；其它环境的账原样保留（各记各的）。
   const environments = { ...cache.environments }
   if (lastCheckAt !== null || lastAttemptAt !== null) {
@@ -792,7 +792,7 @@ function officialContext(profile: string, dir: string, deps: UpgradeEngineDeps):
   const installAnchor = deps.installAnchor ?? context?.installAnchor
   if (installAnchor === undefined || installAnchor.length === 0) {
     throw new EnvironmentError('no-profile-context', '这个进程不是以某个环境启动的，'
-      + '所以无法定位该环境的安装位置，升级做不了。')
+      + '所以无法定位该环境的安装位置，升级做不了')
   }
   return { profile, dir, installAnchor, cwd: dir, home: context?.home ?? dshHome() }
 }
@@ -1038,7 +1038,7 @@ function activationFor(
       removedFirst = removal.exitCode === 0
       removeNote = removal.exitCode === 0
         ? '已先把 ' + String(args[1]) + ' 从测试环境移除，再重新安装（否则重复安装不会生效）'
-        : '移除旧版本没有成功（退出码 ' + String(removal.exitCode) + '），候选包可能仍是重复安装的状态。'
+        : '移除旧版本没有成功（退出码 ' + String(removal.exitCode) + '），候选包可能仍是重复安装的状态'
           + removal.output.trim().slice(-200)
       return removal
     }
@@ -1164,7 +1164,7 @@ export async function upgradePackage(input: UpgradeActionInput): Promise<Upgrade
       ? '通过（深度 ' + String(canary.depth ?? '—') + '，耗时 ' + String(canary.elapsedMs ?? 0) + 'ms）'
       : '未做（' + String(canary.skippedReason ?? '原因未知') + '）'),
     canary.cleanup,
-    isSelf ? '本插件自身：正在运行的是旧代码，新版本要等下次启动才生效。' : '生效时机：下次启动后加载。',
+    isSelf ? '本插件自身：正在运行的是旧代码，新版本要等下次启动才生效' : '生效时机：下次启动后加载',
     '',
     '升级前：',
     ...before.map((line) => '  ' + line),
@@ -1228,7 +1228,7 @@ export async function rollbackUpgrade(input: UpgradeActionInput): Promise<Upgrad
     '回滚后：',
     ...after.map((line) => '  ' + line),
   ]
-  if (!clean) lines.push('', '上面这份盘上事实就是现状：残留需要按它处理，界面不该说"环境未被改动"。')
+  if (!clean) lines.push('', '上面这份盘上事实就是现状：残留需要按它处理，界面不该说"环境未被改动"')
   invalidateTagsCache(name)
   return {
     ok: clean,

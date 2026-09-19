@@ -369,7 +369,7 @@ describe('环境子页与设置子页：控件唯一、归因准确、作用域�
       },
     })
     const html = renderTab(entry, face, t, 'settings')
-    assert.ok(html.includes('配置对所有环境生效。'), '设置子页要有一句作用域事实：' + html.slice(0, 300))
+    assert.ok(html.includes('配置对所有环境生效'), '设置子页要有一句作用域事实：' + html.slice(0, 300))
   })
 
   it('回滚文案是中性的，不替后端复述结论', () => {

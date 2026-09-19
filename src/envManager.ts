@@ -1083,7 +1083,7 @@ export async function startEnvironment(
   if (!existsSync(join(dir, 'package.json'))) return failure('not-found', '环境不存在：' + name)
   const facts = processFacts()
   // 不可读时**不**假装「没在运行」：照常允许启动（启动不是破坏性操作），但把事实如实带出去。
-  const factsNote = facts.readable ? '' : '\n注意：进程表不可读（' + String(facts.reason) + '），本次未做重复实例检查。'
+  const factsNote = facts.readable ? '' : '\n注意：进程表不可读（' + String(facts.reason) + '），本次未做重复实例检查'
   const running = runsForName(facts.runs, name)
   if (running.length > 0) {
     const ports = running.map((run) => run.port).filter((port): port is number => port !== null)
@@ -1121,7 +1121,7 @@ export async function startEnvironment(
       const retrySpec = backgroundSpec({ ...spec, mode: 'background' })
       const fallback = await (options.launch ?? defaultLaunch)(retrySpec)
       retryNote = '\n终端窗口尝试 ' + String(options.readyTimeoutMs ?? START_READY_TIMEOUT_MS)
-        + 'ms 未就绪，已改为后台启动重试。'
+        + 'ms 未就绪，已改为后台启动重试'
       if (!fallback.ok) return failure('launch-failed', fallback.detail + retryNote)
       outcome = fallback
       status = await waitForReady(port, options)
@@ -1154,7 +1154,7 @@ function noWebLayerMessage(name: string, layers: readonly string[]): string {
     + '  1. 在官方插件页给它启用 web 层（'
     + (suggestion.length === 0 ? '官方 web 模板里的 app 层' : suggestion.join(', ')) + '）；\n'
     + '  2. 用官方 web 模板重建一个环境。\n'
-    + '本次没有发起启动。'
+    + '本次没有发起启动'
 }
 
 /**
@@ -1188,7 +1188,7 @@ function startedMessage(
     lines.push('注意：http://127.0.0.1:' + String(port) + '/ 不带 token 会被官方 browser-auth 拒绝（401）。')
     lines.push(outcome.mode === 'terminal'
       ? '可用地址只在刚打开的终端窗口里由 dsh 打印（形如 dsh web: http://127.0.0.1:' + String(port) + '/?token=...），请从那里复制。'
-      : '官方输出里没有读到带 token 的地址，请查看日志。')
+      : '官方输出里没有读到带 token 的地址，请查看日志')
   }
   if (outcome.logPath !== undefined) lines.push('日志：' + outcome.logPath)
   lines.push('命令：' + spec.display)
@@ -1215,7 +1215,7 @@ function startTimeoutMessage(
     + 'ms 内端口 ' + String(port) + ' 没有给出官方 web 应答（就绪判据：GET / 返回 200/303/401）。'
     + (outcome.reason === undefined ? '' : '\n启动方式：' + (outcome.mode === 'terminal' ? '终端窗口' : '后台') + '（' + outcome.reason + '）')]
   if (outcome.logPath === undefined) {
-    lines.push('请看刚打开的终端窗口里 dsh 的输出。')
+    lines.push('请看刚打开的终端窗口里 dsh 的输出')
   } else {
     const tail = tailOfLog(outcome.logPath, 20)
     lines.push('日志：' + outcome.logPath)
@@ -2546,7 +2546,7 @@ export async function materializeSnapshot(
     } catch (error) {
       throw new EnvironmentError('snapshot-not-shallow',
         '试装环境里还留着上一次试装的依赖文件，这次删不掉（' + messageOf(error)
-        + '）：带着旧依赖验证会得出错误的结论，所以这次不做试装。')
+        + '）：带着旧依赖验证会得出错误的结论，所以这次不做试装')
     }
     if (existsSync(path)) {
       throw new EnvironmentError('snapshot-not-shallow',
@@ -3234,19 +3234,19 @@ async function detachCandidate(
 ): Promise<{ readonly removed: boolean; readonly note: string }> {
   const name = candidateName(spec)
   if (name === undefined) {
-    return { removed: false, note: '认不出候选包的包名，本次按直接安装处理。' }
+    return { removed: false, note: '认不出候选包的包名，本次按直接安装处理' }
   }
   if (trialDependencies(target).includes(name)) {
     const removal = await runPackageOperation(runner, context, ['remove', name], options)
     if (removal.exitCode === 0) {
-      return { removed: true, note: '已先把 ' + name + ' 从测试环境移除，再重新安装（否则重复安装不会生效）。' }
+      return { removed: true, note: '已先把 ' + name + ' 从测试环境移除，再重新安装（否则重复安装不会生效）' }
     }
     return {
       removed: false,
-      note: '移除旧版本没有成功（退出码 ' + String(removal.exitCode) + '），候选包可能仍是重复安装的状态。',
+      note: '移除旧版本没有成功（退出码 ' + String(removal.exitCode) + '），候选包可能仍是重复安装的状态',
     }
   }
-  return { removed: false, note: '候选包本来就不在测试环境里，直接安装即可。' }
+  return { removed: false, note: '候选包本来就不在测试环境里，直接安装即可' }
 }
 
 /**
@@ -3280,7 +3280,7 @@ function trialActivation(
   } catch (error) {
     return {
       ok: false,
-      detail: '读不到测试环境的 package.json（' + messageOf(error) + '）。',
+      detail: '读不到测试环境的 package.json（' + messageOf(error) + '）',
       fact: { name: candidate, bundles: [], activated: false, removedFirst: detached.removed, detachNote: detached.note },
     }
   }
@@ -3295,7 +3295,7 @@ function trialActivation(
   if (suspects.length === 0) {
     return {
       ok: false,
-      detail: '这次试装没有验证到任何东西：装完之后，测试环境里找不到候选包。',
+      detail: '这次试装没有验证到任何东西：装完之后，测试环境里找不到候选包',
       fact: fact(false),
     }
   }
@@ -3310,9 +3310,9 @@ function trialActivation(
     detail: '这次试装没有验证到新版本：候选包装上了，但环境的启动列表里没有它，'
       + '所以启动验证根本没有加载它。'
       + (stale
-        ? '原因：它本来就已经装在这个环境里，重复安装不会让它被重新加载。'
+        ? '原因：它本来就已经装在这个环境里，重复安装不会让它被重新加载'
           + (detached.removed ? '（本次已先把它移除，但仍没被重新加载。）' : '')
-        : '原因：它没有声明自己是一个组合包，所以不会被写进启动列表。'),
+        : '原因：它没有声明自己是一个组合包，所以不会被写进启动列表'),
     fact: fact(false),
   }
 }
@@ -3456,7 +3456,7 @@ export async function runTrialInstall(
   lines.push('源环境指纹：' + sourceFingerprint.hash + '（试装前）')
   if (changedDuringTrial) {
     lines.push('注意：试装期间 ' + realName + ' 的环境又变过（指纹 ' + sourceFingerprintAfter.hash
-      + '），这个结论可能不适用。')
+      + '），这个结论可能不适用')
   }
   lines.push('构建：' + describeBuild(build))
   return done(conclusion, lines.join('\n'), {
@@ -3477,13 +3477,13 @@ function describeBuild(build: BuildIdentity): string {
 function describeConclusion(conclusion: TrialConclusion, spec: string, target: string): string {
   switch (conclusion) {
     case 'passed':
-      return '试装通过：' + spec + ' 装进 ' + target + ' 后仍能正常挂载。'
+      return '试装通过：' + spec + ' 装进 ' + target + ' 后仍能正常挂载'
     case 'baseline-broken':
-      return '快照基线就起不来：这不是 ' + spec + ' 的问题。'
+      return '快照基线就起不来：这不是 ' + spec + ' 的问题'
     case 'candidate-broken':
-      return '候选包导致挂载失败：' + spec + ' 装进 ' + target + ' 之后树挂不起来。'
+      return '候选包导致挂载失败：' + spec + ' 装进 ' + target + ' 之后树挂不起来'
     default:
-      return '无法试装：这次没有得到有效判定（不等于通过）。'
+      return '无法试装：这次没有得到有效判定（不等于通过）'
   }
 }
 // ── 备份：导出 / 差异 / 恢复 ──────────────────────────────────────────────
