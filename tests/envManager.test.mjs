@@ -846,6 +846,73 @@ test('W-04/W-05: 读取器不再把失败折叠成空表，且没有 -match 预�
   assert.match(source, /Get-CimInstance Win32_Process/, '进程表查询本身还在')
 })
 
+// ── task-50 试装引擎（第一段：命名 / 指纹 / 三态判定 / 结论映射）──────────────
+test('试装环境命名与归属：<真实名>-dpmc，且只认这一个形态', () => {
+  assert.equal(env.trialEnvironmentName('web'), 'web-dpmc')
+  assert.equal(env.trialEnvironmentName('pm-test'), 'pm-test-dpmc')
+  assert.equal(env.isTrialEnvironmentName('web-dpmc'), true)
+  assert.equal(env.isTrialEnvironmentName('web'), false)
+  assert.equal(env.isTrialEnvironmentName('-dpmc'), false, '裸后缀没有归属，不算测试环境')
+  assert.equal(env.trialEnvironmentOwner('web-dpmc'), 'web')
+  assert.equal(env.trialEnvironmentOwner('web'), null)
+})
+
+test('指纹五元组全部读盘：任一文件变化都必须改变 hash，且标注层栈口径', async () => {
+  const dir = makeEnv('fp-src', { bundles: ['@deepseek-ai/dsh-base'] })
+  writeFileSync(join(dir, 'cordis.patch.yml'), '[]\n')
+  const first = await env.environmentFingerprint('fp-src')
+  assert.match(first.manifestHash, /^[0-9a-f]{16}$/)
+  assert.equal(first.lockfileHash, null, '没有 lockfile 就是 null（那是事实，不是空 hash）')
+  assert.match(first.patchHash, /^[0-9a-f]{16}$/)
+  assert.equal(first.bundlesSource, 'manifest', '没有官方 listBundles 时必须标成 manifest 口径')
+  assert.deepEqual([...first.bundles], ['@deepseek-ai/dsh-base'])
+
+  assert.equal(env.sameFingerprint(first, await env.environmentFingerprint('fp-src')), true)
+  makeEnv('fp-src', { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'] })
+  const afterManifest = await env.environmentFingerprint('fp-src')
+  assert.equal(env.sameFingerprint(first, afterManifest), false)
+  writeFileSync(join(dir, 'cordis.patch.yml'), '- insert: []\n')
+  const afterPatch = await env.environmentFingerprint('fp-src')
+  assert.equal(env.sameFingerprint(afterManifest, afterPatch), false, '用户手写的层最容易在终端里被改')
+  const official = await env.environmentFingerprint('fp-src', { listBundles: async () => ['a', 'b'] })
+  assert.equal(official.bundlesSource, 'official')
+  assert.deepEqual([...official.bundles], ['a', 'b'])
+  const failed = await env.environmentFingerprint('fp-src', { listBundles: async () => { throw new Error('offline') } })
+  assert.equal(failed.bundlesSource, 'manifest', '官方事实拿不到就如实退回 manifest 口径')
+})
+
+test('挂载判定读 stderr 特征：健康=缺任务那行；失败=plugin tree failed + cause 链；都不是=无法判定', () => {
+  const healthy = env.judgeBootStderr('dsh: a task is required, for example: dsh --profile headless "run the tests"\n')
+  assert.equal(healthy.kind, 'mounted', '健康环境 stderr 只有这一行，而退出码仍是 1')
+
+  const boom = [
+    'Error: dsh: plugin tree failed to load: failed to apply loader entry include (cordis:include): failed to apply loader entry t37-bad-b (dsh-t37-bad-b): t37-apply-boom',
+    'Error: t37-apply-boom',
+    '  [cause]: Error: failed to apply loader entry t37-bad-b (dsh-t37-bad-b): t37-apply-boom',
+  ].join('\n')
+  const failed = env.judgeBootStderr(boom)
+  assert.equal(failed.kind, 'failed')
+  assert.match(failed.reason, /plugin tree failed to load/)
+  assert.ok(failed.chain.some((line) => line.includes('t37-apply-boom')), '根因链必须带上')
+
+  assert.equal(env.judgeBootStderr('').kind, 'undetermined', '没有输出就是判不出来，不许当成成功')
+  assert.equal(env.judgeBootStderr('some unrelated output\n').kind, 'undetermined')
+})
+
+test('三种结论不许混：基线坏不赖候选包，无法试装不算通过', () => {
+  const ok = { kind: 'mounted' }
+  const bad = { kind: 'failed', reason: 'x', chain: [] }
+  const unknown = { kind: 'undetermined', reason: 'no output' }
+  assert.equal(env.judgeTrialOutcome(ok, ok), 'passed')
+  assert.equal(env.judgeTrialOutcome(bad, bad), 'baseline-broken', '基线就坏：不是候选包的问题')
+  assert.equal(env.judgeTrialOutcome(ok, bad), 'candidate-broken')
+  assert.equal(env.judgeTrialOutcome(unknown, ok), 'cannot-trial')
+  assert.equal(env.judgeTrialOutcome(ok, unknown), 'cannot-trial')
+  assert.equal(env.judgeTrialOutcome(ok, null), 'cannot-trial')
+  assert.equal(env.judgeTrialOutcome(null, null, '禁用联网且本地 store 没有该包'), 'cannot-trial')
+  assert.notEqual(env.judgeTrialOutcome(null, null, 'offline'), 'passed')
+})
+
 test('P-58b: 环境列表区分「确定没有实例」与「进程事实读不到」（另一来源，单独成对）', async () => {
   makeEnv('listdemo')
   const known = env.listEnvironments(undefined, { facts: env.processFactsNow({ reader: () => [] }) })

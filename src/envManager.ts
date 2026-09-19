@@ -30,6 +30,7 @@ import {
   accessSync, closeSync, constants, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync,
   rmSync, statSync,
 } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { request as httpRequest } from 'node:http'
 import { connect, createServer } from 'node:net'
 import { basename, delimiter, dirname, isAbsolute, join, resolve } from 'node:path'
@@ -2112,6 +2113,207 @@ function recordedDependencies(dir: string): Record<string, unknown> {
   return typeof dependencies === 'object' && dependencies !== null ? dependencies as Record<string, unknown> : {}
 }
 
+
+// ── 试装引擎（DESIGN §5.2 / §5.4）────────────────────────────────────────
+
+/** 测试环境名的后缀。一个真实环境对应一个测试环境（保真需要，§5.4 命名与归属）。 */
+export const TRIAL_ENVIRONMENT_SUFFIX = '-dpmc'
+
+/**
+ * 某个真实环境对应的测试环境名。
+ *
+ * @param realName - 真实环境名。
+ * @returns 测试环境名。
+ */
+export function trialEnvironmentName(realName: string): string {
+  return realName + TRIAL_ENVIRONMENT_SUFFIX
+}
+
+/**
+ * 是不是我们创建的测试环境（只看名字形态）。
+ *
+ * 删除路径先用它筛，再核对归属（§5.4 清理）：不靠台账，台账会过期。
+ *
+ * @param name - 环境名。
+ * @returns 是否形如测试环境。
+ */
+export function isTrialEnvironmentName(name: string): boolean {
+  return name.endsWith(TRIAL_ENVIRONMENT_SUFFIX) && name.length > TRIAL_ENVIRONMENT_SUFFIX.length
+}
+
+/**
+ * 测试环境名对应的真实环境名；不是测试环境时 null。
+ *
+ * @param name - 环境名。
+ * @returns 真实环境名或 null。
+ */
+export function trialEnvironmentOwner(name: string): string | null {
+  return isTrialEnvironmentName(name) ? name.slice(0, -TRIAL_ENVIRONMENT_SUFFIX.length) : null
+}
+
+/**
+ * 环境指纹（DESIGN §5.4）：五元组，**全部读盘**，不读我们的内存台账。
+ *
+ * 为什么不读台账：用户可能在终端里跑官方 dsh plugin add、或直接改文件，那些改动不会经过我们，
+ * 台账必然过期。所以每次要用测试环境之前重算一次、与记录比对。
+ */
+export interface EnvironmentFingerprint {
+  /** package.json 内容 hash；缺失时 null（缺失与空文件是两件事）。 */
+  readonly manifestHash: string | null
+  /** pnpm-lock.yaml 内容 hash；缺失时 null。 */
+  readonly lockfileHash: string | null
+  /** cordis.patch.yml 内容 hash；缺失时 null。 */
+  readonly patchHash: string | null
+  /** bundle 层栈。 */
+  readonly bundles: readonly string[]
+  /** 层栈来源：官方 listBundles() 还是本地 manifest（**口径不同，必须标**）。 */
+  readonly bundlesSource: 'official' | 'manifest'
+  /** 直接依赖名（排序）。 */
+  readonly dependencies: readonly string[]
+  /** 五元组的整体 hash（比对用）。 */
+  readonly hash: string
+}
+
+/** environmentFingerprint 的选项。 */
+export interface FingerprintOptions {
+  /** 官方层栈事实：ctx.pluginManager.listBundles()（只在测当前环境时可用）。 */
+  readonly listBundles?: () => Promise<readonly string[]>
+}
+
+/**
+ * 文件内容 hash。
+ *
+ * @param path - 文件路径。
+ * @returns 16 位 hex；读不到时 null。
+ */
+function fileHash(path: string): string | null {
+  try {
+    return createHash('sha256').update(readFileSync(path)).digest('hex').slice(0, 16)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 算一个环境当前的指纹（读盘）。
+ *
+ * @param name - 环境名。
+ * @param options - 官方层栈来源（可注入；拿不到时退回 manifest 并如实标注口径）。
+ * @returns 指纹。
+ */
+export async function environmentFingerprint(
+  name: string, options: FingerprintOptions = {},
+): Promise<EnvironmentFingerprint> {
+  const dir = environmentDir(name)
+  const manifest = readEnvironmentManifest(dir)
+  let bundles: readonly string[] = manifest.bundles
+  let bundlesSource: 'official' | 'manifest' = 'manifest'
+  if (options.listBundles !== undefined) {
+    try {
+      bundles = await options.listBundles()
+      bundlesSource = 'official'
+    } catch {
+      // 官方事实拿不到：退回 manifest，但口径标签会说明它不是官方投影。
+    }
+  }
+  const tuple = {
+    manifestHash: fileHash(join(dir, 'package.json')),
+    lockfileHash: fileHash(join(dir, 'pnpm-lock.yaml')),
+    patchHash: fileHash(join(dir, 'cordis.patch.yml')),
+    bundles: [...bundles],
+    bundlesSource,
+    dependencies: [...manifest.dependencies].sort(),
+  }
+  const hash = createHash('sha256').update(JSON.stringify(tuple)).digest('hex').slice(0, 16)
+  return { ...tuple, hash }
+}
+
+/**
+ * 两份指纹是否同一环境状态。
+ *
+ * @param a - 之一。
+ * @param b - 之二。
+ * @returns 是否一致。
+ */
+export function sameFingerprint(a: EnvironmentFingerprint, b: EnvironmentFingerprint): boolean {
+  return a.hash === b.hash
+}
+
+/** 一次挂载验证的判定（三态；DESIGN §5.2：**退出码不参与判定**）。 */
+export type BootVerdict =
+  /** 树挂载成功（stderr 只有官方的「缺任务」用法提示）。 */
+  | { readonly kind: 'mounted' }
+  /** 挂载失败，带根因链。 */
+  | { readonly kind: 'failed'; readonly reason: string; readonly chain: readonly string[] }
+  /** 判不出来（没有可识别特征、进程没起来、被超时杀掉等）。 */
+  | { readonly kind: 'undetermined'; readonly reason: string }
+
+/** 官方 headless 在「没给任务」时的 stderr 特征（§5.2 实测）。 */
+const BOOT_TASK_REQUIRED = /a task is required/
+/** 官方 Loader 挂载失败的特征。 */
+const BOOT_TREE_FAILED = /plugin tree failed to load/
+
+/**
+ * 从 stderr 文本判定挂载结果（纯函数，可注入文本测试）。
+ *
+ * 判据（§5.2 实测）：健康环境 stderr 只有一行 dsh: a task is required…，而**退出码仍是 1**，
+ * 所以退出码不能用作判据；失败是 plugin tree failed to load + cause 链。两者都没有 → 无法判定。
+ *
+ * @param stderr - 子进程的 stderr 文本。
+ * @returns 三态判定。
+ */
+export function judgeBootStderr(stderr: string): BootVerdict {
+  const lines = stderr.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0)
+  if (lines.some((line) => BOOT_TREE_FAILED.test(line))) {
+    const chain = lines
+      .filter((line) => /Error|\[cause\]|Cannot find|has been registered/.test(line))
+      .slice(0, 8)
+    const reason = chain[0] ?? lines[0] ?? '未知挂载失败'
+    return { kind: 'failed', reason, chain }
+  }
+  if (lines.some((line) => BOOT_TASK_REQUIRED.test(line))) return { kind: 'mounted' }
+  return {
+    kind: 'undetermined',
+    reason: lines.length === 0
+      ? '子进程没有输出任何 stderr 文本'
+      : '输出里没有可识别的官方特征：' + lines[0],
+  }
+}
+
+/** 试装的三种结论（§5.2：各有措辞、不得混；无法试装**不算通过**）。 */
+export type TrialConclusion =
+  /** 基线起得来、装完候选包也起得来 → 通过。 */
+  | 'passed'
+  /** 快照基线本身就起不来：不是候选包的问题。 */
+  | 'baseline-broken'
+  /** 基线好、装完候选包起不来：候选包导致的。 */
+  | 'candidate-broken'
+  /** 无法试装（例如禁用联网且本地 store 没有该包）：**不能算通过**。 */
+  | 'cannot-trial'
+
+/**
+ * 按受控对照四步给结论（§5.2）。
+ *
+ * 判定顺序刻意如此：先看基线，再看候选 —— 基线失败时不许赖候选包。
+ *
+ * @param baseline - 物化快照后的挂载判定；没做基线启动时 null。
+ * @param candidate - 装完候选包后的挂载判定；没走到这一步 null。
+ * @param cannotTrialReason - 提前失败的原因（如无法下载候选包）；给了就只报「无法试装」。
+ * @returns 结论。
+ */
+export function judgeTrialOutcome(
+  baseline: BootVerdict | null,
+  candidate: BootVerdict | null,
+  cannotTrialReason?: string,
+): TrialConclusion {
+  if (cannotTrialReason !== undefined) return 'cannot-trial'
+  if (baseline !== null && baseline.kind === 'failed') return 'baseline-broken'
+  if (baseline !== null && baseline.kind === 'undetermined') return 'cannot-trial'
+  if (candidate === null) return 'cannot-trial'
+  if (candidate.kind === 'failed') return 'candidate-broken'
+  if (candidate.kind === 'undetermined') return 'cannot-trial'
+  return 'passed'
+}
 // ── 备份：导出 / 差异 / 恢复 ──────────────────────────────────────────────
 
 /**
