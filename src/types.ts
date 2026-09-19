@@ -498,6 +498,139 @@ export interface GatedInstallResult {
   readonly trial?: GatedInstallTrial
 }
 
+// ── 升级（op: upgradeCheck / upgrade / upgradeRollback）──────────────────────
+
+/**
+ * 一个"升级单元"的种类。三类必须分开对待，这是升级这件事的核心诚实点。
+ */
+export type UpgradeUnitKind =
+  /** profile 的 dependencies 里声明着 → 可以在 profile 内升级（走官方 add）。 */
+  | 'profile-dependency'
+  /** 只出现在 dsh.profile.bundles 里（安装方提供的层，如 dsh-base / dsh-web-app）→ profile 内升不了。 */
+  | 'installation-provided'
+  /** 本插件自身 → 可升级，但正在运行的是旧代码：下次启动生效。 */
+  | 'self'
+
+/** 四态（界面直接渲染，不要自己推断）。 */
+export type UpgradeState =
+  /** 有比当前更新的版本。 */
+  | 'update-available'
+  /** 已知没有更新的版本（**必须真的有版本事实**才算，查不到不是这个态）。 */
+  | 'up-to-date'
+  /** 查不到版本事实（没有 registry 事实、也没到检查时间、registry 不可用…）。 */
+  | 'unknown'
+  /** 结构上就升不了（安装方提供的层）。 */
+  | 'not-upgradable'
+
+/** 一条 dist-tag（版本线）。 */
+export interface UpgradeTag {
+  /** dist-tag 名（latest / next / beta …）。 */
+  readonly tag: string
+  readonly version: string
+  /** 与当前版本是不是同一条线（同 major.minor.patch）；当前版本未知时是 'unknown'。 */
+  readonly line: 'same-line' | 'other-line' | 'unknown'
+  /** 同线里最新的那一个（界面默认高亮它）；没有同线候选时为 false。 */
+  readonly preferred: boolean
+}
+
+/** 一个升级单元的检测结果。 */
+export interface UpgradeUnitReport {
+  readonly name: string
+  readonly kind: UpgradeUnitKind
+  readonly state: UpgradeState
+  /** 当前版本（读盘：node_modules/<name>/package.json）；读不到时 null。 */
+  readonly currentVersion: string | null
+  /** 当前版本的线（major.minor.patch）；读不到时 null。 */
+  readonly currentLine: string | null
+  /** 当前声明来源（dependencies 里的 spec）；安装方提供的层没有这一项。 */
+  readonly spec?: string
+  /** 目标版本（默认 = 与当前同线的最新；没有同线候选时取 latest）。 */
+  readonly targetVersion: string | null
+  /** 目标版本来自哪个 dist-tag。 */
+  readonly targetTag: string | null
+  /** 目标版本的线；与 currentLine 不同表示"升级会切到另一条线"。 */
+  readonly targetLine: string | null
+  /** 全部 dist-tags；拿不到时为 null（那时 tagsReason 说明为什么）。 */
+  readonly tags: readonly UpgradeTag[] | null
+  /** 版本事实的来源与时间（界面必须标出来）。 */
+  readonly source?: 'market-index' | 'registry'
+  readonly at?: string
+  /** 面向用户的原因（查不到/不可升级/为什么是这个目标）。 */
+  readonly reason?: string
+  /** 升级会把来源从本地路径/link 换成 registry 版本。 */
+  readonly changesSource?: boolean
+  /** 第 2 类（安装方提供的层）只给这条命令，不给按钮。 */
+  readonly command?: string
+}
+
+/** 升级检查的结果（op: upgradeCheck）。 */
+export interface UpgradeCheckResult {
+  readonly environment: string
+  readonly units: readonly UpgradeUnitReport[]
+  /** 本次是否真的出网查了 registry（false = 用了缓存/市场索引/未到间隔）。 */
+  readonly checked: boolean
+  /** 上次成功检查的时刻（ISO）；从未成功过时 null。 */
+  readonly lastCheckAt: string | null
+  /** 降级与边界事实（用户可见的 notes）。 */
+  readonly notes: readonly string[]
+}
+
+/** 一次升级的金丝雀（试装）结论。 */
+export interface UpgradeCanaryReport {
+  /** 是否真的跑了试装（关掉试装总开关时为 false，此时必须如实说"未验证"）。 */
+  readonly ran: boolean
+  readonly conclusion?: TrialConclusion
+  readonly depth?: SnapshotDepth
+  readonly escalated?: boolean
+  readonly elapsedMs?: number
+  /** 试装结论原文（给人读的完整证据）。 */
+  readonly output?: string
+  /** 没跑金丝雀的原因。 */
+  readonly skippedReason?: string
+  /** 用完即删的结局（一次性资产：删掉了 / 删不掉并给出原因）。 */
+  readonly cleanup: string
+  /**
+   * 激活证据：候选到底有没有进测试环境的层栈（dsh.profile.bundles）。
+   *
+   * 升级场景下这条证据是金丝雀成立的前提：候选已在源环境 dependencies 里时，
+   * 官方 reconcile 会跳过"既有依赖"，候选进不了层栈 → 挂载期不加载它 →
+   * 旧代码照样启动成功 → 假通过。没拿到证据时为 undefined（不假装有）。
+   */
+  readonly activation?: {
+    readonly name: string
+    readonly bundles: readonly string[]
+    readonly activated: boolean
+    readonly removedFirst: boolean
+    readonly removeNote: string
+  }
+}
+
+/** 一次升级的结果。 */
+export interface UpgradeActionResult extends EnvironmentResult {
+  readonly name: string
+  readonly fromVersion: string | null
+  readonly toVersion: string
+  /** 本次用的 spec（官方 add 收到的那个）。 */
+  readonly spec: string
+  readonly canary: UpgradeCanaryReport
+  /** 升级后按盘核对的事实（依赖行 / node_modules / 版本）。 */
+  readonly diskFacts: readonly string[]
+  /** 是否要重启才生效（官方口径；本插件自身一定是 true）。 */
+  readonly restartRequired: boolean
+}
+
+/** 一次回滚的结果。 */
+export interface UpgradeRollbackResult extends EnvironmentResult {
+  readonly name: string
+  /** 回滚前的版本。 */
+  readonly fromVersion: string | null
+  /** 回滚到的版本。 */
+  readonly toVersion: string
+  readonly diskFacts: readonly string[]
+  /** 盘上核对是否一致（false = 有残留或没到位，如实说，不许声称"环境未被改动"）。 */
+  readonly clean: boolean
+}
+
 // ── 试装环境的查询与管理（op: trialEnvironments / trialRemove / trialCleanup）────
 
 /**

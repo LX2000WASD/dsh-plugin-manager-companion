@@ -22,6 +22,7 @@ import { environmentDir as pathEnvironmentDir, OUR_PACKAGE_NAME, readEnvironment
 import { inspectPackage } from "./qualityGate.ts"
 import { applyFix } from "./fix.ts"
 import { loadRegistryIndex } from "./registry.ts"
+import { checkUpgrades, rollbackUpgrade, upgradePackage, type UpgradeActionInput, type UpgradeEngineDeps } from "./upgrade.ts"
 import { findPluginMatches } from "./match.ts"
 import { registerGuard } from "./guard.ts"
 import { registerCompanionTools } from "./tools.ts"
@@ -681,6 +682,8 @@ export interface OpDependencies {
   readonly jobs: JobRegistry
   /** 试装执行器；省略时用真实的 runTrialInstall（会真装候选包并起进程）。 */
   readonly trial?: TrialRunner
+  /** 升级引擎依赖（ctx / 官方运行器 / 试装执行器 / 抓取器 的注入缝）。 */
+  readonly upgrade?: UpgradeEngineDeps
 }
 
 /** 把试装执行器折成 gatedInstall 的可选参数（没注入就不传）。 */
@@ -735,6 +738,32 @@ function targetEnvironment(deps: OpDependencies, name: string | undefined): Envi
   const found = listEnvironments(deps.ctx).find(env => sameEnvironment(env.name, name))
   if (found === undefined) throw new Error(`环境不存在：${name}`)
   return found
+}
+
+/**
+ * 解析一次升级/回滚的入参（**在起 job 之前**调用）。
+ *
+ * 为什么必须提前：这些字段缺失是"当场能回答的请求错误"，而 job 的失败只体现在后续轮询里。
+ * 放进 job 里，客户端会拿到 `ok:true + jobId`，然后异步等一个注定失败的任务——
+ * 错误被包装成了"看起来开始了"。
+ *
+ * @param deps - op 依赖（取环境）。
+ * @param body - 请求体。
+ * @param config - 当前配置。
+ * @returns 升级引擎的入参。
+ * @throws {Error} name / version 缺失或不是非空字符串时。
+ */
+function upgradeInput(
+  deps: OpDependencies, body: Record<string, unknown>, config: CompanionConfig,
+): UpgradeActionInput {
+  const requested = typeof body["environment"] === "string" ? body["environment"] : undefined
+  return {
+    environment: targetEnvironment(deps, requested).name,
+    name: requireString(body, "name"),
+    version: requireString(body, "version"),
+    ...typeof body["spec"] === "string" ? { spec: body["spec"] } : {},
+    config,
+  }
 }
 
 function analysisTarget(deps: OpDependencies): EnvironmentInfo {
@@ -829,6 +858,33 @@ async function dispatch(op: string, body: Record<string, unknown>, deps: OpDepen
 
     case "stopEnvironment":
       return await stopEnvironment(requireString(body, "name"))
+
+    case "upgradeCheck": {
+      // 检查是**短操作**（缓存命中时零网络）；手动检查（refresh）可能出网，
+      // 但总预算有上限（见 upgrade.ts 的 CHECK_BUDGET_MS），不 job 化以免前端要多一跳轮询。
+      const requested = typeof body["environment"] === "string" ? body["environment"] : undefined
+      const target = targetEnvironment(deps, requested)
+      return await checkUpgrades({
+        environment: target.name,
+        config,
+        ...body["refresh"] === true ? { refresh: true } : {},
+        ...deps.upgrade ?? {},
+      })
+    }
+
+    case "upgrade": {
+      // 入参校验必须在**起 job 之前**：job 的失败只体现在后续 job op 的轮询结果里，
+      // 而"少给一个字段"是当场就能回答的请求错误。放进 job 里会让客户端拿到 ok:true +
+      // jobId，然后异步等一个注定失败的任务——错误变成了"看起来开始了"。
+      const input = upgradeInput(deps, body, config)
+      return asJob(async () => await upgradePackage({ ...input, ...deps.upgrade ?? {} }))
+    }
+
+    case "upgradeRollback": {
+      // 同上：先校验再起 job。
+      const input = upgradeInput(deps, body, config)
+      return asJob(async () => await rollbackUpgrade({ ...input, ...deps.upgrade ?? {} }))
+    }
 
     case "trialEnvironments":
       // 纯读：列出测试环境 + 清理计划预览 + 现在生效的保留策略。这个 op 不删任何东西。
@@ -1037,6 +1093,8 @@ export function apply(ctx: Context): void {
     configUpdate: (patch) => config.update(patch),
     capabilities: () => probeOfficialCapabilities(ctx),
     jobs,
+    // 升级引擎要 ctx 才能拿官方 installAnchor 与试装锚点；其余依赖留空走真实实现。
+    upgrade: { ctx },
   }
 
   // REST 路由：webServer 是官方行，装配顺序不保证，用 inject 等待。

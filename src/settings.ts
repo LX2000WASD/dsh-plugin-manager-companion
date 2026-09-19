@@ -148,6 +148,35 @@ export interface TrialConfig {
   readonly maxKept: number
 }
 
+/**
+ * 升级（档三）的配置：**检查时机**与 registry 地址。
+ *
+ * 检查时机刻意不做后台轮询（官方没有这类钩子，自己挂定时器会让插件在宿主里留一个永不退出的句柄）：
+ * "每天一次"的语义是"下次进入时若距上次成功检查超过 24h 就查"。
+ */
+export interface UpgradeConfig {
+  /**
+   * 自动检查更新。**默认开**。
+   *
+   * 关掉的后果：进入关于页不再自动出网；手动检查按钮照常可用（它不受开关与 TTL 限制）。
+   */
+  readonly autoCheck: boolean
+  /**
+   * 检查间隔：`session`（每次打开）/ `6h` / `daily`（默认）/ `manual`（仅手动）。
+   *
+   * 用户看到的后果：间隔越大越少出网、越省时间；代价是"最近发布了新版本"可能晚一点才看到。
+   * 检查失败也会记时间戳（1 小时内不自动重试），免得每次进入都等一次超时——手动按钮不受影响。
+   */
+  readonly interval: 'session' | '6h' | 'daily' | 'manual'
+  /**
+   * npm registry 地址（默认官方 registry，可填镜像）。
+   *
+   * 用户看到的后果：填镜像后版本查询走镜像；镜像不可用一律显示"查不到"，
+   * **不会**显示成"已是最新"（这两个是不同状态）。
+   */
+  readonly registryUrl: string
+}
+
 /** 本插件的完整配置。 */
 export interface CompanionConfig {
   readonly diagnostics: DiagnosticsConfig
@@ -162,6 +191,11 @@ export interface CompanionConfig {
    * 而不是 undefined。运行期这份配置永远由 ConfigSchema 补齐（schema 里带 .default）。
    */
   readonly trial?: TrialConfig
+  /**
+   * 升级配置。与 trial 同为**可选**字段（客户端镜像是按自己的节奏补齐的）；
+   * 读配置一律走 effectiveUpgradeConfig()，缺字段时拿到的是安全默认值。
+   */
+  readonly upgrade?: UpgradeConfig
 }
 
 /**
@@ -182,7 +216,14 @@ export const DEFAULT_TRIAL_CONFIG: TrialConfig = {
   maxKept: 0,
 }
 
-/** 默认配置：诊断全开、质量门拦截、市场启用、试装关闭。 */
+/** 升级配置的默认值（单独一份：CompanionConfig.upgrade 是可选字段）。 */
+export const DEFAULT_UPGRADE_CONFIG: UpgradeConfig = {
+  autoCheck: true,
+  interval: 'daily',
+  registryUrl: '',
+}
+
+/** 默认配置：诊断全开、质量门拦截、市场启用、试装关闭、升级检查每天一次。 */
 export const DEFAULT_CONFIG: CompanionConfig = {
   diagnostics: {
     dependency: true,
@@ -195,6 +236,7 @@ export const DEFAULT_CONFIG: CompanionConfig = {
   qualityGate: { enabled: true, mode: 'block', allowlist: [] },
   marketplace: { enabled: true, cacheTtlMinutes: 1440, timeoutMs: 15_000, indexUrl: '' },
   trial: { ...DEFAULT_TRIAL_CONFIG },
+  upgrade: { ...DEFAULT_UPGRADE_CONFIG },
 }
 
 /**
@@ -264,6 +306,11 @@ export const ConfigSchema = z.object({
     retentionDays: z.natural().min(1).max(3_650).default(14),
     maxKept: z.natural().max(1_000).default(0),
   }).default({ ...DEFAULT_TRIAL_CONFIG }),
+  upgrade: z.object({
+    autoCheck: z.boolean().default(true),
+    interval: z.union([z.const('session'), z.const('6h'), z.const('daily'), z.const('manual')]).default('daily'),
+    registryUrl: z.string().default(''),
+  }).default({ ...DEFAULT_UPGRADE_CONFIG }),
 })
 
 /**
@@ -313,6 +360,43 @@ export interface ConfigHandle {
    * @returns 写入完成后的生效配置。
    */
   update(patch: Partial<CompanionConfig>): Promise<CompanionConfig>
+}
+
+/**
+ * 检查间隔对应的毫秒数；`null` = 仅手动（永不自动检查）。
+ *
+ * 纯函数、单一事实来源：引擎与界面用它算"要不要查"，避免两处各写一份间隔表而漂移。
+ *
+ * @param interval - 配置里的间隔。
+ * @returns 毫秒；仅手动时为 null。
+ */
+export function upgradeIntervalMs(interval: UpgradeConfig['interval']): number | null {
+  switch (interval) {
+    case 'session': return 0
+    case '6h': return 6 * 60 * 60 * 1000
+    case 'manual': return null
+    default: return 24 * 60 * 60 * 1000
+  }
+}
+
+/**
+ * 读升级配置：缺字段、类型不对一律回落默认值（与 effectiveTrialConfig 同一纪律：
+ * schema 的默认值只在官方 settings 解析过那份配置时成立；这两个字段决定要不要出网）。
+ *
+ * @param config - 任意形状的配置片段。
+ * @returns 补齐后的升级配置。
+ */
+export function effectiveUpgradeConfig(config: { readonly upgrade?: Partial<UpgradeConfig> | undefined } | undefined): UpgradeConfig {
+  const fallback = DEFAULT_UPGRADE_CONFIG
+  const raw = (config?.upgrade ?? {}) as Partial<Record<keyof UpgradeConfig, unknown>>
+  const interval = raw.interval === 'session' || raw.interval === '6h' || raw.interval === 'manual'
+    ? raw.interval
+    : 'daily'
+  return {
+    autoCheck: typeof raw.autoCheck === 'boolean' ? raw.autoCheck : fallback.autoCheck,
+    interval,
+    registryUrl: typeof raw.registryUrl === 'string' ? raw.registryUrl : fallback.registryUrl,
+  }
 }
 
 /**

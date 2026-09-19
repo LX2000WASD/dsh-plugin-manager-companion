@@ -29,6 +29,9 @@
 | `trialEnvironments` | `{}` | `TrialEnvironmentReport` | |
 | `trialRemove` | `{ name: string }` | `EnvironmentResult` | |
 | `trialCleanup` | `{}` | `TrialCleanupResult` | job |
+| `upgradeCheck` | `{ environment?: string, refresh?: boolean }` | `UpgradeCheckResult` | |
+| `upgrade` | `{ environment?: string, name: string, version: string, spec?: string }` | `UpgradeActionResult` | job |
+| `upgradeRollback` | `{ environment?: string, name: string, version: string, spec?: string }` | `UpgradeRollbackResult` | job |
 | `getConfig` | `{}` | `CompanionConfig` | |
 | `setConfig` | `{ patch: Partial<CompanionConfig> }` | `CompanionConfig` | |
 | `job` | `{ id: string }` | `{ done, result?, error?, missing? }` | |
@@ -265,4 +268,51 @@ node_modules 实体、凭据、缓存都不进来——备份的价值是可重�
   这些条目只显示"由安装方提供"+ 对应命令，**不给按钮**。
 - **生效时机沿用官方口径**（官方安装成功文案即"下次启动后加载"），不自造"已立即生效"。
 - **版本查询失败必须显示"查不到"**，不得显示"已是最新"（查不到 ≠ 是最新版）。
+
+## 升级 op 的契约（upgradeCheck / upgrade / upgradeRollback）
+
+三个 op 的分工刻意不对称，理由写在括号里：
+
+| op | 形态 | 为什么 |
+|---|---|---|
+| `upgradeCheck` | **直接返回** `UpgradeCheckResult`，不走 job | 缓存命中时零网络；手动检查也受 `CHECK_BUDGET_MS`（20s）总预算约束，不会无限拖住请求。走 job 只会让客户端多一跳轮询 |
+| `upgrade` | job（首包 `{ jobId }`） | 会真装包（可能联网），耗时可到分钟级 |
+| `upgradeRollback` | job（首包 `{ jobId }`） | 同上；回滚也是"装一个版本"，不是撤销 |
+
+**入参校验在起 job 之前**（`name` / `version` 缺失当场返回 `ok:false`）：
+job 的失败只体现在后续 `job` op 的轮询结果里，把"少给一个字段"塞进 job 会让客户端先拿到
+`ok:true + jobId`，然后异步等一个注定失败的任务——错误被包装成"看起来开始了"。
+
+`environment` 省略即当前环境（与 `diagnose` 同一口径）。
+
+### `UpgradeCheckResult.units[].state` 四态（界面直接渲染，不要自己推断）
+
+| state | 含义 | 界面该做什么 |
+|---|---|---|
+| `update-available` | **有版本事实**且比当前新 | 给升级入口；`tags` 非 null 时列出全部 dist-tags 让用户挑 |
+| `up-to-date` | 有版本事实、没有更新的 | 显示"已是最新"+ 依据（`reason` 带版本号） |
+| `unknown` | **拿不到版本事实**（registry 失败 / 未到检查时间 / 仅手动 / 关掉了自动检查） | 显示"查不到"+ `reason` + 重试；**绝不显示"已是最新"** |
+| `not-upgradable` | 结构上就升不了（安装方提供的层） | 显示 `command`，**不给按钮** |
+
+`source` 标明事实来自哪里（`market-index` 零网络优先 / `registry`），`at` 是那份事实的时间——
+界面必须把来源与时间标出来，否则"最新"这个断言没有依据。
+
+### 出网纪律（检查缓存）
+
+- **进入即查 + TTL + 手动常驻**，不做后台轮询。"每天一次"= 下次进入时距上次成功检查超过 24h 才查。
+- 记账与条目都**按环境分开**：A 环境查过不代表 B 环境查过（换环境一律重新出网）。
+- 负缓存**逐包**判定：某包失败后 1 小时内自动检查不重试它，但**不牵连**同环境里别的包；
+  过了 1 小时自动恢复。
+- `refresh: true`（手动）**无视**开关、TTL 与负缓存，永远可用。
+
+### 金丝雀（`upgrade` 的 canary 字段）
+
+`canary.ran === false` 时必须读 `canary.skippedReason`：试装总开关关着时文案是
+"未做金丝雀，直接升级（没有验证新版本能否挂载）"——**"没验证"不等于"通过"**，
+界面不许把它渲染成绿色通过态。
+
+`canary.activation` 是激活证据（候选有没有真的进 `dsh.profile.bundles`）：
+升级场景下候选已在源环境 `dependencies` 里，官方 reconcile 会跳过"既有依赖"，
+所以金丝雀必须先走官方 `remove` 再 `add`，否则它永远进不了层栈、旧代码照样启动成功（假通过）。
+`activation.activated === false` 时结论一律 `cannot-trial`。
 
