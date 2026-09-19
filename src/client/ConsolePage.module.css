@@ -203,7 +203,7 @@
 .issueCode,
 .evidenceAt,
 .envDir {
-  font-family: var(--dsw-font-family-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-family: var(--dsw-font-markdown-code-font-family);
   font-size: 12px;
   color: var(--dsw-alias-label-secondary);
 }
@@ -269,9 +269,14 @@
   flex-wrap: wrap;
 }
 
+/*
+ * 证据说明与路径是"照着改"的依据（承重文本）：浅色下 label-tertiary 只有 3.71:1，
+ * 抬到 label-secondary（浅色 5.8:1）。装饰性层级（intro / metaLabel / scoreMeta / 未选中 tab）保持 tertiary 不动。
+ */
+
 .evidenceNote {
   font-size: 12px;
-  color: var(--dsw-alias-label-tertiary);
+  color: var(--dsw-alias-label-secondary);
 }
 
 .issueActions {
@@ -290,7 +295,8 @@
   align-self: stretch;
   font-size: 12px;
   line-height: 18px;
-  color: var(--dsw-alias-label-tertiary);
+  /* 承重：这是"点了会发生什么"的说明，用户必须读它（浅色 3.71 → 5.8）。 */
+  color: var(--dsw-alias-label-secondary);
   text-align: left;
   display: -webkit-box;
   -webkit-box-orient: vertical;
@@ -456,13 +462,14 @@
 
 .envUnknownReason {
   font-size: 12px;
-  color: var(--dsw-alias-label-tertiary);
+  /* 承重：它是"为什么显示未知"的唯一依据（与 evidenceNote 同类），不是装饰性层级 → 抬到 secondary。 */
+  color: var(--dsw-alias-label-secondary);
 }
 
 /* 选中模板的层栈：官方包名，原样显示，不做文案化。 */
 
 .templateBundles {
-  font-family: var(--dsw-font-family-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-family: var(--dsw-font-markdown-code-font-family);
   font-size: 12px;
   color: var(--dsw-alias-label-tertiary);
   word-break: break-all;

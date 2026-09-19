@@ -15,7 +15,8 @@
  */
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
+import { join } from 'node:path'
 import { createRequire } from 'node:module'
 import {
   NS, React, bootBundle, propsFor as harnessPropsFor, stubFetch as harnessStubFetch, until,
@@ -971,3 +972,60 @@ describe('体检页：删除冗余后，替代载体必须真的在（task-64）
     assert.ok(html.includes('被诊断环境：pm-other'), '报告头要说清这份报告属于谁：' + html.slice(0, 500))
   })
 })
+
+describe('视觉令牌护栏（task-67）：承重层级与真令牌', () => {
+  /** src/ 下的全部源码文件（含 CSS Modules），护栏要走完整棵树，避免"这个文件没被检查"。 */
+  const sourceFiles = () => readdirSync('src', { recursive: true })
+    .filter(entry => /[.](css|ts|tsx)$/.test(entry))
+    .map(entry => join('src', entry))
+
+  it('官方不存在的字体令牌名不得再出现（--dsw-font-family-mono 曾出现 4 处）', () => {
+    // 旧写法是 font-family: var(--dsw-font-family-mono, ui-monospace, …)：退避值掩盖了它只是"命名幻觉"，
+    // 官方任何样式表与已安装产物里都没有这个名字。换上的真令牌 --dsw-font-markdown-code-font-family 有定义
+    // （ui-theme/src/styles/gradient-shadow-text.css:158 ⇒ var(--ds-font-family-code)，字体栈在同目录 base.css:9）、
+    // 有官方先例（ui-primitives/src/user-text.module.css），且 docs/web-styling.md 要求特性组件消费 --dsw-* 语义
+    // 别名而不是 --ds-* 基础令牌。
+    const offenders = sourceFiles().filter(file => readFileSync(file, 'utf8').includes('--dsw-font-family-mono'))
+    assert.deepEqual(offenders, [], '这些文件用了官方不存在的令牌名：' + offenders.join(', '))
+  })
+
+  it('四处代码字体（issueCode/evidenceAt/envDir、templateBundles、kinds.path、market.repo）都在真令牌上', () => {
+    const files = ['src/client/ConsolePage.module.css', 'src/client/KindsPage.module.css', 'src/client/MarketplacePage.module.css']
+    const uses = files.flatMap(file =>
+      readFileSync(file, 'utf8').match(/font-family:[ ]*var[(]--dsw-font-markdown-code-font-family[)]/g) || [])
+    assert.equal(uses.length, 4, '四处代码字体都要显式消费 --dsw-font-markdown-code-font-family：' + String(uses.length))
+  })
+
+  /** 取某个类自己的规则里的 color 令牌；类必须有独立规则，否则它只是"跟着别人一起变"。 */
+  const colorTokenOf = (css, className) => {
+    const rule = new RegExp('[.]' + className + '[ ]*[{]([^}]*)[}]').exec(css)
+    assert.notEqual(rule, null, '.' + className + ' 必须有独立规则')
+    const token = /color:[ ]*var[(]--dsw-alias-label-[a-z]+[)]/.exec(rule[1])
+    assert.notEqual(token, null, '.' + className + ' 必须用 label-* 语义令牌：' + rule[1])
+    return token[0].slice(token[0].indexOf('--'), -1)
+  }
+
+  it('承重文本 = label-secondary；装饰层级 = label-tertiary（判据写在注释里）', () => {
+    // 判据（Lead 裁定，别当成随意划的线）：删掉这段文字之后，用户还能不能完成任务？
+    // 不能 → 承重 → label-secondary（浅色 5.8:1）；能 → 装饰性层级 → 保持官方 label-tertiary（浅色 3.71:1）。
+    // 不做全局替换：官方刻意做的层级不能被抹掉，"与官方样式一致"这条原则更硬。
+    // 未选中 tab（.tab）与市场 .link 属已知官方令牌层偏差：前者是导航入口、后者是官方 link 别名，都不由我方单方面改。
+    const consoleCss = readFileSync('src/client/ConsolePage.module.css', 'utf8')
+    for (const className of ['evidenceNote', 'fixSummary', 'envUnknownReason']) {
+      assert.equal(colorTokenOf(consoleCss, className), '--dsw-alias-label-secondary',
+        '.' + className + ' 是承重文本（证据说明 / 修复动作 / 「未知」的原因），删掉用户就没法判断该不该动手')
+    }
+    for (const className of ['metaLabel', 'scoreMeta', 'envMeta', 'hint', 'tab']) {
+      assert.equal(colorTokenOf(consoleCss, className), '--dsw-alias-label-tertiary',
+        '.' + className + ' 是装饰性层级（删掉不影响完成任务），必须保持官方层级')
+    }
+    for (const file of ['KindsPage', 'MarketplacePage']) {
+      const css = readFileSync('src/client/' + file + '.module.css', 'utf8')
+      for (const className of ['meta', 'metaLabel']) {
+        assert.equal(colorTokenOf(css, className), '--dsw-alias-label-tertiary',
+          file + '.' + className + ' 是层级信息，保持官方 tertiary')
+      }
+    }
+  })
+})
+

@@ -72,7 +72,7 @@
 }
 
 .path {
-  font-family: var(--dsw-font-family-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-family: var(--dsw-font-markdown-code-font-family);
   font-size: 12px;
   color: var(--dsw-alias-label-secondary);
   word-break: break-all;
