@@ -179,8 +179,8 @@ tests/*.test.mjs 一律 import ../dist/*.js。由此产生一条纪律：
 端口号本身不携带归属信息，靠猜必然出错。
 
 约定：
-- **3300–3499 是共享工具带**：tools/e2e-visual.sh 与 tools/e2e-lifecycle.sh 等脚本用这一段，
-  脚本自取自清。
+- **3300–3499 是共享工具带**：tools/e2e-visual.sh 与 tools/e2e-lifecycle.mjs（其 .sh 是兼容壳）
+  等脚本用这一段，脚本自取自清。
 - **3500 以上按人分号段**，每人 10 个：
 
   | 谁 | 号段 |
