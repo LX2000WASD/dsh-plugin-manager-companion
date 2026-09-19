@@ -1,0 +1,13 @@
+# 行尾统一为 LF。Windows 上若不声明，git 结账会把文本文件的换行改写成 CRLF，
+# 于是源码扫描类的护栏（tests/ui-copy.test.mjs 逐行读源码）在那边测的是另一份文本——
+# 会出现"Linux 上绿、Windows 上红"的假信号。
+* text=auto eol=lf
+
+# 明确标记二进制，避免任何行尾转换。
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+
+# shell 脚本必须 LF：CRLF 会让 shebang 失效（bad interpreter）。
+*.sh text eol=lf
