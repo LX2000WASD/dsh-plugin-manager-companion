@@ -31,7 +31,7 @@
  */
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
+import { readFileSync, readdirSync, statSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { applyWithMocks, bootBundle, NS } from './client-harness.mjs'
@@ -62,13 +62,34 @@ const R_COVERED_HOST_SOURCES = ['src/index.ts', 'src/upgrade.ts']
  *
  * 这是一条**会自己报警的登记**：命中数一旦变化（尤其是清零）就会红，
  * 逼着后来人把它挪进已纳入清单，而不是让"漏了一个文件"静默存在。
+ *
+ * ## `hits` 的口径（必须写清，否则这个数会与别人算的对不上）
+ *
+ * 单位是 **`hostUserLines()` 收进来的那一行**（= 用户会看到的一行，拼接链粒度），
+ * 判据是 **`violationsOf(value, 'host')` 非空**（也就是 R2 或 R3 命中），**不是**"含内部代号的行数"。
+ *
+ * 同一份 `src/envManager.ts` 在不同口径下差很多（实测，2026-09-20）：
+ *
+ * | 口径 | 单位 | 数 |
+ * |---|---|---|
+ * | 源码行，**含注释** | 行 | 116 |
+ * | 源码行，**剥注释** | 行 | 23 |
+ * | 用户可见渲染行，含内部代号 | 行 | 21 |
+ * | **用户可见渲染行，命中 R2 或 R3（本表用的）** | 行 | **28** |
+ *
+ * 28 = 21（R3 命中）+ 7（只命中 R2 的"冒号套冒号"行，与 R3 不重叠的那部分）。
+ * 差别全在**单位**上，不在词表或文件版本上：
+ *   · 含注释会多算（注释里合法地写着"层栈/挂载"，那是给维护者看的，不上屏）；
+ *   · 数源码行会把一条文案拆成多行（`'甲' +` 换行 `'乙'`）；
+ *   · 只数"含代号"会漏掉 R2 那一类（它们不含任何代号，但同样是用户可见的坏行）。
  */
 const R_UNCOVERED_HOST_SOURCES = [
   {
     file: 'src/envManager.ts',
     hits: 28,
     why: '本轮该文件由另一个在跑的写任务持有（task-80 正在改试装那一段），同时改同一批行必然冲突；'
-      + '它的命中集中在试装/副本那一组文案上，与该任务的改动面重叠。已请 Lead 裁决归属。',
+      + '它的命中集中在试装/副本那一组文案上，与该任务的改动面重叠。已请 Lead 裁决：'
+      + 'Lead 已开 task-89，阻塞在 task-80 之后（不塞给 task-80，避免污染那条阻断级修复的验证边界）。',
   },
 ]
 
@@ -231,6 +252,28 @@ const INTRO_LIMITS = { zh: 40, en: 100 }
  * 「字面条目的键必须都在产物字典里」两条断言兜住（后者同时能抓出忘了 build 的旧产物）。
  * @returns 条目列表（行号、键、值、原始行、是否字符串字面量）。
  */
+/**
+ * 列出某棵目录下所有源码文件（用于"字典键有没有被引用"这类跨文件判据）。
+ *
+ * 为什么不用 glob 库：本仓库的测试是零依赖的（只 import node: 内置模块与本地 harness），
+ * 引一个 glob 只为走一遍目录不值得。
+ *
+ * @param root - 起始目录（相对仓库根）。
+ * @returns 文件路径（相对仓库根，稳定排序）。
+ */
+function sourceFiles(root) {
+  const out = []
+  const walk = (dir) => {
+    for (const entry of readdirSync(dir)) {
+      const path = dir + '/' + entry
+      if (statSync(path).isDirectory()) walk(path)
+      else if (/\.(ts|tsx|mjs)$/.test(path)) out.push(path)
+    }
+  }
+  walk(root)
+  return out.sort()
+}
+
 function sourceEntries() {
   const out = []
   const lines = readFileSync(SOURCE, 'utf8').split('\n')
@@ -637,6 +680,71 @@ describe('UI 文案标准（DESIGN §12）', () => {
       '字典条目必须单行写全（值以逗号收尾）：换行会让源码扫描漏掉后半句')
   })
 
+
+  it('字典里没有死键（每个键都至少有一处引用）', () => {
+    // 为什么需要它（Lead 复核 task-88 时点名）：死键比没有键更坏——它看起来还在被用。
+    // `upgrade.canary.note`（`原因：{note}`）就是这样：渲染路径改成"reasonLabel + 逐行树"之后
+    // 它没有任何调用点，却仍留在字典里，下一个人会以为改它有用。
+    //
+    // 判据：字典的每个键，都必须在 src/ 或 tests/ 的某个非字典文件里以 `'键'` 的形式出现过。
+    // 用**字面量包含**而不是解析 AST：本仓库的调用都是 `t('字面量键')`，
+    // 而动态拼键（`t('a.' + x)`）在本仓库不存在——下面有一条断言钉住这个前提，
+    // 前提一旦被打破（有人开始拼键），这条护栏会红，而不是静默误报一堆"死键"。
+    const dict = dictionaries()
+    const keys = Object.keys(dict.zh)
+    // 前提自检：源码里不许有动态拼键的写法。
+    const dynamic = []
+    // 跳过本文件自己：它下面的注释里**举例**写了 `t('a.' + x)`，那是说明文字，不是真的在拼键。
+    // （判据扫的是源码字面量，分不出"举例"与"真用"——把本文件排除掉最省事，也不会漏掉真问题。）
+    for (const file of [...sourceFiles('src'), ...sourceFiles('tests')]) {
+      if (file.endsWith('client/locales.ts') || file.endsWith('tests/ui-copy.test.mjs')) continue
+      const text = readFileSync(file, 'utf8')
+      for (const match of text.matchAll(/\bt\(\s*['"`]([a-z][\w.]*)\.?['"`]\s*\+/g)) dynamic.push(file + ' :: ' + match[0])
+      for (const match of text.matchAll(/\bt\(\s*`[^`]*\$\{/g)) dynamic.push(file + ' :: ' + match[0])
+    }
+    assert.deepEqual(dynamic, [],
+      '这些地方在**动态拼字典键**：死键判据（按字面量找引用）会因此失效，请改成字面量调用'
+      + String.fromCharCode(10) + dynamic.join(String.fromCharCode(10)))
+    const blob = [...sourceFiles('src'), ...sourceFiles('tests')]
+      .filter(file => !file.endsWith('client/locales.ts'))
+      .map(file => readFileSync(file, 'utf8')).join(String.fromCharCode(10))
+    const dead = keys.filter(key => !blob.includes("'" + key + "'"))
+    // 未纳入本轮的欠账：它们**已经**登记在案，不在这里重复报（否则这条用例会一直红，
+    // 而一条长期红的用例等于没有用例）。每条都必须写明"谁的地盘 + 为什么先留着"。
+    // 注意：这张表里的键名**不能写成完整字面量**——否则它们会把自己"引用"上，
+    // 于是上面的 dead 判据永远看不到它们（判据是按字面量包含找引用的）。
+    // 所以统一用 join 拼出来：表在，但字面量不在。
+    const k = (...parts) => parts.join('.')
+    const KNOWN_DEAD = [
+      { key: k('trial', 'cleanupTitle'), why: '试装清理组的脚手架键，task-89（envManager 文案）一并处理' },
+      { key: k('trial', 'cleanupDesc'), why: '同上' },
+      { key: k('trial', 'planTitle'), why: '同上' },
+      { key: k('trial', 'planRemove'), why: '同上' },
+      { key: k('trial', 'planKeep'), why: '同上' },
+      { key: k('trial', 'planRow'), why: '同上' },
+      { key: k('market', 'moreTags'), why: '市场页的脚手架键，属 market-dev 的地盘' },
+      { key: k('upgrade', 'noTarget'), why: 'task-74 留下的脚手架键；R1/R2 改版后不再需要"无可升目标"这句' },
+      { key: k('upgrade', 'result.output'), why: '被 upgrade.result.commandOutput（R5 的标识行）取代' },
+      { key: k('upgrade', 'loadFailed'), why: 'task-77（关于 → 软件升级）会用到：检查失败的提示' },
+      { key: k('upgrade', 'checkedAt'), why: 'task-77 会用到：上次检查时间' },
+      { key: k('upgrade', 'neverChecked'), why: 'task-77 会用到：从未成功检查过' },
+      { key: k('upgrade', 'checking'), why: 'task-77 会用到：检查中…' },
+      { key: k('upgrade', 'notes'), why: 'task-77 会用到：检查说明' },
+      { key: k('upgrade', 'rollback.action'), why: 'task-77 会用到：回滚到 x.y.z 的按钮' },
+    ]
+    const known = new Set(KNOWN_DEAD.map(item => item.key))
+    const unexpected = dead.filter(key => !known.has(key))
+    assert.deepEqual(unexpected, [],
+      '这些字典键没有任何引用（死键）：要么删掉，要么写进 KNOWN_DEAD 并说明谁会用'
+      + String.fromCharCode(10) + unexpected.join(String.fromCharCode(10)))
+    // 反向：登记表里的键必须**仍然**是死的。清掉了就该从表里删——
+    // 否则这张表会慢慢变成"曾经死过的键"的坟场，而它的价值恰恰在于"现在还欠着谁"。
+    const revived = KNOWN_DEAD.filter(item => !dead.includes(item.key)).map(item => item.key)
+    assert.deepEqual(revived, [],
+      '这些键已经有引用了（或已删除），请把它们从 KNOWN_DEAD 里删掉：' + revived.join(', '))
+    const noReason = KNOWN_DEAD.filter(item => typeof item.why !== 'string' || item.why.trim() === '')
+    assert.deepEqual(noReason.map(item => item.key), [], '这些死键没写"谁会用/为什么先留着"')
+  })
   it('intro 类文案不超过一句话的长度上限，且不出现分号', () => {
     const dict = dictionaries()
     const introKeys = Object.keys(dict.zh).filter(key => key.endsWith('.intro'))
