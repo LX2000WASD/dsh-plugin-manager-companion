@@ -7,7 +7,7 @@
 
 | op | 请求体 | 成功返回 | 长操作 |
 |---|---|---|---|
-| `capabilities` | `{}` | `{ capabilities, config }` | |
+| `capabilities` | `{}` | `{ capabilities, config, trialDisclosure }` | |
 | `diagnose` | `{ layers?: DiagnosticLayer[], environment?: string }` | `DiagnosticReport` | job |
 | `fix` | `{ action: string, target?: string }` | `FixOutcome` | job |
 | `install` | `{ spec: string, enable?: boolean, answers?: Record<string,string> }` | `GatedInstallResult` | job |
@@ -26,6 +26,9 @@
 | `marketplace` | `{ refresh?: boolean }` | `MarketplaceResult` | |
 | `listKinds` | `{}` | `KindListResult` | |
 | `uninstallKind` | `{ repo: string }` | `EnvironmentResult` | job |
+| `trialEnvironments` | `{}` | `TrialEnvironmentReport` | |
+| `trialRemove` | `{ name: string }` | `EnvironmentResult` | |
+| `trialCleanup` | `{}` | `TrialCleanupResult` | job |
 | `getConfig` | `{}` | `CompanionConfig` | |
 | `setConfig` | `{ patch: Partial<CompanionConfig> }` | `CompanionConfig` | |
 | `job` | `{ id: string }` | `{ done, result?, error?, missing? }` | |
@@ -117,3 +120,141 @@ node_modules 实体、凭据、缓存都不进来——备份的价值是可重�
   与差异状态；界面上也不要加「该地址含令牌」之类的解释段（`DESIGN §12`）。
 - **启动方式**如实返回：终端窗口（带终端名）或后台。后台启动默认加 `--no-open`（没有人看着
   那个窗口，官方否则会在那台机器桌面弹浏览器）；终端模式保持官方默认行为。
+
+## 试装（质量门第二步，DESIGN §5.2/§5.3）
+
+**接入点**：`install` op（市场页安装、`dshpmc install`、`fix` 里的补装）都走同一个
+`gatedInstall`；试装接在**静态快筛之后、真正放行之前**，所以三个入口同时生效，没有一个能绕过。
+
+### 开启与关闭
+
+- **默认关闭**。关闭时安装路径的语义与没有试装时逐条相同（现有测试即证据）。
+- 开关在 `CompanionConfig.trial.enabled`。**配置里没有 `trial` 字段 = 关闭**：
+  读配置一律走 `effectiveTrialConfig()`，缺字段/类型不对/越界都回落到安全默认值
+  （schema 的默认值只在官方 settings 解析过那份配置时成立，不是运行期保证）。
+- **质量门整体关闭**（`qualityGate.enabled=false`）或**包在豁免名单里**时试装**不执行**，
+  但结果里会带 `trial.policy='skipped'` 并写明理由——"我打开了开关却什么都没发生"必须是可见的。
+- 静态快筛就拦下的包不进入试装（结果里没有 `trial` 字段）。
+
+### 结论与处置（四值 × 两档，不得混）
+
+| `trial.conclusion` | 含义 |
+|---|---|
+| `passed` | 基线挂载 + 装完候选包仍挂载 |
+| `baseline-broken` | 快照基线本身就起不来：**不是候选包的问题** |
+| `candidate-broken` | 基线好、装完候选包起不来：候选包导致的（附根因链）|
+| `cannot-trial` | 没有得到有效判定（禁网且 store 里没有、跨环境、超限、超时等）——**不算通过** |
+
+`trial.policy` 说明这次**装没装**：
+
+| 设置 `trial.onFailure` | conclusion ≠ passed 时的行为 |
+|---|---|
+| `block`（默认）| 不安装：`ok:false` + 官方 removeBundle 回滚 + `rolledBack` + 原因链 |
+| `warn` | 照常安装（`ok:true`），结论照样写在 `trial` 里，输出里写明"按 warn 模式放行" |
+
+两档都**不会**把 `cannot-trial` 写成通过；`warn` 下输出里也不会出现"试装通过"这类字眼。
+
+### 快照深度（`trial.depth`）
+
+| 值 | 行为 |
+|---|---|
+| `auto`（默认）| 先浅快照；只有基线**明确挂载失败**才升级为完整快照重试一次；`undetermined`（判不出来）**不升级** |
+| `shallow` | 只用浅快照（省一次官方 install；层栈不全时可能把"快照缺依赖"报成"基线起不来"）|
+| `full` | 每次都跑官方 `install --prefer-offline` 物化真实快照（59ms 热 / 831ms 冷）|
+
+结论里永远带 `trial.depth` 与 `trial.escalated`（是否升过级）——界面不许把 shallow 的结论说成
+"完整验证"。候选包不会被"先激活再回滚"：装进去时就是 `enabled:false`。
+
+### 测试环境（`<真实环境名>-dpmc`）
+
+- 命名与归属见 DESIGN §5.4；**一个真实环境一个测试环境**，禁止重命名，不得当成真实环境操作。
+- 快照源必须是**包真正会落地的那个环境**。官方安装通道（`ctx.pluginManager`）只作用于**当前环境**，
+  所以请求里 `environment` 指向别的环境时试装直接报 `cannot-trial`：
+  验证的环境与落地的环境不是同一个时，结论没有意义。
+- `trialEnvironments` 是**纯读**：它返回列表、占地、计划预览（下次清理会删谁/留谁），**不删任何东西**。
+  删除只有两个入口：`trialRemove`（单个）与 `trialCleanup` / 试装结束时的自动清理（按保留期）。
+- 删除的三重纪律（引擎实现，op 不改）：只删形如 `<名>-dpmc` 的环境 / 运行中先拒 /
+  进程事实不可读就拒。孤儿测试环境（真实环境已改名或删除）同样纳入清理。
+- 占地口径：`bytes` 是 **st_size 合计（apparent）**，不是独占磁盘；`sharedFiles` 是 nlink>1 的文件数
+  （pnpm store 硬链接，实测一个 12 MiB 的测试环境独占只有 36 KiB）。界面引用 `bytes` 时应当同时
+  提到"其中 N 个是硬链接"，否则会把"看着大、实际不占"说成"占了很多盘"。
+- `retention.days` / `retention.autoCleanup` / `retention.maxKept` 直接来自生效配置，
+  界面**不要自己拼默认值**。
+- **上限（`trial.maxKept`，0 = 不限）的语义是"拒绝执行"，不是"删掉最旧的腾位"**：
+  达到上限时新的一轮试装报 `cannot-trial` 并告诉用户先清理。删除只发生在两处——
+  用户自己点删除、或超过保留期的清理（这正是 §5.3"不设硬上限"的意思）。
+- 清理记账：`<DSH_HOME>/dpmc-trial-cleanup.log`（0600），每行"removed/kept <名字>：<原因>"。
+
+### 告知义务（设置页必须显示的事实）
+
+`capabilities` 的 `trialDisclosure` 给两条**机器可读**的事实，文案由 UI 落地、数字不要各抄一份：
+
+```json
+{
+  "executesCandidateCode": true,
+  "peakMemoryMiB": 161,
+  "measurement": "实测口径：headless 验证启动的 maxrss 峰值 161 MiB，在 Linux x64 / Node 24 / DSH 0.1.6-alpha.2 上量得；候选包自带的安装脚本会真的在你机器上执行。"
+}
+```
+
+引用数字时必须一起给出 `measurement`（否则数字没有意义）。
+
+### 配置键（`CompanionConfig.trial`）
+
+| 键 | 默认 | 用户在设置页看到的后果 |
+|---|---|---|
+| `enabled` | `false` | 开启后会真装候选包并执行它的安装脚本；一次验证启动内存峰值约 161 MiB；一轮约 0.65s |
+| `depth` | `'auto'` | 只影响结论的可信度与耗时；结论里永远写明实际用了哪种 |
+| `baseline` | `true` | 关掉省约 558ms，但失败时说不清是不是候选包的问题（结论降级为"无法试装"）|
+| `allowNetwork` | `true` | 关掉只用本地 store，冷包直接"无法试装"，**不假装通过** |
+| `onFailure` | `'block'` | 未通过时不装（默认）或只警告 |
+| `autoCleanup` | `true` | 试装结束时按保留期清理过期测试环境；关掉则只增不减（仍可手动清理）|
+| `retentionDays` | `14` | 超过这个天数没被用过的测试环境会被删；运行中的不删 |
+| `maxKept` | `0`（不限）| 设成 N 后超限的试装会拒绝执行并提示先清理 |
+
+`trial` 段在 TypeScript 里是**可选**字段（客户端镜像配置形状的节奏与宿主不同步，
+写成必填会让"宿主加字段"变成"客户端编译失败"）；运行期由 schema 补齐。
+
+### 真机实测的两条限制（2026-09-19，临时 DSH_HOME + 3531；构建 md5=a590ce908218）
+
+1. **含 web app 的环境今天拿不到判定。** 验证启动的形态是 `<dsh> --profile <name>`（不给任务、不指定端口）。
+   实测（GUI 正占着 3080）：
+   - 默认端口冲突：profile 的 web 层会去绑 3080 → `EADDRINUSE` → 整棵树挂不起来。
+     照原样读会被归因成"基线起不来"（错误归因）；host 侧已把它降级为 `cannot-trial` 并给出精确原因。
+   - 把兜底端口让开（证据脚本里把 webserver 的兜底端口改成 0）之后：树**挂载成功，但进程以服务形态常驻**，
+     30s 超时被杀、stderr 为空 → `undetermined` → 同样只能给 `cannot-trial`。
+   结论：今天只有**不带 web 层**的环境（headless 模板）才可能得到 `passed`。
+   候选修复方向（动的是 §5.2 的"验证形态"，需要设计批准）：验证启动改用服务形态，并以官方打印的
+   `dsh web: http://…?token=…`（它的注释写明"在 Loader 树 settle 之后才打印"）当作挂载凭证，随后杀掉子进程；
+   或者为试装环境覆写 webserver 端口，并换一个能在服务形态下收敛的判据。
+2. **浅快照会复用上一次完整快照留下的 `node_modules`。** `createTrialEnvironment` 复用已存在的测试环境，
+   而浅快照只覆盖那几个清单文件。实测第二次试装的 `shallow` 带着上一次 full 物化出来的依赖（因此它挂载成功）。
+   结论本身不错，但"这次是浅快照"的语义被稀释了：要么物化前显式清理，要么在结论里标注。
+
+### 客户端跟进事项（UI 任务）
+
+- `GatedInstallResult` 新增 `trial` 字段（`conclusion/policy/depth/escalated/baseline/candidate/elapsedMs/output/policyNote`）：
+  `policy='warned'/'blocked'` 时不要把结论渲染成成功态。
+- `src/client/wire.ts` 的配置默认形状需要补 `trial` 段（`normalizeConfig` 也要填默认值），
+  否则设置页草稿里 `draft.trial` 是 undefined；跳过的情形（`policy='skipped'`）要有专门文案。
+
+## 升级动作的客户端约束（Lead 决定，宿主侧无新 op）
+
+官方插件页只有三个槽位（`plugins.item` / `plugins.bundle.config` / `plugins.row.config`）；
+卸载按钮与启用开关在 `PluginManagerPage.tsx:433-452` 的官方 chrome 里，**没有槽位**——
+所以"升级"不放在删除按钮旁边，也不用 DOM 注入。
+
+| 落点 | 做法 |
+|---|---|
+| ① 主落点 | `plugins.bundle.config` 按包名注册（一行"当前 x → 最新 y ｜ 升级"，只在该包有更新时出现）|
+| ② 市场页 | 已装条目的卡片上加"升级到 x.y.z"（零新机制，可选）|
+| ③ 关于 → 软件升级 | 批量视图（另一个任务）|
+
+硬约束（每条都对应一个已核实的事实）：
+
+- **安装方提供的层在 profile 内升级不了**：官方 `list_bundles` 的 `installed === false` /
+  `removable === false` 就是这条事实（已核实 web profile manifest：`bundles` 里有、`dependencies` 里没有）。
+  这些条目只显示"由安装方提供"+ 对应命令，**不给按钮**。
+- **生效时机沿用官方口径**（官方安装成功文案即"下次启动后加载"），不自造"已立即生效"。
+- **版本查询失败必须显示"查不到"**，不得显示"已是最新"（查不到 ≠ 是最新版）。
+

@@ -13,7 +13,8 @@
 
 import type { Context } from "@deepseek-ai/cordis"
 import { analyzeEnvironment } from "./diagnostics.ts"
-import { DEFAULT_ENVIRONMENT_TEMPLATE, backupDiff, backupExport, backupRestore, copyPlugins, createEnvironment, environmentTemplates, listEnvironments, removeEnvironment, renameEnvironment, repairDependencies, scanRuns, startEnvironment, stopEnvironment } from "./envManager.ts"
+import { DEFAULT_ENVIRONMENT_TEMPLATE, backupDiff, backupExport, backupRestore, cleanupTrialEnvironments, copyPlugins, createEnvironment, environmentFingerprint, environmentTemplates, listEnvironments, listTrialEnvironments, planTrialCleanup, processFacts, removeEnvironment, removeTrialEnvironment, renameEnvironment, repairDependencies, runTrialInstall, scanRuns, startEnvironment, stopEnvironment, trialEnvironmentName } from "./envManager.ts"
+import type { SnapshotDepth, TrialConclusion, TrialInstallOptions, TrialInstallResult } from "./envManager.ts"
 import { findOrphanKindDirs, kindDirsOf, loadKindRecords, presetsRoot, pruneGhostRecords, removeKindDir, removeKindRecord, skillsRoot } from "./kinds.ts"
 import { buildInstalledIndex, cachedMarketplace, invalidateInstalledIndex, registryItems } from "./marketplace.ts"
 import { probeOfficialCapabilities, requireManager, type OfficialCapabilities } from "./official.ts"
@@ -25,10 +26,10 @@ import { findPluginMatches } from "./match.ts"
 import { registerGuard } from "./guard.ts"
 import { registerCompanionTools } from "./tools.ts"
 import { BODY_LIMIT_DEFAULT, JobRegistry, ROUTE_PREFIX, isJsonPost, isTrustedRequest, readJsonBody, sendJson, type Envelope } from "./rest.ts"
-import { fallbackConfigHandle, registerConfig, type CompanionConfig, type ConfigHandle } from "./settings.ts"
-import type { DiagnosticLayer, DiagnosticReport, EnvironmentInfo, EnvironmentResult, GatedInstallResult, KindListResult, MarketplaceResult } from "./types.ts"
+import { TRIAL_DISCLOSURE, effectiveTrialConfig, fallbackConfigHandle, registerConfig, type CompanionConfig, type ConfigHandle, type TrialConfig } from "./settings.ts"
+import type { BootVerdictKind, DiagnosticLayer, DiagnosticReport, EnvironmentInfo, EnvironmentResult, GatedInstallResult, GatedInstallTrial, KindListResult, MarketplaceResult, TrialCleanupResult, TrialEnvironmentInfo, TrialEnvironmentReport, TrialPolicyOutcome } from "./types.ts"
 import type { IncomingMessage, ServerResponse } from "node:http"
-import { existsSync, lstatSync, readlinkSync } from "node:fs"
+import { existsSync, lstatSync, readdirSync, readlinkSync } from "node:fs"
 import { join } from "node:path"
 
 /** 本插件对外的服务名。绝不用 pluginManager —— 那是官方的。 */
@@ -155,6 +156,396 @@ function rollbackState(dir: string | null, name: string): { lines: string[]; cle
   }
 }
 
+// ── 试装（质量门第二步，DESIGN §5.2）─────────────────────────────────────
+
+/**
+ * 试装执行器（测试注入替身）。
+ *
+ * 为什么要留这个缝：试装会真起进程（headless 验证）。单测要证明的是"接进来了、策略生效了"，
+ * 不能靠真的起一个 dsh 来证明——那是真机 e2e 的活。
+ */
+export type TrialRunner = (
+  spec: string, realName: string, options: TrialInstallOptions,
+) => Promise<TrialInstallResult>
+
+/** gatedInstall 的可选注入。 */
+export interface GatedInstallOptions {
+  /** 试装执行器；省略时用真实的 runTrialInstall（会真装、真起进程）。 */
+  readonly trial?: TrialRunner
+}
+
+/**
+ * 四种结论各自的短标签（措辞与 §5.2 一一对应，不得混用）。
+ *
+ * 用法约定：这些短句直接拼进结果里，**不再套"试装未通过："之类的前缀**——
+ * "无法试装（不算通过），已回滚 X" 比 "试装未通过（无法试装（不算通过）），已回滚 X" 可读得多。
+ */
+const TRIAL_LABEL: Record<TrialConclusion, string> = {
+  "passed": "试装通过",
+  "baseline-broken": "快照基线起不来（不是候选包的问题）",
+  "candidate-broken": "候选包导致挂载失败",
+  "cannot-trial": "无法试装（不算通过）",
+}
+
+/**
+ * 验证启动失败是不是"端口绑不上"这类基础设施原因。
+ *
+ * 为什么必须单独认它（真机实测 2026-09-19）：含 web app 的环境在验证启动时（不给任务、
+ * 不指定端口）会去绑 web-app 补丁里的默认端口 3080；GUI 正跑在那个端口上时必然
+ * EADDRINUSE，整棵树因此挂不起来。把它照原样报成"基线起不来"是**错误的归因**——
+ * 用户会以为自己的环境坏了（甚至去改环境），而真实原因与他和候选包都无关。
+ *
+ * 只在**基线**失败时降级：基线里没有候选包的任何代码，端口冲突只可能来自环境自身或外部进程。
+ *
+ * @param verdict - 一次挂载验证的判定（引擎的 BootVerdict 结构式视图）。
+ * @returns 冲突地址（host:port）；不是端口冲突时 null。
+ */
+function bootPortConflict(verdict: { readonly kind: string; readonly reason?: string; readonly chain?: readonly string[] } | null): string | null {
+  if (verdict === null || verdict.kind !== "failed") return null
+  const text = [verdict.reason ?? "", ...(verdict.chain ?? [])].join("\n")
+  if (!/EADDRINUSE|address already in use/i.test(text)) return null
+  const hit = /address already in use[ :]*([0-9a-zA-Z.:\[\]_-]+)/i.exec(text)
+  return hit === null ? "（错误里没写地址）" : hit[1]
+}
+
+/** 当前环境名（官方 profileContext 的 name）；读不到时为 null。 */
+function currentEnvironmentName(ctx: Context): string | null {
+  const profileContext = ctx.get("profileContext") as { name?: unknown } | undefined
+  const name = profileContext?.name
+  return typeof name === "string" && name.length > 0 ? name : null
+}
+
+/** 试装未通过时按设置决定处置（**两种模式都不把"无法试装"当成通过**）。 */
+function trialPolicyFor(trial: TrialConfig, conclusion: TrialConclusion): { policy: TrialPolicyOutcome; policyNote: string } {
+  if (conclusion === "passed") return { policy: "passed", policyNote: "试装通过" }
+  if (trial.onFailure === "warn") {
+    return { policy: "warned", policyNote: TRIAL_LABEL[conclusion] + "，按 warn 模式照常安装" }
+  }
+  return { policy: "blocked", policyNote: TRIAL_LABEL[conclusion] + "，按 block 模式未安装并已回滚" }
+}
+
+/**
+ * 试装已开启但这次没执行时的摘要（质量门整体关闭 / 包在豁免名单里）。
+ *
+ * 结论写 cannot-trial、处置写 skipped：它**不是**通过。界面据此说"试装未执行"，
+ * 而不是让用户以为这个包被验证过了。
+ *
+ * @param config - 本插件配置。
+ * @param reason - 没执行的原因（面向用户）。
+ * @returns 结论摘要。
+ */
+function trialSkipSummary(config: CompanionConfig, reason: string): GatedInstallTrial {
+  return {
+    conclusion: "cannot-trial", policy: "skipped", depth: undefined, escalated: false,
+    baseline: null, candidate: null, elapsedMs: 0,
+    output: "试装未执行：" + reason + "。这个包没有经过试装验证——它并没有通过试装。",
+    policyNote: reason,
+  }
+}
+
+/**
+ * 本次试装要不要为"数量上限"停在门外（§5.3 的最多保留数；0 = 不限）。
+ *
+ * 上限的语义刻意做成**拒绝执行**而不是"删掉最旧的一个腾位"：删除只允许发生在两处
+ * （用户自己点删除、或超过保留期的自动清理）。为了腾位而隐式删除，正是本仓库在
+ * removeTrialEnvironment 里明确拒绝过的形态（"不做先停后删的隐式动作"）。
+ *
+ * @param realName - 真实环境名（测试环境由它派生）。
+ * @param maxKept - 上限；0 = 不限。
+ * @returns 超限时返回面向用户的说明；否则 null。
+ */
+function trialSlotBlocked(realName: string, maxKept: number): string | null {
+  if (maxKept <= 0) return null
+  const listed = listTrialEnvironments()
+  const target = trialEnvironmentName(realName)
+  const others = listed.candidates.filter(candidate => !sameEnvironment(candidate.name, target))
+  if (others.length < maxKept) return null
+  return "测试环境已经有 " + String(others.length) + " 个（你设的上限是 " + String(maxKept)
+    + "）：先删掉不再需要的（每个测试环境都能单独删），或把上限调大。"
+    + "试装不会为了腾位偷偷删掉任何一个测试环境。"
+}
+
+/**
+ * 跑一次试装，并把它折成这次安装能用的结论摘要（§5.2 的受控对照四步在引擎里）。
+ *
+ * 三件事在接进来这一层做，因为它们都是**接入层的判断**，不是引擎的判断：
+ *   1. 受控对照的"真实环境"必须是**包真正会落地的那个环境**。官方安装通道只作用于当前环境
+ *      （ctx.pluginManager 就是当前 profile 的管理器），所以请求里指定了别的环境时，
+ *      验证的环境与落地的环境不是同一个——这种结论毫无意义，如实报"无法试装"。
+ *   2. 数量上限（§5.3）在起进程之前判，省掉一整轮无用的安装。
+ *   3. 试装跑完后按保留期顺手清理过期测试环境（§5.4；可在设置里关）。
+ *
+ * 任何异常都折成 cannot-trial（**不算通过**），绝不让一次异常变成"静默放行"。
+ *
+ * @param ctx - host 上下文（引擎用它取官方安装锚点与 pnpm 通道）。
+ * @param config - 本插件配置。
+ * @param spec - 候选包 spec。
+ * @param targetName - 调用方给的安装目标环境名（可能为空字符串 = 当前环境）。
+ * @param runner - 试装执行器。
+ * @returns 结论摘要。
+ */
+async function runTrialStep(
+  ctx: Context, config: CompanionConfig, spec: string, targetName: string, runner: TrialRunner,
+): Promise<GatedInstallTrial> {
+  const trial = effectiveTrialConfig(config)
+  /** 试装没跑起来时的摘要：一律 cannot-trial（占位字段为 null / 省略）。 */
+  const cannotTrial = (reason: string): GatedInstallTrial => {
+    const { policy, policyNote } = trialPolicyFor(trial, "cannot-trial")
+    return {
+      conclusion: "cannot-trial", policy, depth: undefined, escalated: false,
+      baseline: null, candidate: null, elapsedMs: 0, output: "无法试装：" + reason, policyNote,
+    }
+  }
+  const realName = currentEnvironmentName(ctx) ?? runtime?.capabilities.environmentName ?? ""
+  if (realName.length === 0) {
+    return cannotTrial("读不到当前环境名（官方 profileContext 不可用），无法确定候选包会落进哪个环境，也就没有可以对照的快照源。")
+  }
+  if (targetName.length > 0 && !sameEnvironment(targetName, realName)) {
+    return cannotTrial("这次安装的目标是 " + targetName + "，但官方安装通道只作用于当前环境 " + realName
+      + "：试装验证的环境与包真正落地的环境必须是同一个，所以做不了受控对照。请在当前环境里安装，或改用跨环境通道（dshpmc）。")
+  }
+  const slot = trialSlotBlocked(realName, trial.maxKept)
+  if (slot !== null) return cannotTrial(slot)
+
+  let result: TrialInstallResult
+  try {
+    result = await runner(spec, realName, {
+      ctx,
+      depth: trial.depth,
+      baseline: trial.baseline,
+      allowNetwork: trial.allowNetwork,
+      // 层栈事实取官方 listBundles（这台的插件管理器就是当前环境的管理器）。
+      // 拿不到时引擎会自己回落到 manifest 并如实标注口径，不需要这里兜。
+      listBundles: async () => (await requireManager(ctx).listBundles()).map(bundle => bundle.name),
+    })
+  } catch (error) {
+    return cannotTrial("试装执行时出错：" + (error instanceof Error ? error.message : String(error)))
+  }
+  // 归因修正：基线挂载失败且原因是"端口绑不上"时，这不是环境坏了、也不是候选包的问题。
+  // 照原样报 baseline-broken 会误导用户去修一个其实没坏的环境，所以降级为"无法试装"。
+  let conclusion = result.conclusion
+  let output = result.output
+  const baselineConflict = bootPortConflict(result.baseline)
+  const baselineUndetermined = result.baseline !== null && result.baseline.kind === "undetermined"
+  if (baselineConflict !== null && conclusion !== "passed") {
+    // 端口冲突这一支：**整段替换**引擎的结论叙述。
+    // 为什么替换而不是"在前面加一句"：引擎那段会说"快照基线起不来 / 这个环境当前状态有问题"，
+    // 而端口冲突下这两句都不成立（真机实测：GUI 占着 3080，验证启动必然撞上它）。
+    conclusion = "cannot-trial"
+    output = trialNarrative(result, [
+      "无法试装：验证启动绑不上端口（" + baselineConflict + " 已被占用）。",
+      "这不是候选包的问题，也不是环境坏了：含 web app 的环境在验证启动时（不给任务、不指定端口）"
+        + "会去绑它自己的默认端口，而那个端口正被别的进程占着。占用者是谁需要你自己确认；"
+        + "端口空出来之后，这次验证才有意义。",
+    ])
+  } else if (baselineUndetermined) {
+    // 基线"判不出来"这一支同样替换：引擎会说"快照基线本身就起不来"，但那句话没被任何事实支持
+    // （判不出来恰恰是"不知道"）。真机实测：含 web app 的环境在验证启动里以**服务形态常驻**，
+    // 30s 超时后被杀、stderr 为空——既没挂载成功的凭证，也没有失败凭证。
+    output = trialNarrative(result, [
+      "无法试装：验证启动没有给出判定——它既没挂载成功，也没报挂载失败"
+        + (result.baseline !== null && result.baseline.kind === "undetermined" ? "（" + result.baseline.reason + "）" : "") + "。",
+      "这是验证形态给不出结论，不是候选包的问题，也不是环境坏了。",
+    ])
+  }
+  // 候选启动失败时的端口冲突是**有歧义**的（可能是候选包自己要绑那个端口），
+  // 所以结论不动，只把这条事实补进输出——让人能判断，而不是由我们替他下结论。
+  const candidateConflict = bootPortConflict(result.candidate)
+  if (candidateConflict !== null) {
+    output += "\n注意：候选启动的失败形态是端口冲突（" + candidateConflict + " 已被占用）："
+      + "可能是候选包自己要绑这个端口，也可能是与环境里已有进程冲突，需要人工判断。"
+  }
+  const { policy, policyNote } = trialPolicyFor(trial, conclusion)
+  const cleanupNote = await maybeAutoCleanupTrialEnvironments(config)
+  return {
+    conclusion,
+    policy,
+    depth: result.depth,
+    escalated: result.escalated,
+    escalationReason: result.escalationReason,
+    baseline: result.baseline?.kind ?? null,
+    candidate: result.candidate?.kind ?? null,
+    elapsedMs: result.elapsedMs,
+    output: cleanupNote === null ? output : output + "\n" + cleanupNote,
+    policyNote,
+  }
+}
+
+/**
+ * 试装没能给出结论时，用**接入层拿得到的结构化事实**拼一份结论叙述。
+ *
+ * 为什么不直接复用引擎的 output：引擎那一段会把"验证启动没跑起来"写成
+ * "快照基线起不来 / 这个环境当前状态有问题"——在没有失败凭证的情况下那是**错误的归因**
+ * （真机实测两例：GUI 占着 3080 导致的口冲突；以及含 web app 的环境以服务形态常驻、
+ * 30s 超时被杀）。这里只用事实：判定说了什么、深度、耗时、原始根因链、构建指纹。
+ *
+ * @param result - 引擎给的试装结果（结构化事实）。
+ * @param head - 这段结论自己要说清的话（面向用户）。
+ * @returns 面向用户的结论叙述。
+ */
+function trialNarrative(result: TrialInstallResult, head: readonly string[]): string {
+  const chain = result.baseline !== null && result.baseline.kind === "failed" ? result.baseline.chain : []
+  const depthLine = "实际深度：" + String(result.depth)
+    + (result.escalated ? "（由 shallow 升级：" + String(result.escalationReason) + "）" : "")
+    + "｜验证耗时 " + String(result.elapsedMs) + "ms"
+  const buildLine = "构建：md5=" + (result.build.artifactMd5 === null ? "不可读" : result.build.artifactMd5.slice(0, 12))
+    + (result.build.gitHead === null ? "（读不到 git HEAD）" : " head=" + result.build.gitHead.slice(0, 12))
+  return [
+    ...head,
+    depthLine,
+    chain.length === 0 ? "" : "根因（验证启动的原始输出）：\n" + chain.join("\n"),
+    buildLine,
+  ].filter(line => line.length > 0).join("\n")
+}
+
+/**
+ * 试装结束后顺手清理过期测试环境（§5.4；开关与天数在设置里）。
+ *
+ * 只删**超过保留期**且**没在运行**的（判定在引擎的清理计划里，删不动就如实记账）。
+ * 没有任何过期项时返回 null——不做无意义的打扰。清理失败**不影响**本次安装结论。
+ *
+ * @param config - 本插件配置。
+ * @returns 面向用户的一句清理结果；没有可清理项时为 null。
+ */
+async function maybeAutoCleanupTrialEnvironments(config: CompanionConfig): Promise<string | null> {
+  const trial = effectiveTrialConfig(config)
+  if (!trial.autoCleanup) return null
+  try {
+    const result: TrialCleanupResult = await cleanupTrialEnvironments({ retainDays: trial.retentionDays })
+    if (result.removed.length === 0 && result.ok) return null
+    return "测试环境自动清理：\n" + result.output
+  } catch (error) {
+    return "测试环境自动清理失败（不影响本次安装）：" + (error instanceof Error ? error.message : String(error))
+  }
+}
+
+/** 目录占地的统计预算（超过就如实说"没统计完"，不让页面卡在一次遍历上）。 */
+const USAGE_FILE_BUDGET = 20_000
+
+/**
+ * 目测一个目录的占地（apparent 字节合计 + 文件数 + 硬链接数）。
+ *
+ * 口径必须说清：这是 **st_size 的合计**，不是"独占磁盘"。pnpm 的 store 用硬链接，
+ * 实测一个 12 MiB 的测试环境独占只有 36 KiB（1243/1247 个文件 nlink>1）——所以
+ * sharedFiles 一起给出来，界面才能说清"看着大、实际不占"。
+ * 符号链接只计链接本身、不跟进目标（跟进会把 store 里的内容重复算进来）。
+ *
+ * @param root - 目录。
+ * @returns 统计结果；截断或读不到时 bytes 为 null 并给原因。
+ */
+function directoryUsage(root: string): { bytes: number | null; files: number; sharedFiles: number; reason?: string } {
+  let bytes = 0
+  let files = 0
+  let sharedFiles = 0
+  const stack = [root]
+  try {
+    while (stack.length > 0) {
+      const dir = stack.pop() as string
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const path = join(dir, entry.name)
+        if (entry.isDirectory()) {
+          stack.push(path)
+          continue
+        }
+        if (files >= USAGE_FILE_BUDGET) {
+          return { bytes: null, files, sharedFiles, reason: "目录里文件数超过 " + String(USAGE_FILE_BUDGET) + " 个，没统计完（避免拖住页面）" }
+        }
+        const stat = lstatSync(path)
+        files += 1
+        if (stat.isSymbolicLink()) continue
+        bytes += stat.size
+        if (stat.nlink > 1) sharedFiles += 1
+      }
+    }
+  } catch (error) {
+    return { bytes: null, files, sharedFiles, reason: "统计失败：" + (error instanceof Error ? error.message : String(error)) }
+  }
+  return { bytes, files, sharedFiles }
+}
+
+/**
+ * 测试环境的快照清单是否仍与真实环境一致（§5.4 第二步的"比对"那一步，只读、不改）。
+ *
+ * 比的是三件套的**内容 hash**（package.json / pnpm-lock.yaml / cordis.patch.yml）：
+ * 不一致只意味着"下次试装会重新物化"，不是错误，所以两态都如实给出。
+ *
+ * @param trialEnvName - 测试环境名。
+ * @param ownerName - 归属的真实环境名。
+ * @returns 是否一致；读不到时为 null。
+ */
+async function snapshotMatchesOwner(trialEnvName: string, ownerName: string): Promise<boolean | null> {
+  try {
+    const [snapshot, owner] = await Promise.all([
+      environmentFingerprint(trialEnvName),
+      environmentFingerprint(ownerName),
+    ])
+    return snapshot.manifestHash === owner.manifestHash
+      && snapshot.lockfileHash === owner.lockfileHash
+      && snapshot.patchHash === owner.patchHash
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 测试环境的查询报告（op: trialEnvironments）。
+ *
+ * 纯读：这个 op **不删任何东西**（计划只作为 preview 给界面），删除只有两个入口——
+ * 用户点单个删除（trialRemove）与显式/自动清理（trialCleanup）。
+ *
+ * @param config - 本插件配置（保留策略从这里读，界面不要自己拼默认值）。
+ * @returns 报告。
+ */
+async function trialEnvironmentReport(config: CompanionConfig): Promise<TrialEnvironmentReport> {
+  const trial = effectiveTrialConfig(config)
+  const listed = listTrialEnvironments()
+  const plan = planTrialCleanup(listed.candidates, { retainDays: trial.retentionDays })
+  const notes: string[] = []
+  if (!listed.factsReadable) {
+    notes.push("进程事实读不到（" + String(listed.reason ?? "原因未知") + "）：运行状态按未知处理，"
+      + "清理计划因此不会删任何东西（不在未知状态下动磁盘）。")
+  }
+  const now = Date.now()
+  const environments: TrialEnvironmentInfo[] = []
+  let bytes = 0
+  let unknownBytes = 0
+  let running = 0
+  for (const candidate of listed.candidates) {
+    const dir = pathEnvironmentDir(candidate.name)
+    const ownerDir = environmentDirOrNull(candidate.owner)
+    const ownerExists = ownerDir !== null && existsSync(join(ownerDir, "package.json"))
+    const usage = directoryUsage(dir)
+    if (usage.bytes === null) unknownBytes += 1
+    else bytes += usage.bytes
+    if (candidate.running) running += 1
+    environments.push({
+      name: candidate.name,
+      owner: candidate.owner,
+      ownerExists,
+      dir,
+      running: candidate.running,
+      modifiedAtMs: candidate.modifiedAt,
+      modifiedAt: new Date(candidate.modifiedAt).toISOString(),
+      ageDays: Math.round((now - candidate.modifiedAt) / 86_400_000 * 10) / 10,
+      bytes: usage.bytes,
+      files: usage.files,
+      sharedFiles: usage.sharedFiles,
+      bytesReason: usage.reason,
+      snapshotMatchesOwner: ownerExists ? await snapshotMatchesOwner(candidate.name, candidate.owner) : null,
+    })
+  }
+  return {
+    environments,
+    factsReadable: listed.factsReadable,
+    factsReason: listed.reason,
+    totals: { count: environments.length, running, bytes, unknownBytes },
+    retention: { days: trial.retentionDays, autoCleanup: trial.autoCleanup, maxKept: trial.maxKept },
+    plan: { remove: [...plan.remove], keep: [...plan.keep] },
+    overCap: trial.maxKept > 0 && environments.length >= trial.maxKept,
+    notes,
+  }
+}
+
 /**
  * 受质量门保护的安装。
  *
@@ -169,14 +560,24 @@ function rollbackState(dir: string | null, name: string): { lines: string[]; cle
  * 装上但不激活，等于把包放进隔离区，扫完再决定是否放行——比"先扫后装"更可靠，
  * 因为扫描对象真实存在于目标位置。
  *
+ * 试装（第二步，DESIGN §5.2）接在**静态快筛之后、真正放行之前**：一条路径，Web UI /
+ * CLI / agent 工具三边同时生效。试装关闭时（默认）本函数的行为与没有它时逐条相同。
+ *
+ * 两处刻意的实现细节：
+ *   · 质量门**整体**关闭或包在豁免名单里时，试装不执行——但会在输出里写明"试装未执行"，
+ *     不让"我打开了开关却什么都没发生"变成一个看不见的洞。
+ *   · 试装没通过时的处置由设置决定（默认不装），但**无论哪一档**，"无法试装"都不会被写成通过。
+ *
  * @param ctx - host 上下文。
  * @param config - 本插件配置。
  * @param spec - 安装 spec（npm 名 / git 地址 / 本地路径 / tarball）。
  * @param environmentName - 目标环境名；undefined 表示当前环境。
- * @returns 结果；失败时输出里说明是官方拒绝、质量门拦截还是激活失败。
+ * @param options - 可选注入（试装执行器）。
+ * @returns 结果；失败时输出里说明是官方拒绝、质量门拦截、试装未通过还是激活失败。
  */
 export async function gatedInstall(
   ctx: Context, config: CompanionConfig, spec: string, environmentName?: string,
+  options: GatedInstallOptions = {},
 ): Promise<GatedInstallResult> {
   const manager = requireManager(ctx)
   const inspected = await manager.inspect(spec)
@@ -192,10 +593,23 @@ export async function gatedInstall(
     }
   }
   const packageName = installed.bundle
+  const trialConfig = effectiveTrialConfig(config)
   if (!config.qualityGate.enabled || config.qualityGate.allowlist.includes(packageName)) {
     await manager.setBundleEnabled(packageName, true)
     invalidateInstalledIndex(environmentName ?? "")
-    return { ok: true, output: `已安装并启用 ${packageName}（质量门未启用）`, packageName, gateIssues: [] }
+    // 开关被打开却什么都没发生，必须说出来（否则用户以为试装保护着他）。
+    const skippedTrial = trialConfig.enabled
+      ? trialSkipSummary(config, config.qualityGate.enabled
+        ? "包名在质量门豁免名单里（豁免 = 跳过全部检查）"
+        : "质量门整体已关闭")
+      : undefined
+    return {
+      ok: true,
+      output: `已安装并启用 ${packageName}（质量门未启用）`
+        + (skippedTrial === undefined ? "" : `（试装未执行：${skippedTrial.policyNote}）`),
+      packageName, gateIssues: [],
+      ...skippedTrial === undefined ? {} : { trial: skippedTrial },
+    }
   }
   const targetName = environmentName ?? runtime?.capabilities.environmentName ?? ""
   let gate
@@ -227,10 +641,33 @@ export async function gatedInstall(
       packageName, gateIssues: gate.issues, rolledBack: state.clean,
     }
   }
+  // 第二步：试装（DESIGN §5.2）。只在静态快筛放行之后执行——第一步就挂掉的包没有必要起进程。
+  const trial = trialConfig.enabled
+    ? await runTrialStep(ctx, config, spec, targetName, options.trial ?? runTrialInstall)
+    : undefined
+  if (trial !== undefined && trial.policy === "blocked") {
+    const removed = await manager.removeBundle(packageName)
+    invalidateInstalledIndex(targetName)
+    const state = rollbackState(currentProfileDir(ctx, environmentDirOrNull(targetName)), packageName)
+    return {
+      ok: false,
+      output: `${TRIAL_LABEL[trial.conclusion]}，${rollbackHeadline(removed)} ${packageName}：\n`
+        + trial.output
+        + '\n' + state.lines.join('\n'),
+      packageName, gateIssues: gate.issues, rolledBack: state.clean, trial,
+    }
+  }
   await manager.setBundleEnabled(packageName, true)
   invalidateInstalledIndex(targetName)
   const warned = gate.issues.length === 0 ? "" : `（质量门有 ${gate.issues.length} 条提示，按 warn 模式放行）`
-  return { ok: true, output: `已安装并启用 ${packageName}${warned}`, packageName, gateIssues: gate.issues }
+  const trialLine = trial === undefined ? "" : trial.policy === "warned"
+    ? `（${TRIAL_LABEL[trial.conclusion]}，按 warn 模式照常安装 —— 它在验证启动里没通过，环境起不来时先移除它）`
+    : `（${TRIAL_LABEL[trial.conclusion]}；实际深度 ${trial.depth ?? "未物化快照"}，耗时 ${trial.elapsedMs}ms）`
+  return {
+    ok: true, output: `已安装并启用 ${packageName}${warned}${trialLine}`,
+    packageName, gateIssues: gate.issues,
+    ...trial === undefined ? {} : { trial },
+  }
 }
 
 // ── op 分派 ───────────────────────────────────────────────────────────────
@@ -242,6 +679,13 @@ export interface OpDependencies {
   readonly configUpdate: (patch: Partial<CompanionConfig>) => Promise<CompanionConfig>
   readonly capabilities: () => OfficialCapabilities
   readonly jobs: JobRegistry
+  /** 试装执行器；省略时用真实的 runTrialInstall（会真装候选包并起进程）。 */
+  readonly trial?: TrialRunner
+}
+
+/** 把试装执行器折成 gatedInstall 的可选参数（没注入就不传）。 */
+function gatedInstallOptions(deps: OpDependencies): GatedInstallOptions {
+  return deps.trial === undefined ? {} : { trial: deps.trial }
 }
 
 /** 从请求体里取一个字符串字段，缺失即报错。 */
@@ -332,7 +776,10 @@ async function dispatch(op: string, body: Record<string, unknown>, deps: OpDepen
     ({ jobId: deps.jobs.start(task) })
   switch (op) {
     case "capabilities":
-      return { capabilities: deps.capabilities(), config }
+      // trialDisclosure 放在这里而不是设置页自己的接口：它是**静态事实**（会执行第三方代码、
+      // 内存峰值），任何时候都能回答，且客户端启动时已经会拉这个 op——设置页因此不必
+      // 为了"告知"再发一次请求，也不会出现"列表读失败所以告知也没了"。
+      return { capabilities: deps.capabilities(), config, trialDisclosure: TRIAL_DISCLOSURE }
 
     case "getConfig":
       return config
@@ -356,7 +803,8 @@ async function dispatch(op: string, body: Record<string, unknown>, deps: OpDepen
     case "install":
       return asJob(async () =>
         await gatedInstall(deps.ctx, config, requireString(body, "spec"),
-          typeof body["environment"] === "string" ? body["environment"] : undefined))
+          typeof body["environment"] === "string" ? body["environment"] : undefined,
+          gatedInstallOptions(deps)))
 
     case "listEnvironments":
       return listEnvironments(deps.ctx)
@@ -381,6 +829,23 @@ async function dispatch(op: string, body: Record<string, unknown>, deps: OpDepen
 
     case "stopEnvironment":
       return await stopEnvironment(requireString(body, "name"))
+
+    case "trialEnvironments":
+      // 纯读：列出测试环境 + 清理计划预览 + 现在生效的保留策略。这个 op 不删任何东西。
+      return await trialEnvironmentReport(config)
+
+    case "trialRemove":
+      // 删单个测试环境：走引擎的三重纪律（只删 <名>-dpmc / 运行中先拒 / 进程事实不可读就拒）。
+      return await removeTrialEnvironment(requireString(body, "name"), { ctx: deps.ctx })
+
+    case "trialCleanup":
+      // 一键清理过期（长操作：可能删多个目录，含真实快照的 node_modules）。
+      // 与"自动清理"共用引擎的同一个计划与同一个记账（<DSH_HOME>/dpmc-trial-cleanup.log）。
+      return asJob(async () => {
+        const trial = effectiveTrialConfig(config)
+        const result: TrialCleanupResult = await cleanupTrialEnvironments({ retainDays: trial.retentionDays })
+        return result
+      })
 
     case "createEnvironment":
       // 省略 template 时由后端默认到官方 web 模板（能起得来），不是官方 base-only 默认。
@@ -481,7 +946,9 @@ async function dispatch(op: string, body: Record<string, unknown>, deps: OpDepen
       return asJob(async () => await applyFix(action, target, {
         ctx: deps.ctx,
         environmentName: () => deps.capabilities().environmentName,
-        install: async (spec) => await gatedInstall(deps.ctx, config, spec),
+        // 修复里的安装与市场安装走**同一个** gatedInstall，因此质量门与试装三边一致；
+        // 注入的试装执行器照旧透传，测试才能不动真进程。
+        install: async (spec) => await gatedInstall(deps.ctx, config, spec, undefined, gatedInstallOptions(deps)),
         // install-dependency 走这条：声明已在、只是没装，官方 add 会以 already-installed 拒绝。
         repair: async (target) => await repairDependencies(target, { ctx: deps.ctx }),
       }))

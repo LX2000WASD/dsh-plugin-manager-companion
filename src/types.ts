@@ -11,6 +11,8 @@
  * 全部类型必须 JSON-safe（跨 wire 传输）。
  */
 
+import type { BootVerdict, SnapshotDepth, TrialConclusion } from './envManager.ts'
+
 // ── 官方类型的再导出（单一事实来源，禁止在本文件重定义）────────────────
 export type {
   BundleInfo, BundleRowInfo, ChangeResult, ManagementError, PluginEntryId,
@@ -438,6 +440,48 @@ export interface EnvironmentBackupDiff {
 
 // ── 质量门安装 ───────────────────────────────────────────────────────────
 
+/**
+ * 一次试装（质量门第二步）在**这次安装**里的处置。
+ *
+ * 词汇表（结论、深度、挂载判定）单一事实来源在 envManager（试装引擎），这里只做类型引用：
+ * 类型导入不产生运行期依赖，因此不会和 envManager → types 的既有方向形成运行期环。
+ */
+export type TrialPolicyOutcome =
+  /** 试装通过（或试装未开启），安装照常。 */
+  | 'passed'
+  /** 试装未通过且策略是 block：已回滚，没有装。 */
+  | 'blocked'
+  /** 试装未通过但策略是 warn：装了，结论如实带在结果里。 */
+  | 'warned'
+  /** 试装已开启但这次没执行（质量门整体关闭 / 包在豁免名单里）。 */
+  | 'skipped'
+
+/** 试装结论的摘要（JSON-safe，给界面渲染用；完整证据在 output 里）。 */
+export interface GatedInstallTrial {
+  /** 结论（passed / baseline-broken / candidate-broken / cannot-trial）。 */
+  readonly conclusion: TrialConclusion
+  /** 这次结论对安装的处置。 */
+  readonly policy: TrialPolicyOutcome
+  /** 结论实际基于哪种快照深度；试装没执行/没物化快照时为 undefined。 */
+  readonly depth?: SnapshotDepth
+  /** 是否发生过 shallow → full 的升级。 */
+  readonly escalated: boolean
+  /** 浅快照不给力的原因（升级时）。 */
+  readonly escalationReason?: string
+  /** 基线启动判定形态；未做基线启动时为 null。 */
+  readonly baseline: BootVerdictKind | null
+  /** 装完候选包后的启动判定形态；没走到这一步时为 null。 */
+  readonly candidate: BootVerdictKind | null
+  readonly elapsedMs: number
+  /** 面向用户的完整说明（含根因链、指纹、构建）。 */
+  readonly output: string
+  /** 处置的一句话依据（例如"按 warn 模式放行"、"已回滚"；跳过时是跳过的原因）。 */
+  readonly policyNote: string
+}
+
+/** 挂载判定的形态（不含根因链，摘要用）；从引擎的三态判定派生，避免两处漂移。 */
+export type BootVerdictKind = BootVerdict['kind']
+
 /** 一次受质量门保护的安装结果。 */
 export interface GatedInstallResult {
   /** 是否最终装成功（含通过质量门并激活）。 */
@@ -450,4 +494,86 @@ export interface GatedInstallResult {
   readonly gateIssues: readonly string[]
   /** 失败时是否已回滚。 */
   readonly rolledBack?: boolean
+  /** 试装（第二步）的结果；试装关闭时为 undefined。 */
+  readonly trial?: GatedInstallTrial
+}
+
+// ── 试装环境的查询与管理（op: trialEnvironments / trialRemove / trialCleanup）────
+
+/**
+ * 一个测试环境（`<真实环境名>-dpmc`）的只读事实。
+ *
+ * 全部读盘得来（不读内存台账）：测试环境不参与诊断结论，也不是真值来源，
+ * 因此这里只回答"它在不在、多大、多旧、还在跑吗"。
+ */
+export interface TrialEnvironmentInfo {
+  /** 测试环境名（`<真实环境名>-dpmc`）。 */
+  readonly name: string
+  /** 归属的真实环境名（由名字形态推出）。 */
+  readonly owner: string
+  /** 归属的真实环境是否还在（false = 孤儿测试环境，同样可删）。 */
+  readonly ownerExists: boolean
+  /** 绝对路径。 */
+  readonly dir: string
+  /** 是否正在运行；进程事实读不到时按 true 处理（保守：不删）。 */
+  readonly running: boolean
+  /** 快照物化时间（目录 mtime，epoch 毫秒）。 */
+  readonly modifiedAtMs: number
+  /** 同上的 ISO 字符串（界面直接用）。 */
+  readonly modifiedAt: string
+  /** 距今天数（保留期判定用同一个口径）。 */
+  readonly ageDays: number
+  /** 占地（apparent 字节合计）；统计被截断或读不到时为 null。 */
+  readonly bytes: number | null
+  /** 统计到的文件数。 */
+  readonly files: number
+  /** nlink>1 的文件数（pnpm store 硬链接；这些文件的实际独占磁盘远小于 bytes）。 */
+  readonly sharedFiles: number
+  /** bytes 为 null 时的原因（面向用户）。 */
+  readonly bytesReason?: string
+  /**
+   * 快照清单是否仍与真实环境一致（三件套 hash 比对）；真实环境已不存在时为 null。
+   * false 表示下次试装会重新物化（§5.4 第二步的即时物化），不是错误。
+   */
+  readonly snapshotMatchesOwner: boolean | null
+}
+
+/** 试装环境查询的结果（op: trialEnvironments）。 */
+export interface TrialEnvironmentReport {
+  readonly environments: readonly TrialEnvironmentInfo[]
+  /** 进程事实是否可读；false 时 running 一律按 true 报（不删的保守面）。 */
+  readonly factsReadable: boolean
+  /** 进程事实不可读的原因。 */
+  readonly factsReason?: string
+  readonly totals: {
+    readonly count: number
+    readonly running: number
+    /** 已知占地合计；有环境统计不出来时只是"已知部分"。 */
+    readonly bytes: number
+    /** 统计不出来的环境数（bytes 不等于总占地时看它）。 */
+    readonly unknownBytes: number
+  }
+  /** 当前生效的保留策略（从配置读；UI 直接显示，不要自己拼默认值）。 */
+  readonly retention: {
+    /** 保留天数。 */
+    readonly days: number
+    readonly autoCleanup: boolean
+    /** 上限；0 = 不限。 */
+    readonly maxKept: number
+  }
+  /** 下次清理会删谁、留谁（纯计划；这个 op 不删任何东西）。 */
+  readonly plan: {
+    readonly remove: readonly { readonly name: string; readonly reason: string }[]
+    readonly keep: readonly { readonly name: string; readonly reason: string }[]
+  }
+  /** 是否已达到/超过保留上限（达到上限时新的一轮试装会拒绝执行）。 */
+  readonly overCap: boolean
+  /** 降级/不可读事实（用户可见）。 */
+  readonly notes: readonly string[]
+}
+
+/** 一次试装环境清理的结果（op: trialCleanup）。 */
+export interface TrialCleanupResult extends EnvironmentResult {
+  /** 实际删掉的测试环境名。 */
+  readonly removed: readonly string[]
 }
