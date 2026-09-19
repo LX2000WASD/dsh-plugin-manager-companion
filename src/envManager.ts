@@ -2254,6 +2254,14 @@ export type BootVerdict =
 const BOOT_TASK_REQUIRED = /a task is required/
 /** 官方 Loader 挂载失败的特征。 */
 const BOOT_TREE_FAILED = /plugin tree failed to load/
+/**
+ * 官方启动器「层解析不到」的特征（浅快照缺依赖时的真实形态，真机实测）。
+ *
+ * 它与 Loader 失败**不同形**：这一条发生在挂载之前（profile-boot 解析 bundle 时 throw），
+ * 所以 stderr 里既没有 plugin tree failed to load、也没有缺任务提示 —— 旧判据会把它归成
+ * 「无法判定」，于是升级分支永远不会触发（等于装饰）。两种失败可区分，所以这里单独认它。
+ */
+const BOOT_UNRESOLVED_LAYER = /cannot resolve profile bundle/
 
 /**
  * 从 stderr 文本判定挂载结果（纯函数，可注入文本测试）。
@@ -2272,6 +2280,11 @@ export function judgeBootStderr(stderr: string): BootVerdict {
       .slice(0, 8)
     const reason = chain[0] ?? lines[0] ?? '未知挂载失败'
     return { kind: 'failed', reason, chain }
+  }
+  // 层解析不到：明确的失败（不是「判不出来」）。升级 full 的判据靠它。
+  if (lines.some((line) => BOOT_UNRESOLVED_LAYER.test(line))) {
+    const hit = lines.find((line) => BOOT_UNRESOLVED_LAYER.test(line)) ?? lines[0] ?? ''
+    return { kind: 'failed', reason: hit, chain: lines.slice(0, 4) }
   }
   if (lines.some((line) => BOOT_TASK_REQUIRED.test(line))) return { kind: 'mounted' }
   return {
@@ -2817,7 +2830,18 @@ function emptyLaunchSpec(name: string): LaunchSpec {
   }
 }
 /** runTrialInstall 的选项。 */
-export interface TrialInstallOptions extends MaterializeSnapshotOptions {
+export interface TrialInstallOptions extends Omit<MaterializeSnapshotOptions, 'depth'> {
+  /**
+   * 深度策略：auto（默认，先浅快照、基线明确失败再升级 full）/ shallow / full。
+   *
+   * 为什么 auto 不再先问「锚点能否解析」：实测这条谓词对**原装环境一律返回 full**
+   * （官方层由安装锚点供给，但 resolveBundleDir 在这台机器上解析不到它们），
+   * 于是 shallow 成了走不到的分支，而 shallow 真机又能挂载（526ms）。
+   * 改成**以启动为判据**（Lead 授权）：先 shallow；基线**明确 failed** 才升级 full，
+   * 升级后仍不 mounted 才报 baseline-broken（文案写明两种快照都试过）。
+   * undetermined（超时/无可识别特征）**不升级** —— 那是「判不出来」，如实报。
+   */
+  readonly depth?: 'auto' | 'shallow' | 'full'
   /** 官方层栈事实（算指纹用）；只在测当前环境时可用。 */
   readonly listBundles?: () => Promise<readonly string[]>
   /** 是否做基线启动（§5.2 四步的②）；默认 true —— 关掉省 ~558ms，但失败时说不清是谁的问题。 */
@@ -2845,6 +2869,12 @@ export interface TrialInstallResult {
   readonly baseline: BootVerdict | null
   readonly candidate: BootVerdict | null
   readonly elapsedMs: number
+  /** 结论实际基于哪种快照深度。 */
+  readonly depth: SnapshotDepth
+  /** 是否发生过 shallow → full 的升级（只在基线明确失败时）。 */
+  readonly escalated: boolean
+  /** 浅快照不给力的原因（升级时给出，取失败判定的第一行）。 */
+  readonly escalationReason?: string
 }
 
 /**
@@ -2872,28 +2902,63 @@ export async function runTrialInstall(
   const target = trialEnvironmentName(realName)
   const done = (conclusion: TrialConclusion, output: string, extra: Partial<TrialInstallResult> = {}) => ({
     conclusion, output, build, sourceFingerprint, sourceFingerprintAfter: null,
-    changedDuringTrial: false, baseline: null, candidate: null, elapsedMs: now() - started, ...extra,
+    changedDuringTrial: false, baseline: null, candidate: null, elapsedMs: now() - started,
+    depth: 'shallow' as SnapshotDepth, escalated: false, ...extra,
   })
 
   const verify = options.verify ?? ((name: string) => runHeadlessVerification(name))
-  const materialized = await createTrialEnvironment(realName, { snapshot: options })
+  /** 只把物化需要的字段传下去（避免把 baseline/verify 等选项混进快照选项）。 */
+  const snapshotOptions = (depth: SnapshotDepth): MaterializeSnapshotOptions => ({
+    depth,
+    ...options.ctx === undefined ? {} : { ctx: options.ctx },
+    ...options.installAnchor === undefined ? {} : { installAnchor: options.installAnchor },
+    ...options.runCommand === undefined ? {} : { runCommand: options.runCommand },
+    ...options.bundlesOf === undefined ? {} : { bundlesOf: options.bundlesOf },
+  })
+  const requested = options.depth ?? 'auto'
+  let depth: SnapshotDepth = requested === 'full' ? 'full' : 'shallow'
+  let escalated = false
+  let escalationReason: string | undefined
+
+  const materialize = async (which: SnapshotDepth): Promise<EnvironmentResult> =>
+    await createTrialEnvironment(realName, { snapshot: snapshotOptions(which) })
+  let materialized = await materialize(depth)
   if (!materialized.ok) {
     return done('cannot-trial', '无法试装：测试环境没有物化成功（' + String(materialized.code) + '）。\n'
-      + materialized.output + '\n这**不等于通过**。')
+      + materialized.output + '\n这**不等于通过**。', { depth })
   }
 
   let baseline: BootVerdict | null = null
   if (options.baseline !== false) {
-    const verified = await verify(target)
+    let verified = await verify(target)
     baseline = verified.verdict
-    if (verified.verdict.kind !== 'mounted') {
-      const detail = verified.verdict.kind === 'failed'
-        ? '根因：' + verified.verdict.reason + '\n' + verified.verdict.chain.join('\n')
-        : '判不出来：' + verified.verdict.reason
-      return done('baseline-broken',
-        '快照基线本身就起不来 —— 这不是 ' + spec + ' 的问题，试装无法判断它。\n'
-        + detail + '\n（这条发现应当升级成一条诊断：真实环境 ' + realName + ' 的当前状态有问题。）\n'
-        + '构建：' + describeBuild(build), { baseline })
+    // 以启动为判据的升级：**只对明确失败**升级；undetermined 是判不出来，不许悄悄换成 full。
+    if (baseline.kind === 'failed' && requested === 'auto') {
+      escalated = true
+      escalationReason = baseline.reason
+      depth = 'full'
+      materialized = await materialize(depth)
+      if (!materialized.ok) {
+        return done('cannot-trial', '无法试装：浅快照基线失败后升级为完整快照，但重新物化失败（'
+          + String(materialized.code) + '）。\n' + materialized.output + '\n这**不等于通过**。',
+          { depth, escalated, escalationReason })
+      }
+      verified = await verify(target)
+      baseline = verified.verdict
+    }
+    if (baseline.kind !== 'mounted') {
+      const head = escalated
+        ? '快照基线本身就起不来（**浅快照与完整快照都试过**，两次都没挂载起来）—— 这不是 ' + spec + ' 的问题。\n'
+          + '浅快照为什么不给力：' + String(escalationReason) + '\n'
+        : '快照基线本身就起不来 —— 这不是 ' + spec + ' 的问题，试装无法判断它。\n'
+      const detail = baseline.kind === 'failed'
+        ? '根因：' + baseline.reason + '\n' + baseline.chain.join('\n')
+        : '判不出来：' + baseline.reason
+      // failed → baseline-broken；undetermined → cannot-trial（判不出来就是无法试装，不许算通过）。
+      return done(judgeTrialOutcome(baseline, null),
+        head + detail + '\n（这条发现应当升级成一条诊断：真实环境 ' + realName + ' 的当前状态有问题。）\n'
+        + '实际深度：' + depth + (escalated ? '（由 shallow 升级）' : '') + '\n'
+        + '构建：' + describeBuild(build), { baseline, depth, escalated, escalationReason })
     }
   }
 
@@ -2927,6 +2992,9 @@ export async function runTrialInstall(
     + '（验证耗时 ' + String(after.elapsedMs) + 'ms）']
   if (after.verdict.kind === 'failed') lines.push('根因链：\n' + after.verdict.chain.join('\n'))
   if (after.verdict.kind === 'undetermined') lines.push('判不出来：' + after.verdict.reason)
+  lines.push('实际深度：' + depth + (escalated
+    ? '（由 shallow 升级：浅快照基线失败 —— ' + String(escalationReason) + '）'
+    : ''))
   lines.push('源环境指纹：' + sourceFingerprint.hash + '（试装前）')
   if (changedDuringTrial) {
     lines.push('注意：试装期间 ' + realName + ' 的环境又变过（指纹 ' + sourceFingerprintAfter.hash
@@ -2935,6 +3003,7 @@ export async function runTrialInstall(
   lines.push('构建：' + describeBuild(build))
   return done(conclusion, lines.join('\n'), {
     baseline, candidate: after.verdict, sourceFingerprintAfter, changedDuringTrial,
+    depth, escalated, ...escalationReason === undefined ? {} : { escalationReason },
   })
 }
 

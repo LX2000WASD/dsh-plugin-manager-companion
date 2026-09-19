@@ -848,6 +848,51 @@ test('W-04/W-05: 读取器不再把失败折叠成空表，且没有 -match 预�
 
 // ── task-50 试装引擎（第一段：命名 / 指纹 / 三态判定 / 结论映射）──────────────
 // ── task-50 第二段：快照物化 / 删除纪律 / 清理计划 ──────────────────────────
+test('深度以启动为判据：shallow 明确失败→升级 full；两次都不行才 baseline-broken；undetermined 不升级', async () => {
+  makeEnv('esc-src', { bundles: ['@deepseek-ai/dsh-base'] })
+  const build = env.buildIdentity()
+  const mounted = { kind: 'mounted' }
+  const failed = { kind: 'failed', reason: 'Cannot find package @fake/missing', chain: ['Error: Cannot find package @fake/missing'] }
+  const unknown = { kind: 'undetermined', reason: '子进程没有输出任何 stderr 文本' }
+  const runnerOk = async () => ({ exitCode: 0, output: 'ok', truncated: false, logPath: '/dev/null' })
+  const base = { installAnchor: '/anchor/package.json', runCommand: runnerOk }
+
+  // ① shallow 失败 → 升级 full → 成功：结论 passed，且说明实际深度与升级原因
+  let n = 0
+  const firstFails = async () => { n += 1; return { verdict: n === 1 ? failed : mounted, elapsedMs: 1, stderr: '', exitCode: 1, build } }
+  const esc = await env.runTrialInstall('@fake/pkg', 'esc-src', { ...base, verify: firstFails })
+  assert.equal(esc.conclusion, 'passed')
+  assert.equal(esc.depth, 'full', '升级后实际用的是 full')
+  assert.equal(esc.escalated, true)
+  assert.match(String(esc.escalationReason), /Cannot find package @fake\/missing/, '要带浅快照为什么不给力')
+  assert.match(esc.output, /由 shallow 升级/)
+
+  // ② 两次都失败 → baseline-broken，且文案写明两种快照都试过
+  const alwaysFails = async () => ({ verdict: failed, elapsedMs: 1, stderr: '', exitCode: 1, build })
+  const both = await env.runTrialInstall('@fake/pkg', 'esc-src', { ...base, verify: alwaysFails })
+  assert.equal(both.conclusion, 'baseline-broken')
+  assert.equal(both.escalated, true)
+  assert.match(both.output, /浅快照与完整快照都试过/)
+  assert.match(both.output, /不是 @fake\/pkg 的问题/)
+
+  // ③ undetermined 不升级：判不出来就是无法试装，不许悄悄换成 full
+  let calls = 0
+  const undetermined = async () => { calls += 1; return { verdict: unknown, elapsedMs: 1, stderr: '', exitCode: null, build } }
+  const cannot = await env.runTrialInstall('@fake/pkg', 'esc-src', { ...base, verify: undetermined })
+  assert.equal(cannot.conclusion, 'cannot-trial', '判不出来是「无法试装」，不是「基线坏」')
+  assert.equal(cannot.escalated, false, 'undetermined 不许触发升级')
+  assert.equal(calls, 1, '不升级就意味着只跑了一次验证')
+  assert.equal(cannot.depth, 'shallow')
+
+  // ④ 显式 depth 入口仍然有效（引擎侧保留，设置项归 task-51）
+  let seen = []
+  const explicit = async () => ({ verdict: mounted, elapsedMs: 1, stderr: '', exitCode: 1, build })
+  const full = await env.runTrialInstall('@fake/pkg', 'esc-src', { ...base, depth: 'full', verify: explicit })
+  assert.equal(full.depth, 'full')
+  assert.equal(full.escalated, false)
+  void seen
+})
+
 test('四步编排：基线坏不赖候选包 / 候选坏给根因 / 无法试装不算通过（结论带构建指纹）', async () => {
   makeEnv('trial-src', { bundles: ['@deepseek-ai/dsh-base'] })
   const build = env.buildIdentity()
@@ -1027,6 +1072,21 @@ test('指纹五元组全部读盘：任一文件变化都必须改变 hash，且
   assert.deepEqual([...official.bundles], ['a', 'b'])
   const failed = await env.environmentFingerprint('fp-src', { listBundles: async () => { throw new Error('offline') } })
   assert.equal(failed.bundlesSource, 'manifest', '官方事实拿不到就如实退回 manifest 口径')
+})
+
+test('浅快照缺依赖的失败形态要被认出来（启动器层），否则升级分支就是装饰', () => {
+  // 真机实测：浅快照没带 node_modules 时，启动器在挂载前就 throw（既没有 Loader 标记，也没有缺任务提示）
+  const resolver = [
+    'file:///…/@deepseek-ai/dsh-app-boot/lib/index.js:904',
+    '  throw new Error(`dsh: cannot resolve profile bundle "dsh-t50-linklayer" from the dsh installation or /tmp/x/profiles/real-dpmc`);',
+  ].join('\n')
+  const verdict = env.judgeBootStderr(resolver)
+  assert.equal(verdict.kind, 'failed', '层解析不到是明确失败，不是「判不出来」（否则升级永远不触发）')
+  assert.match(verdict.reason, /cannot resolve profile bundle/)
+  // 三种形态互不混淆
+  assert.equal(env.judgeBootStderr('Error: dsh: plugin tree failed to load: x').kind, 'failed')
+  assert.equal(env.judgeBootStderr('dsh: a task is required, for example: …').kind, 'mounted')
+  assert.equal(env.judgeBootStderr('').kind, 'undetermined')
 })
 
 test('挂载判定读 stderr 特征：健康=缺任务那行；失败=plugin tree failed + cause 链；都不是=无法判定', () => {
