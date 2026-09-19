@@ -28,7 +28,7 @@
 import type {
   DiagnosticEvidence, DiagnosticFix, DiagnosticGroup, DiagnosticIssue, DiagnosticLayer,
   DiagnosticReport, DiagnosticScopeCount, DiagnosticSeverity, DiagnosticSkip, EnvironmentBackup,
-  EnvironmentBackupDiff, EnvironmentInfo,
+  EnvironmentBackupDiff, EnvironmentInfo, ManifestField,
   EnvironmentResult, GatedInstallResult, InstalledKind, KindListResult, MarketItem,
   MarketItemKind, MarketplaceResult,
 } from '../types.ts'
@@ -215,6 +215,22 @@ function group(raw: unknown, index: number): DiagnosticGroup | undefined {
 }
 
 /**
+ * 归一 unknownFields：只保留闭集（ManifestField）里的名字，去重。
+ *
+ * 线上载荷可能来自旧版本或脏数据；未知名字不发明"未知"——与 runs / issues 的归一口径一致。
+ *
+ * @param raw - 线缆上的 unknownFields。
+ * @returns 只含已知字段名的数组（可能为空）。
+ */
+function unknownManifestFields(raw: unknown): ManifestField[] {
+  const seen = new Set<ManifestField>()
+  for (const name of texts(raw)) {
+    if (name === 'bundles' || name === 'dependencies') seen.add(name)
+  }
+  return [...seen]
+}
+
+/**
  * 一条跳过记录。
  *
  * `layers` 必须**原样透传**：它是引擎的事实，界面据此区分"这一层查过且没问题"与
@@ -325,14 +341,17 @@ export function normalizeEnvironments(raw: unknown): EnvironmentInfo[] | undefin
       current: flag(record['current'], false),
       builtin: flag(record['builtin'], false),
       bundles: texts(record['bundles']),
-      // 层栈是不是确定的：只认明确的 false，缺字段（等价 true）与任何其它取值都不发明"未知"
-      // ——口径与层归属那次一致：只透传引擎给出的已知事实。
-      ...(record['bundlesKnown'] === false ? { bundlesKnown: false } : {}),
+      // 读不出来的派生字段：只认闭集里的名字（未知名字不发明"未知"）——
+      // 口径与层归属那次一致：只透传引擎给出的已知事实。
+      ...(unknownManifestFields(record['unknownFields']).length === 0
+        ? {}
+        : { unknownFields: unknownManifestFields(record['unknownFields']) }),
       // 原因只在确实读不懂时带，且必须是非空字符串（空串等于没有原因）。
-      ...(record['bundlesKnown'] === false && typeof record['bundlesUnknownReason'] === 'string'
-        && record['bundlesUnknownReason'] !== ''
-        ? { bundlesUnknownReason: record['bundlesUnknownReason'] as string }
+      ...(typeof record['unknownReason'] === 'string' && record['unknownReason'] !== ''
+        ? { unknownReason: record['unknownReason'] as string }
         : {}),
+      // 层栈是不是确定的：只认明确的 false，缺字段（等价 true）与任何其它取值都不发明"未知"。
+      ...(record['bundlesKnown'] === false ? { bundlesKnown: false } : {}),
       dependencies: texts(record['dependencies']),
       runs: asArray(record['runs'])
         .map(entry => run(entry))
@@ -462,6 +481,8 @@ function marketItem(raw: unknown): MarketItem | undefined {
     category: asText(record['category']),
     installedVersion: asText(record['installedVersion']),
     latestVersion: asText(record['latestVersion']),
+    packageName: asText(record['packageName']),
+    installSpec: asText(record['installSpec']),
   }
   return {
     repo,
@@ -475,6 +496,8 @@ function marketItem(raw: unknown): MarketItem | undefined {
     ...optional.installedVersion === undefined ? {} : { installedVersion: optional.installedVersion },
     ...optional.latestVersion === undefined ? {} : { latestVersion: optional.latestVersion },
     ...KINDS.includes(kind as MarketItemKind) ? { kind: kind as MarketItemKind } : {},
+    ...optional.packageName === undefined ? {} : { packageName: optional.packageName },
+    ...optional.installSpec === undefined ? {} : { installSpec: optional.installSpec },
   }
 }
 
@@ -491,6 +514,8 @@ export function normalizeMarketplace(raw: unknown): MarketplaceResult | undefine
   for (const [key, value] of Object.entries(asObject(record['categories']) ?? {})) {
     if (typeof value === 'number' && Number.isFinite(value)) categories[key] = value
   }
+  const notes = texts(record['notes'])
+  const source = asText(record['source'])
   return {
     items: asArray(record['items'])
       .map(item => marketItem(item))
@@ -498,6 +523,9 @@ export function normalizeMarketplace(raw: unknown): MarketplaceResult | undefine
     generatedAt: text(record['generatedAt'], new Date().toISOString()),
     cached: record['cached'] === true,
     categories,
+    ...source === undefined ? {} : { source },
+    ...record['stale'] === true ? { stale: true } : {},
+    ...notes.length === 0 ? {} : { notes },
   }
 }
 

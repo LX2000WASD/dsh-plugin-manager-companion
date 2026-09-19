@@ -565,12 +565,13 @@ export function listEnvironments(ctx?: Context, options: ListEnvironmentsOptions
       current: name === current,
       builtin: isBuiltinEnvironment(name),
       bundles: manifest.bundles,
-      // 读不懂 manifest 时**不能**让调用方把空数组当事实：把未知如实带出去。
-      ...(manifest.bundlesKnown === false ? {
-        bundlesKnown: false,
-        ...(manifest.bundlesUnknownReason === undefined
-          ? {} : { bundlesUnknownReason: manifest.bundlesUnknownReason }),
-      } : {}),
+      // 读不懂 manifest 时**不能**让调用方把空数组当事实：把未知按字段如实带出去。
+      ...(manifest.unknownFields === undefined ? {} : {
+        unknownFields: manifest.unknownFields,
+        ...(manifest.unknownReason === undefined ? {} : { unknownReason: manifest.unknownReason }),
+        // 层栈是界面上唯一直接渲染的派生字段，给它一个派生谓词（等价于 includes('bundles')）。
+        bundlesKnown: !manifest.unknownFields.includes('bundles'),
+      }),
       dependencies: manifest.dependencies,
       runs: runs.get(name) ?? [],
     })

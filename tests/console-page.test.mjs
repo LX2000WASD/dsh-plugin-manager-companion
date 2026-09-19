@@ -690,7 +690,10 @@ describe('环境列表：层栈读不懂时显示「未知」而不是 0（task-
 
   it('bundlesKnown=false：显示「未知」与可见原因，且不出现 0 个组合包', async () => {
     const reason = 'package.json 结构读不懂：dsh.profile.bundles 存在但不是字符串数组'
-    const { html } = await renderEnvWith(environmentPayload({ bundlesKnown: false, bundlesUnknownReason: reason }))
+    // task-40 复数化：线缆上按字段表达未知（unknownFields + unknownReason），bundlesKnown 是派生谓词
+    const { html } = await renderEnvWith(environmentPayload({
+      bundlesKnown: false, unknownFields: ['bundles'], unknownReason: reason,
+    }))
     assert.ok(html.includes('未知'), '组合包那一栏要显示「未知」：' + html.slice(0, 400))
     assert.ok(!html.includes('0 个组合包'), '读不懂不能画成"0 个组合包"（把不知道说成知道）')
     assert.ok(html.includes(reason), '原因必须是可见文本，不是只挂 title')
@@ -709,7 +712,7 @@ describe('环境列表：层栈读不懂时显示「未知」而不是 0（task-
   })
 
   it('只有 reason 没有 bundlesKnown=false 时不显示未知（原因不能单独成立）', async () => {
-    const { html } = await renderEnvWith(environmentPayload({ bundlesUnknownReason: '一些原因', bundles: ['@deepseek-ai/dsh-base'] }))
+    const { html } = await renderEnvWith(environmentPayload({ unknownReason: '一些原因', bundles: ['@deepseek-ai/dsh-base'] }))
     assert.ok(html.includes('1 个组合包'), '按已知显示：' + html.slice(0, 400))
     assert.ok(!html.includes('未知'), '没有 false 就不该出现未知')
   })

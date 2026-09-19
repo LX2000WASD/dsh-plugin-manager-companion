@@ -388,46 +388,27 @@ export function readInstallAnchor(ctx: Context): string | undefined {
 }
 
 /**
- * 这一层的输入是否**确定**（manifest 读不懂时不能把结论当成事实说出去）。
+ * 这份 manifest 里有哪些派生字段读不出来（按字段表达，闭集见 types.ts 的 ManifestField）。
  *
- * 存在的理由：官方若改了 dsh.profile.bundles 的名字或位置，读出来就是空数组。
- * 若不作声，诊断会把"我不知道"说成"这个环境没有层栈"——典型的假阴性。
- *
- * @param facts - 静态事实（含 manifest）。
- * @param skipped - 跳过项收集器。
- * @returns 输入是否确定。
- */
-function bundlesFactKnown(facts: StaticFacts, skipped: DiagnosticSkip[]): boolean {
-  const manifest = facts.manifest
-  if (manifest.bundlesKnown !== false) return true
-  skipped.push({
-    check: 'bundles-unknown',
-    reason: '这个环境的 package.json 结构读不懂（' + (manifest.bundlesUnknownReason ?? '原因未知')
-      + '）：层栈相关的结论（bundle 声明、层栈与运行时对照）本次**没有判断**，'
-      + '不要把它当成"这个环境没有层栈"。'
-  })
-  return false
-}
-/**
- * 这一层的输入是否**确定**（manifest 读不懂时不能把结论当成事实说出去）。
- *
- * 存在的理由：官方若改了 dsh.profile.bundles 的名字或位置，读出来就是空数组。
- * 若不作声，诊断会把"我不知道"说成"这个环境没有层栈"——典型的假阴性。
+ * 存在的理由：官方若改了 dsh.profile.bundles 的名字/位置，或把 dependencies 写成数组
+ * （Object.keys(['a']) === ['0']，会读出一个名叫 "0" 的依赖），读取器读出来都是空值。
+ * 若不作声，诊断会把"我不知道"说成"这个环境没有层栈 / 没有依赖"——典型的假阴性。
  * 放在组合层：受影响的正是"层栈相关"的结论（bundle 声明、层栈与运行时对照），
  * 依赖层与运行时层照常出结论，不会因此被连带跳过。
  *
  * @param facts - 静态事实（含 manifest）。
- * @param facts.manifest - 该环境的 manifest 解析结果。
- * @returns 一条跳过项；输入确定时 undefined。
+ * @returns 一条跳过项；manifest 全部读得出来时 undefined。
  */
-function bundlesUnknownSkip(facts: StaticFacts): DiagnosticSkip | undefined {
+function manifestUnknownSkip(facts: StaticFacts): DiagnosticSkip | undefined {
   const manifest = facts.manifest
-  if (manifest.bundlesKnown !== false) return undefined
+  const fields = manifest.unknownFields ?? []
+  if (fields.length === 0) return undefined
   return {
-    check: 'bundles-unknown',
-    reason: '这个环境的 package.json 结构读不懂（' + (manifest.bundlesUnknownReason ?? '原因未知')
-      + '）：层栈相关的结论（bundle 声明、层栈与运行时对照）本次**没有判断**，'
-      + '不要把它当成"这个环境没有层栈"。'
+    check: 'manifest-unknown',
+    reason: '这个环境的 package.json 有读不出来的字段（' + fields.join('、') + '）：'
+      + (manifest.unknownReason ?? '原因未知')
+      + '。与这些字段相关的结论（bundle 声明、层栈与运行时对照、依赖清单对照）本次**没有判断**，'
+      + '不要把它们当成"确实为空"。'
   }
 }
 
@@ -1063,8 +1044,8 @@ function compositionLayer(
 ): DiagnosticIssue[] {
   const issues: DiagnosticIssue[] = []
   // 输入事实先说清：manifest 读不懂时，"层栈为空"不是结论而是未知。
-  const unknownBundles = bundlesUnknownSkip(facts)
-  if (unknownBundles !== undefined) skipped.push(unknownBundles)
+  const manifestUnknown = manifestUnknownSkip(facts)
+  if (manifestUnknown !== undefined) skipped.push(manifestUnknown)
 
   // 1. duplicate-row-id：**同一个 insert 列表**里同一个显式 id 出现多次。
   //    官方 loader 的 Group.update() 只对自己那一份 insert 列表查重，命中即抛

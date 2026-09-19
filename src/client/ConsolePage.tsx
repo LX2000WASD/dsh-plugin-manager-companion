@@ -837,9 +837,9 @@ function EnvironmentsPanel({ t, useEnvironments, actions }: EnvironmentsPanelPro
                 {environment.bundlesKnown === false ? (
                   <span className={css.envUnknown}>
                     <Tag tone="warning">{t('env.bundlesUnknown')}</Tag>
-                    {environment.bundlesUnknownReason === undefined
+                    {environment.unknownReason === undefined
                       ? null
-                      : <span className={css.envUnknownReason}>{environment.bundlesUnknownReason}</span>}
+                      : <span className={css.envUnknownReason}>{environment.unknownReason}</span>}
                   </span>
                 ) : (
                   <span>{t('env.bundles', { count: environment.bundles.length })}</span>

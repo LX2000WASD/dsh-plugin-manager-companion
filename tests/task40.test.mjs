@@ -43,45 +43,82 @@ after(async () => {
   delete process.env.DSH_HOME
 })
 
-describe('task-40 · manifest 读不懂 ≠ 没有层栈', () => {
-  it('字段被改名时得到"未知"，而不是空数组', async () => {
+describe('task-40 · manifest 读不懂 ≠ 没有值（按字段表达）', () => {
+  const diagnosticConfig = {
+    diagnostics: { dependency: true, composition: true, runtime: true, consistency: true, ecosystem: false },
+    qualityGate: { enabled: true, mode: 'block', allowlist: [] },
+  }
+  const envOf = (name) => ({ name, dir: join(home, 'profiles', name), current: false, builtin: false, bundles: [], dependencies: [], runs: [] })
+
+  it('字段被改名时按字段报未知，而不是给空数组', async () => {
     const dir = await environment(home, 'renamed', {
       name: 'dsh-profile-renamed', dependencies: {},
       dsh: { profile: { layers: ['@deepseek-ai/dsh-base'] } },
     })
     const manifest = readEnvironmentManifest(dir)
-    assert.equal(manifest.bundlesKnown, false, '字段改名必须被识别为未知：' + JSON.stringify(manifest.bundlesKnown))
-    assert.equal(typeof manifest.bundlesUnknownReason, 'string')
-    assert.ok(manifest.bundlesUnknownReason.length > 0, '未知必须带原因')
+    assert.deepEqual(manifest.unknownFields, ['bundles'],
+      '字段改名必须按字段报出来：' + JSON.stringify(manifest.unknownFields))
+    assert.equal(typeof manifest.unknownReason, 'string')
+    assert.ok(manifest.unknownReason.length > 0, '未知必须带原因')
   })
 
-  it('bundles 存在但不是字符串数组时也是未知', async () => {
+  it('bundles 存在但不是字符串数组时，也是 bundles 未知', async () => {
     const dir = await environment(home, 'not-array', {
       name: 'dsh-profile-not-array',
       dsh: { profile: { bundles: { base: true } } },
     })
     const manifest = readEnvironmentManifest(dir)
-    assert.equal(manifest.bundlesKnown, false)
-    assert.match(manifest.bundlesUnknownReason, /不是数组/);
+    assert.deepEqual(manifest.unknownFields, ['bundles'])
+    assert.match(manifest.unknownReason, /不是数组/);
   })
 
-  it('反向用例：正常 manifest 仍得到真实层栈（known = true）', async () => {
+  it('dependencies 写成数组：不产生名叫 "0" 的依赖，并标为 dependencies 未知', async () => {
+    const dir = await environment(home, 'array-deps', {
+      name: 'dsh-profile-array-deps',
+      dependencies: ['a'],
+      dsh: { profile: { bundles: [] } },
+    })
+    const manifest = readEnvironmentManifest(dir)
+    assert.equal(manifest.dependencies.includes('0'), false,
+      'Object.keys(["a"]) === ["0"] —— 绝不能读出一个名叫 0 的依赖：' + JSON.stringify(manifest.dependencies))
+    assert.deepEqual(manifest.dependencies, [], '读不出来时给空数组，但必须同时标未知');
+    assert.deepEqual(manifest.unknownFields, ['dependencies'],
+      '要按字段说是 dependencies 读不出来：' + JSON.stringify(manifest.unknownFields))
+    assert.match(manifest.unknownReason, /dependencies/);
+    // 列表侧同样如实带出
+    const listed = listEnvironments(ctxOf(), { runs: new Map() }).find((item) => item.name === 'array-deps')
+    assert.deepEqual(listed.unknownFields, ['dependencies'])
+    assert.deepEqual(listed.dependencies, [], '列表侧也不许冒出 "0"');
+    // 只要这份 manifest 有未知字段，就同时给出层栈的派生谓词（这里层栈是读得出来的 → true）
+    assert.equal(listed.bundlesKnown, true, '层栈读得出来就不该被标未知');
+  })
+
+  it('反向用例：正常 manifest 两个字段都读得出来，不带未知标记', async () => {
     const dir = await environment(home, 'normal', {
       name: 'dsh-profile-normal', dependencies: { 'pkg-a': '^1.0.0' },
       dsh: { profile: { bundles: ['@deepseek-ai/dsh-base'] } },
     })
     const manifest = readEnvironmentManifest(dir)
     assert.deepEqual(manifest.bundles, ['@deepseek-ai/dsh-base'])
-    assert.notEqual(manifest.bundlesKnown, false, '正常 manifest 不许被标成未知')
     assert.deepEqual(manifest.dependencies, ['pkg-a'])
+    assert.equal(manifest.unknownFields, undefined)
+    assert.equal(manifest.unknownReason, undefined)
   })
 
-  it('确实没有声明层栈时，是"确定的空"而不是未知', async () => {
-    const empty = await environment(home, 'empty-stack', { name: 'x', dsh: { profile: { bundles: [] } } })
+  it('确实没有声明层栈 / 没有依赖时，是"确定的空"而不是未知', async () => {
+    const empty = await environment(home, 'empty-stack', { name: 'x', dependencies: {}, dsh: { profile: { bundles: [] } } })
     const noDsh = await environment(home, 'no-dsh', { name: 'y' })
-    assert.notEqual(readEnvironmentManifest(empty).bundlesKnown, false)
     assert.deepEqual(readEnvironmentManifest(empty).bundles, [])
-    assert.notEqual(readEnvironmentManifest(noDsh).bundlesKnown, false)
+    assert.equal(readEnvironmentManifest(empty).unknownFields, undefined)
+    assert.deepEqual(readEnvironmentManifest(noDsh).bundles, [])
+    assert.equal(readEnvironmentManifest(noDsh).unknownFields, undefined)
+  })
+
+  it('顶层不是 JSON 对象：整份 manifest 不可用（两个字段都读不出来）', async () => {
+    const dir = await environment(home, 'top-array', '[1,2,3]')
+    const manifest = readEnvironmentManifest(dir)
+    assert.deepEqual([...manifest.unknownFields].sort(), ['bundles', 'dependencies'])
+    assert.match(manifest.unknownReason, /顶层不是 JSON 对象/);
   })
 
   it('调用方如实呈现：环境列表把"未知"与"空"分开', async () => {
@@ -89,9 +126,10 @@ describe('task-40 · manifest 读不懂 ≠ 没有层栈', () => {
     const byName = new Map(list.map((item) => [item.name, item]))
     const renamed = byName.get('renamed')
     assert.ok(renamed, '环境仍要出现在列表里：' + JSON.stringify([...byName.keys()]))
-    assert.equal(renamed.bundlesKnown, false, '列表必须带上未知标记')
-    assert.ok(String(renamed.bundlesUnknownReason).length > 0)
-    assert.equal(byName.get('normal').bundlesKnown, undefined, '正常环境不带未知标记')
+    assert.deepEqual(renamed.unknownFields, ['bundles'])
+    assert.equal(renamed.bundlesKnown, false, '层栈未知的派生谓词也要给');
+    assert.ok(String(renamed.unknownReason).length > 0)
+    assert.equal(byName.get('normal').unknownFields, undefined, '正常环境不带未知标记')
   })
 
   it('变异验证：把未知说成确定（退回旧行为）→ 断言必须报红', async () => {
@@ -101,51 +139,40 @@ describe('task-40 · manifest 读不懂 ≠ 没有层栈', () => {
     })
     const manifest = readEnvironmentManifest(dir)
     const mutated = { ...manifest }
-    delete mutated.bundlesKnown
-    delete mutated.bundlesUnknownReason
+    delete mutated.unknownFields
+    delete mutated.unknownReason
     assert.deepEqual(mutated.bundles, [], '旧行为读出来就是空数组');
-    assert.throws(() => assert.equal(mutated.bundlesKnown, false, '字段改名必须被识别为未知'),
+    assert.throws(() => assert.deepEqual(mutated.unknownFields, ['bundles'], '字段改名必须被识别为未知'),
       '退回旧行为后断言必须失败——否则这条事实又会被说成"这个环境没有层栈"')
   })
 
-  it('诊断把它如实呈现为"没查"：report.skipped 里出现 bundles-unknown', async () => {
-    const dir = join(home, 'profiles', 'renamed')
-    const env = { name: 'renamed', dir, current: false, builtin: false, bundles: [], dependencies: [], runs: [] }
-    const config = {
-      diagnostics: { dependency: true, composition: true, runtime: true, consistency: true, ecosystem: false },
-      qualityGate: { enabled: true, mode: 'block', allowlist: [] },
-    }
-    const report = await analyzeEnvironment(ctxOf(), env, config)
-    const skip = report.skipped.find((item) => item.check === 'bundles-unknown')
+  it('诊断把它如实呈现为"没查"：report.skipped 里出现 manifest-unknown 并带字段名', async () => {
+    const report = await analyzeEnvironment(ctxOf(), envOf('renamed'), diagnosticConfig)
+    const skip = report.skipped.find((item) => item.check === 'manifest-unknown')
     assert.ok(skip, '要在 skipped 里如实登记：' + JSON.stringify(report.skipped.map((item) => item.check)))
-    assert.match(skip.reason, /读不懂/)
-    assert.match(skip.reason, /不要把它当成/, '要说清这不是"没有层栈"')
+    assert.match(skip.reason, /bundles/, '要说清是哪个字段读不出来：' + skip.reason)
+    assert.match(skip.reason, /不要把它们当成/, '要说清这不是"确实为空"')
   })
 
-  it('反向用例：正常 manifest 不产生 bundles-unknown', async () => {
-    const dir = join(home, 'profiles', 'normal')
-    const env = { name: 'normal', dir, current: false, builtin: false, bundles: [], dependencies: [], runs: [] }
-    const config = {
-      diagnostics: { dependency: true, composition: true, runtime: true, consistency: true, ecosystem: false },
-      qualityGate: { enabled: true, mode: 'block', allowlist: [] },
-    }
-    const report = await analyzeEnvironment(ctxOf(), env, config)
-    assert.equal(report.skipped.some((item) => item.check === 'bundles-unknown'), false)
+  it('dependencies 未知时诊断同样登记 manifest-unknown', async () => {
+    const report = await analyzeEnvironment(ctxOf(), envOf('array-deps'), diagnosticConfig)
+    const skip = report.skipped.find((item) => item.check === 'manifest-unknown')
+    assert.ok(skip, '依赖读不出来也要登记：' + JSON.stringify(report.skipped.map((item) => item.check)))
+    assert.match(skip.reason, /dependencies/)
   })
 
-  it('变异验证：删掉这条 skip（退回"当成空层栈"）→ 断言必须报红', async () => {
-    const dir = join(home, 'profiles', 'renamed')
-    const env = { name: 'renamed', dir, current: false, builtin: false, bundles: [], dependencies: [], runs: [] }
-    const config = {
-      diagnostics: { dependency: true, composition: true, runtime: true, consistency: true, ecosystem: false },
-      qualityGate: { enabled: true, mode: 'block', allowlist: [] },
-    }
-    const report = await analyzeEnvironment(ctxOf(), env, config)
-    const mutated = { ...report, skipped: report.skipped.filter((item) => item.check !== 'bundles-unknown') }
-    assert.equal(mutated.skipped.some((item) => item.check === 'bundles-unknown'), false)
+  it('反向用例：两个字段都读得出来时不产生 manifest-unknown', async () => {
+    const report = await analyzeEnvironment(ctxOf(), envOf('normal'), diagnosticConfig)
+    assert.equal(report.skipped.some((item) => item.check === 'manifest-unknown'), false)
+  })
+
+  it('变异验证：删掉这条 skip（退回"当成空值"）→ 断言必须报红', async () => {
+    const report = await analyzeEnvironment(ctxOf(), envOf('renamed'), diagnosticConfig)
+    const mutated = { ...report, skipped: report.skipped.filter((item) => item.check !== 'manifest-unknown') }
+    assert.equal(mutated.skipped.some((item) => item.check === 'manifest-unknown'), false)
     assert.throws(() => {
-      assert.ok(mutated.skipped.find((item) => item.check === 'bundles-unknown'), '要在 skipped 里如实登记')
-    }, '去掉这条 skip 后断言必须失败——否则"读不懂"又会被当成"没有层栈"')
+      assert.ok(mutated.skipped.find((item) => item.check === 'manifest-unknown'), '要在 skipped 里如实登记')
+    }, '去掉这条 skip 后断言必须失败——否则"读不懂"又会被当成"确实为空"')
   })
 })
 

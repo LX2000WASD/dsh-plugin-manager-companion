@@ -23,6 +23,15 @@ export type {
 
 // ── 环境（profile）──────────────────────────────────────────────────────
 
+/**
+ * 我们**从 manifest 派生**、且可能读不出来的字段名（闭集）。
+ *
+ * 为什么是联合类型而不是 string[]：裸字符串数组只能靠约定，谁报一个新名字都不会在
+ * review 里被注意到。闭集让"新增一种读不懂的字段"变成一次**看得见的契约变更**——
+ * 要同时改这里、读取器、以及客户端是否渲染；客户端写 includes('bundles') 也能被类型检查。
+ */
+export type ManifestField = 'bundles' | 'dependencies'
+
 /** 一个 profile 目录的只读事实。 */
 export interface EnvironmentInfo {
   /** profile 目录名，即 profile 名。 */
@@ -33,20 +42,26 @@ export interface EnvironmentInfo {
   readonly current: boolean
   /** 官方内置环境（web/headless 等），只读不可删。 */
   readonly builtin: boolean
-  /** `dsh.profile.bundles` 的层栈；读不懂 manifest 时为空数组，**必须**配合 bundlesKnown 判断。 */
+  /** `dsh.profile.bundles` 的层栈；读不懂时为空数组，**必须**配合 unknownFields / bundlesKnown 判断。 */
   readonly bundles: readonly string[]
   /**
-   * 层栈是不是确定的事实。缺省（undefined）等价于 true。
+   * 这份 manifest 里我们**读不出来**的派生字段（缺省 = 全部读得出来）。
    *
-   * 为什么必须有：官方若改了 `dsh.profile.bundles` 的名字或位置，读出来是空数组；
-   * 界面若直接显示 `0 个组合包`，就是把"我不知道"说成"这个环境没有层栈"。
-   * false 表示这份 manifest 的结构我们读不懂，层栈相关的结论都不可信。
+   * 为什么按字段列：官方改字段名/类型时，受影响的往往只是其中一个字段；
+   * 一个笼统的"manifest 读不懂"会让调用方不知道该少说哪句话。
+   */
+  readonly unknownFields?: readonly ManifestField[]
+  /** 读不出来的原因（面向用户）；全部读得出来时为 undefined。 */
+  readonly unknownReason?: string
+  /** 直接依赖名列表；读不懂时为空数组，**必须**配合 unknownFields 判断。 */
+  readonly dependencies: readonly string[]
+  /**
+   * 层栈是不是确定的事实（等价于 unknownFields 里含 'bundles'）。
+   *
+   * 单独留一个派生谓词，是因为层栈是**界面上唯一直接渲染的派生字段**：显示
+   * `0 个组合包` 就是把"我不知道"说成"这个环境没有层栈"。其余字段判断未知请读 unknownFields。
    */
   readonly bundlesKnown?: boolean
-  /** bundlesKnown 为 false 时的原因（面向用户）；确定时为 undefined。 */
-  readonly bundlesUnknownReason?: string
-  /** 直接依赖名列表。 */
-  readonly dependencies: readonly string[]
   /** 进程表扫描到的运行实例；空数组表示未运行。 */
   readonly runs: readonly EnvironmentRun[]
 }
@@ -250,17 +265,38 @@ export interface MarketItem {
   readonly latestVersion?: string
   /** 安装来源形态，供 UI 选择安装路径。 */
   readonly kind?: MarketItemKind
+  /** 索引采集到的 npm 包名（pkg_name / npm_pkg_name）；没有时缺省。 */
+  readonly packageName?: string
+  /**
+   * 安装 spec：**host 侧决定**，客户端只负责原样送给 install op。
+   *
+   * 为什么不让客户端拼：spec 的合法形态由官方的 parseInstallSpec 定义（registry 名 / 绝对路径 /
+   * git URL / tarball），客户端自己拼就是把这套规则复制一份——一处改动要改两处，而且必然漂移。
+   * host 用 marketplace.installSpecFor() 决定（npm 包名优先，否则 github: 前缀的仓库地址），
+   * 索引字段变了只改那一个函数。契约上可选：老载荷没有这个字段时客户端不会瞎猜（见 shared.ts）。
+   */
+  readonly installSpec?: string
 }
 
 /** 市场查询结果。 */
 export interface MarketplaceResult {
   readonly items: readonly MarketItem[]
-  /** 索引生成时间。 */
+  /** 索引生成时间；索引不可用且无缓存时为空串（UI 显示"未知"而不是伪造一个时间）。 */
   readonly generatedAt: string
   /** 本次结果是否来自缓存。 */
   readonly cached: boolean
   /** 上游分类计数，供筛选器渲染。 */
   readonly categories: Readonly<Record<string, number>>
+  /**
+   * 数据来源标识：network:<跳> / cache / cache-stale / empty。
+   * 存在的理由：只给 cached 布尔值时，「拿到的是新鲜索引」「用的是三天前的缓存」「六跳全失败」三者
+   * 在界面上长得一模一样，用户会把"索引不可用"读成"市场里没有这个插件"。
+   */
+  readonly source?: string
+  /** 数据是否已过期（来自过期缓存，或全部来源失败）。 */
+  readonly stale?: boolean
+  /** 逐跳失败原因（有上限）；UI 如实展示，不把失败画成"空结果"。 */
+  readonly notes?: readonly string[]
 }
 
 // ── 技能与预设 ───────────────────────────────────────────────────────────
