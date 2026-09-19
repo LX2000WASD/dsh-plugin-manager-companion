@@ -278,9 +278,11 @@ describe('环境子页与设置子页：控件唯一、归因准确、作用域�
     const { entry, face, t } = boot({ react: shim.react })
     face.hooks.environments.update((draft) => { draft.environments = [ENV] })
     const html = renderTab(entry, face, t, 'env')
-    // 一次是工具栏按钮的文字，一次是那个选择器的可见标签；再出现第三次就是重复控件回来了。
+    // 可见文本里「导出备份」只该出现一次：导出按钮本身。
+    // （选择器的可访问名走 aria-label，桩件不渲染属性；原注释写成「按钮 + 选择器可见标签」是错的——
+    //   当时那第二次其实是空态提示里重复写了一遍操作路径，已按 §12.3.2「指路式引导」删掉，见下一个用例。）
     const occurrences = html.split('导出备份').length - 1
-    assert.equal(occurrences, 2, '「导出备份」应恰好出现两次（按钮 + 一个选择器标签），实际 ' + String(occurrences))
+    assert.equal(occurrences, 1, '可见文本里「导出备份」应恰好一次（导出按钮），实际 ' + String(occurrences))
     // 选择器本体是 PmSelect（Menu + Button 组合），备份区里只能有一个。
     // 切到第一个 Modal 之前：模态框里另有自己的选择器（新建模板、复制目标），不属于备份区。
     const cardStart = html.indexOf('backupCard')
@@ -289,6 +291,23 @@ describe('环境子页与设置子页：控件唯一、归因准确、作用域�
     const selects = backupCard.split('data-stub="Menu"').length - 1
     assert.equal(selects, 1, '备份区只能有一个选择器（导出目标），实际 ' + String(selects))
     assert.ok(backupCard.includes('导出备份'), '备份区要有导出目标的可见标签')
+  })
+
+  it('备份空态只说事实：指路半句已删，两个按钮同屏可见（§12.3.2 指路式引导 / §12.5 替代载体）', () => {
+    const shim = shimReact()
+    const { entry, face, t } = boot({ react: shim.react })
+    face.hooks.environments.update((draft) => { draft.environments = [ENV] })
+    const html = renderTab(entry, face, t, 'env')
+    const cardStart = html.indexOf('backupCard')
+    const cardEnd = html.indexOf('data-stub="Modal"', cardStart)
+    const backupCard = html.slice(cardStart, cardEnd === -1 ? undefined : cardEnd)
+    // 删「指路」的前提是替代载体真的在同屏（§12.5）：这两个按钮就在同一张卡片的上一行。
+    assert.ok(backupCard.includes('导出备份'), '替代载体：卡片里要能看到「导出备份」')
+    assert.ok(backupCard.includes('导入备份'), '替代载体：卡片里要能看到「导入备份」')
+    // 空态只留事实，不写操作路径（用户会自己看到上面两个按钮）。
+    assert.ok(backupCard.includes('尚未读入备份文件'), '空态要保留事实本身')
+    assert.ok(!backupCard.includes('先用'), '指路半句不得回来（按钮就在上面）')
+    assert.ok(!backupCard.includes('或导入一个已有的 JSON'), '指路半句不得回来')
   })
 
   it('修复失败说「修复失败」，不把归因写成「体检失败」', async () => {
@@ -381,6 +400,18 @@ describe('体检页：跳过层如实标注、修复说明行内可见（task-27
     assert.ok(start >= 0, '没找到层计数格：' + html.slice(0, 200))
     return { html, grid: html.slice(start, start + 2500) }
   }
+
+  it('体检空态只说事实：指路半句已删，「开始体检」按钮同屏可见（§12.3.2 指路式引导 / §12.5 替代载体）', () => {
+    const shim = shimReact({ tabId: 'health' })
+    const { entry, face, t } = boot({ react: shim.react })
+    // 默认就是「尚未体检」状态（没有报告）
+    const html = renderToStaticMarkup(React.createElement(entry.component, propsFor(face, t)))
+    // 替代载体：同一区块标题右侧那枚按钮，无报告时文案就是「开始体检」（ConsolePage.tsx:483-492）
+    assert.ok(html.includes('开始体检'), '替代载体：区块标题旁要能看到「开始体检」按钮')
+    assert.ok(html.includes('尚未体检'), '空态要保留事实本身')
+    assert.ok(!html.includes('点击「开始体检」'), '指路半句不得回来（按钮就在标题旁）')
+    assert.ok(!html.includes('生成报告'), '指路半句不得回来')
+  })
 
   it('跳过的层显示「未查」而不是 0（生态层被配置关掉时）', () => {
     const { grid } = renderHealth(reportWith([{ check: 'ecosystem-layer', reason: '配置里关闭了该层', layers: ['ecosystem'] }]))
@@ -796,11 +827,16 @@ describe('只读标记（task-48）：状态用标记承载，不用句子', () 
       await until(() => booted.face.hooks.environments.getSnapshot().loading === false, '环境列表落地')
       const home = renderTab(booted.entry, booted.face, booted.t, 'health')
       assert.ok(!home.includes('只读'), '当前环境下不该出现只读标记：' + home.slice(0, 300))
+      // task-66：这个事实必须被说出来，不能靠"没有非当前环境标记"这种缺席去推断。
+      assert.ok(home.includes('>当前环境</'), '当前环境要有明确标记（不能靠缺席表达）：' + home.slice(0, 400))
+      assert.ok(!home.includes('>非当前环境</'), '当前环境下不该出现非当前环境标记')
 
       booted.face.setDiagnosticTarget('pm-other')
       await until(() => booted.face.hooks.health.getSnapshot().target === 'pm-other', '目标切到另一个环境')
       const away = renderTab(booted.entry, booted.face, booted.t, 'health')
       assert.ok(away.includes('只读'), '不是当前环境时要显示只读标记：' + away.slice(0, 400))
+      assert.ok(away.includes('>非当前环境</'), '非当前环境要有标记')
+      assert.ok(!away.includes('>当前环境</'), '两个标记不得同时出现（互斥）')
       // §12.5：被删掉的那句状态说明，语义要由标记承载——所以"标记在、句子不在"要能同时看出来。
       assert.ok(!away.includes('本页只读'), '状态句不得回来（已由标记承载）')
       assert.ok(!away.includes('默认诊断当前环境'), '被删的那句不得回来')

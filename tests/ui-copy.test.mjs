@@ -120,6 +120,15 @@ const FORBIDDEN = [
     source: '第二次反馈 2026-09-19 实例3 原文：（…逐条证据一条不少）' },
   { id: 'en·parenthetical guarantee', re: /\([^)]{0,60}(every piece of evidence|nothing omitted|not a single)/i, why: '括注里的保证式收尾',
     source: '第二次反馈 2026-09-19 实例3 英文对应句' },
+  // ── 第三次反馈（2026-09-19）：§12.3.2「指路式引导」────────────────────────────
+  // 判据：被指的那个控件**就在同一屏上可见**时，不要再把操作路径写成句子（引导式交互，不是纯介绍）。
+  // 纪律（Lead 2026-09-19 裁定）：每条命中的控件可见性都要给出源码位置证据；控件不可见时该句保留并作为反例。
+  { id: 'zh·指路式引导（写操作路径）', re: /(先用|请用|点击|请点|点一下|按一下)「[^」]{2,12}」/, why: '控件就在同一屏可见，操作路径不写成句子',
+    source: '用户第三轮反馈 2026-09-19（DESIGN §12.3.2 指路式引导），两条实例：①尚未读入备份文件；先用「导出备份」生成，或导入一个已有的 JSON。②尚未体检。点击「开始体检」生成报告。' },
+  { id: 'en·指路式引导（Run/Click the X）', re: /\b(Run|Click|Use|Press|Open) the [A-Za-z][A-Za-z' -]{2,24}\b (to|button|tab|dialog|menu)\b/i, why: '同上（英文）',
+    source: '同上，实例②的英文对应句：No report yet. Run the check-up to generate one.' },
+  { id: 'en·指路式引导（export/import one）', re: /\b(export|import) (one|an existing|it first)/i, why: '同上（英文）',
+    source: '同上，实例①的英文对应句：No backup loaded yet; export one first, or import an existing JSON file.' },
 ]
 
 /**
@@ -298,6 +307,20 @@ describe('UI 文案标准（DESIGN §12）', () => {
     }
     const missed = sentences.filter(value => !FORBIDDEN.some(rule => rule.re.test(value)))
     assert.deepEqual(missed, [], '状态句漏拦了（状态应当由标记表达，不是写成句子）：' + missed.join(' / '))
+  })
+
+  it('规则5（指路式引导）的边界：只拦「把同屏控件写进句子」，不碰用户查不到的后果与参数', () => {
+    const dict = dictionaries()
+    const rule = FORBIDDEN.find(item => item.id === 'zh·指路式引导（写操作路径）')
+    assert.ok(rule !== undefined, '指路式引导规则不见了')
+    // 命中面（用户第三轮的两条实例）
+    for (const value of ['尚未读入备份文件；先用「导出备份」生成，或导入一个已有的 JSON。', '尚未体检。点击「开始体检」生成报告。']) {
+      assert.ok(rule.re.test(value), '这条指路句必须被拦下：' + value)
+    }
+    // 反例面：这些是用户**查不到**的后果/参数说明，不引同屏控件，必须放行（否则规则会退化成凭空的洁癖）
+    for (const key of ['config.marketplace.indexUrlHint', 'env.removeDesc', 'kinds.uninstallDesc', 'health.scoreHint']) {
+      assert.ok(!rule.re.test(dict.zh[key]), '不该拦下「' + key + '」：' + dict.zh[key])
+    }
   })
 
   it('每条禁止项都写明了来源（哪次反馈 / 用户原文 / 日期）', () => {

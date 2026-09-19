@@ -505,13 +505,17 @@ function HealthPanel({
             setDiagnosticTarget(id === current ? undefined : id)
           }}
         />
+        {/*
+          "这个目标是不是当前环境"必须**被说出来**，不能靠"没有标记"传达（缺席不是表达）。
+          两边都有标记：当前环境用中性色（它不是问题），其他环境用 warning + 只读（那是后果）。
+        */}
         {foreign ? (
           <>
             <Tag tone="warning">{t('health.foreignTag')}</Tag>
             {/* 标记而不是句子：目标不是当前环境时，本页的结论与操作都是只读的。 */}
             <Tag tone="neutral">{t('common.readOnly')}</Tag>
           </>
-        ) : null}
+        ) : <Tag tone="neutral">{t('env.current')}</Tag>}
       </div>
       {/* 这里原本还有两块："诊断目标：{name}"（选择器已经显示着这个值）与
           "修改请到「环境」子页。"（目标入口在子页标签里可见可点，属于"指路"而不是可执行出路）。
