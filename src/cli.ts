@@ -123,7 +123,7 @@ export const USAGE = [
   'Usage: dshpmc <command> [options]',
   '',
   'Commands:',
-  '  install <spec>            Install a package into a profile through the official protected flow',
+  '  install <spec>            Install a package into a profile',
   '  remove <name>             Remove an installed package from a profile',
   '  update <name>             Re-resolve a package to its newest version (add <name>@latest)',
   '  mount <name>              Report whether a declared dependency is mounted, and what to do (read-only)',
@@ -386,9 +386,8 @@ async function runProtectedOperation(
   if (result.exitCode !== 0 && result.logPath !== undefined) {
     out.stderr('dshpmc: full log at ' + result.logPath + String.fromCharCode(10))
     if (isGitSource(spec)) {
-      out.stderr('dshpmc: git-hosted plugins build on install via their prepare script; if pnpm printed an '
-        + 'allowBuilds hint, approve the listed key in the profile pnpm-workspace.yaml and re-run.'
-        + String.fromCharCode(10))
+      out.stderr('dshpmc: if pnpm printed an allowBuilds hint, approve the listed key in the '
+        + 'profile pnpm-workspace.yaml and re-run.' + String.fromCharCode(10))
     }
   }
   return result.exitCode === null ? 1 : result.exitCode
@@ -457,7 +456,6 @@ async function runList(options: CliOptions, out: { stdout: (text: string) => voi
   if (blocked.size > 0) {
     out.stdout('blocked repositories (' + String(blocked.size) + '): ' + [...blocked].sort().join(', ') + String.fromCharCode(10))
   }
-  out.stdout("Note: mounting/enabling a plugin in the current profile is the official plugin_manager tool's job (action set_plugin / set_bundle). This CLI never edits cordis.patch.yml.")
   return 0
 }
 
@@ -490,7 +488,7 @@ async function runMount(options: CliOptions, out: { stdout: (text: string) => vo
     return 0
   }
   out.stdout(String.fromCharCode(10)
-    + 'A declared dependency is not necessarily mounted. Check and mount it through the official manager:'
+    + 'Declared, not necessarily mounted — check and mount it through the official manager:'
     + String.fromCharCode(10)
     + '  plugin_manager { action: "list_plugins" }              # find the entry id and its current state'
     + String.fromCharCode(10)
@@ -772,7 +770,6 @@ async function runAnalyze(options: CliOptions, deps: CliDependencies, out: { std
     for (const blocker of judgement.blockers) {
       if (!judgement.incomplete.some(reason => reason.includes(blocker))) out.stdout('  - 未提升为问题的根因：' + blocker + nl)
     }
-    out.stdout('  （把根因提升为正式问题属于诊断引擎的事；CLI 只负责如实展示。）' + nl)
   }
 
   for (const issue of report.issues) {

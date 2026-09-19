@@ -941,10 +941,19 @@ export interface MarketplaceFace {
   dismissInstallNotice(): void
 }
 
-/** 市场条目在 UI 侧的稳定视图（只带渲染需要的字段）。 */
+/** 市场条目在 UI 侧的稳定视图（只带渲染与安装需要的字段）。 */
 export interface MarketItemView {
   readonly repo: string
   readonly name: string
+  /**
+   * 安装 spec —— **host 侧给的**（MarketItem.installSpec），客户端只负责原样转发。
+   *
+   * 不在这里拼字符串是有意的：官方 parseInstallSpec 只认 registry 名 / 绝对路径 / git URL /
+   * tarball 四种形态，而市场条目的天然键是 owner/repo（不在其中，官方直接判 invalid-spec）。
+   * 那套规则若在客户端再实现一份，索引字段一变就要改两处，且必然漂移。
+   * 契约上可选：老载荷没有这个字段时不猜——送空串，由 host 的字段校验如实报错。
+   */
+  readonly installSpec?: string
 }
 
 /** 市场控制器。 */
@@ -1006,6 +1015,10 @@ export class MarketplaceController {
 
   /**
    * 经质量门安装一个市场条目。
+   *
+   * spec 由 host 决定（MarketItem.installSpec），本方法**只转发**；缺失时送空串，
+   * 让 host 的字段校验给出可读错误，而不是在这里编一个 spec 出来。
+   *
    * @param item - 要安装的条目。
    */
   async install(item: MarketItemView): Promise<void> {
@@ -1016,7 +1029,7 @@ export class MarketplaceController {
       draft.rolledBack = false
     })
     try {
-      const result = normalizeGatedInstall(await runJob<unknown>('install', { spec: item.repo }))
+      const result = normalizeGatedInstall(await runJob<unknown>('install', { spec: item.installSpec ?? '' }))
       this.store.update((draft) => {
         draft.installing = undefined
         draft.gateIssues = result.gateIssues

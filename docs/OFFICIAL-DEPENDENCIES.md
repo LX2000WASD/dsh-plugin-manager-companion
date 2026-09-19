@@ -74,6 +74,18 @@
 | C2 | 官方用户预设根 `<dshHome>/.agent-presets`（`USER_PRESET_DIR`），构成条件是目录里有 `agent.cordis.yml`（`preset.yml` 只是展示元数据） | `src/kinds.ts:127`（presetsRoot）、`src/kinds.ts:587`（installPreset）、`src/presets.ts:285,429,490,532` | **静默**：常量改名 → 预设不被 roster 发现（我们照旧写文件） | `grep -n 'USER_PRESET_DIR\|COMPOSITION_FILE' packages/preset/agent-presets/src/discovery.ts` | 官方 `packages/preset/agent-presets/src/discovery.ts:37,51` | 已实测（task-25 真机 REST 卸载按 roster roots 找根；归档/恢复仅单测） |
 | C3 | profile 布局：`<dshHome>/profiles/<name>/`（manifest 在根），依赖兜底目录是 `<profiles>/node_modules` 与 `<dshHome>/node_modules` | `src/paths.ts:29,43`、`src/envManager.ts`（枚举环境）、`src/diagnostics.ts`（fallbackModules = dirname(envDir)/node_modules） | **静默**：布局变化 → 扫不到环境，或解析根错位导致"缺包"误报 | `node dist/cli.js list`；`node --test tests/envManager.test.mjs` | `src/paths.ts:29`；官方 `packages/boot/app-boot/src/profile.ts:125`（resolveProfileDir） | 已实测（task-26 真机临时 home 用同一布局 + profiles/node_modules 共享兜底跑通） |
 
+### F. 官方 README 的明文空白（我们据此设计的那两句）
+
+这两句不涉及任何符号，但**是我们两个功能的唯一设计依据**：官方改了措辞就等于收回了那块空白，我们会白做一层。
+界面上已经不再引用它们（task-53 把这份引文从用户文案里删掉了——用户要做的只是加一个 loader 行），所以**出处只住在这一份维护者文档里**。
+
+| # | 官方原话（逐字） | 对应我们的什么功能 | 变了会怎样 | 怎么最快发现 | 状态 |
+|---|---|---|---|---|---|
+| F1 | "Only bundles are managed — ... loading plain plugin modules stays a file operation" | `unmounted-dependency` 诊断（`src/diagnostics.ts` 的 consistencyLayer）：依赖已装上、入口导出插件形态，但 loader 树里没有任何行指向它（用户看不出它没生效）；以及行级配置（`plugins.row.config`）这块空白 | **功能前提消失**：官方若把普通插件模块也纳入托管，这条诊断就成了重复劳动；官方明确拒绝时我们继续补位 | 读官方 README（`boot/plugin-manager` 与 `client/ui-plugin-manager`）；看 `dsh plugin --help` 的动词面是否出现"挂载普通模块" | 仅读官方文档（本轮按此实现；未做"官方新增该能力"的对照） |
+| F2 | "The manager cannot ... change another profile, or edit an agent preset's composition" | 跨环境管理（`src/envManager.ts` 的复制 / 备份 / 恢复）与技能、预设安装（`src/kinds.ts`、`src/presets.ts`）这两块的存在理由 | **功能前提消失**：官方自己支持之后，这两块应当收敛为薄壳或下线 | 同上 README；官方 CLI 是否出现 `dsh profile` 子命令族 | 仅读官方文档（同上） |
+
+用法：动 `unmounted-dependency`、跨环境管理、预设安装之前，先确认这两句仍然成立。
+
 ### D. 客户端平台契约（host + browser）
 
 | # | 依赖什么（符号/字段/语义） | 我们在哪用（file:line） | 变了会怎样 | 怎么最快发现 | 先看哪行 | 状态 |

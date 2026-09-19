@@ -25,7 +25,7 @@ import {
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { defineStore, type HandleOf } from '@deepseek-ai/dsh-client-store'
 import type { ComposedProps, EntryKeyOf, SnapshotSelectorHook, TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
-import type { DiagnosticGroup, DiagnosticIssue, DiagnosticLayer } from '../types.ts'
+import type { DiagnosticGroup, DiagnosticIssue, DiagnosticLayer, ManifestField } from '../types.ts'
 import { NS } from './locales.ts'
 import { PmSelect } from './pmSelect.tsx'
 import {
@@ -39,6 +39,14 @@ import css from './ConsolePage.module.css'
 
 /** 本文件里 t 的键域（本插件字典）。 */
 type T = TranslateNS<typeof NS>
+
+/**
+ * 环境列表**已经渲染了**的 manifest 字段。
+ *
+ * 用可穷尽表而不是字符串字面量判断：ManifestField 联合类型一扩展，这里就编译报错，
+ * 逼着实现者同时决定新字段在界面上怎么显示（而不是被 Object.hasOwn 静默吞掉）。
+ */
+const RENDERED_FIELDS: Record<ManifestField, true> = { bundles: true, dependencies: true }
 
 /** 只带动作、不带 hooks 隔间的注入子面（子面板只吃自己需要的动作）。 */
 type EnvironmentActions = Omit<EnvironmentsFace, 'hooks'>
@@ -482,7 +490,8 @@ function HealthPanel({
           {running ? t('health.refreshing') : report === undefined ? t('health.refresh') : t('health.runAgain')}
         </Button>
       </div>
-      <p className={css.hint}>{t('health.intro')}</p>
+      {/* health.intro 的渲染点已删（层名就在下面逐个显示，属"重复屏幕已有信息"）；
+          字典键留给 copy-dev 在 task-47 统一收口，这里不删键。 */}
       <div className={css.fieldRow}>
         <span className={css.metaLabel}>{t('health.target')}</span>
         <PmSelect
@@ -495,9 +504,16 @@ function HealthPanel({
             setDiagnosticTarget(id === current ? undefined : id)
           }}
         />
-        {foreign ? <Tag tone="warning">{t('health.foreignTag')}</Tag> : null}
+        {foreign ? (
+          <>
+            <Tag tone="warning">{t('health.foreignTag')}</Tag>
+            {/* 标记而不是句子：目标不是当前环境时，本页的结论与操作都是只读的。 */}
+            <Tag tone="neutral">{t('common.readOnly')}</Tag>
+          </>
+        ) : null}
       </div>
-      <p className={css.hint}>{t('health.targetHint')}</p>
+      {/* health.targetHint 的渲染点已删（整句去掉；"只读"语义由 task-48 的标记补回）。
+          字典键留给 copy-dev 在 task-47 统一收口，这里不删键。 */}
       {foreign ? (
         <div className={css.capabilities} role="status">
           <span className={css.metaLabel}>{t('health.foreignTitle', { name: target ?? '' })}</span>
@@ -811,6 +827,20 @@ function EnvironmentsPanel({ t, useEnvironments, actions }: EnvironmentsPanelPro
       <ul className={css.envList}>
         {environments.map((environment) => {
           const running = environment.runs.length > 0
+          const unknownFields = environment.unknownFields ?? []
+          const bundlesUnknown = unknownFields.includes('bundles')
+          const dependenciesUnknown = unknownFields.includes('dependencies')
+          // 两栏之外的字段名：闭集下不该出现，但"host 知道的事实被客户端悄悄丢掉"与"把不知道说成知道"
+          // 是同一枚硬币的两面，所以这里留一行兜底而不是忽略（见 env.factsIncomplete）。
+          const unmapped = unknownFields.some(field => !Object.hasOwn(RENDERED_FIELDS, field))
+          // 原因一行：认不出来的未知用兜底文案，被映射字段的未知直接给原因；都没有就整行不渲染。
+          const unknownLine = bundlesUnknown || dependenciesUnknown || unmapped
+            ? environment.unknownReason === undefined
+              ? undefined
+              : unmapped
+                ? t('env.factsIncomplete', { reason: environment.unknownReason })
+                : environment.unknownReason
+            : undefined
           const menuItems: readonly MenuEntry[] = [
             { id: 'start-background', label: t('env.startBackground'), disabled: running },
             { id: 'rename', label: t('env.rename') },
@@ -831,20 +861,17 @@ function EnvironmentsPanel({ t, useEnvironments, actions }: EnvironmentsPanelPro
               <div className={css.envMeta}>
                 <code className={css.envDir}>{environment.dir}</code>
                 {/*
-                  组合包这一栏必须区分"确实是 0 个"与"这份 manifest 读不懂"：后者显示 0 个
-                  就是把"我不知道"说成"这个环境没有层栈"（与"跳过层显示 0"同一类误读）。
+                  两栏各自判断：这份 manifest 里这个字段读不读得出来。读不出来显示「未知」，
+                  读得出来才显示数字——把"我不知道"说成"0 个"是这一整轮在消除的假事实。
+                  两栏互不串味：只有一个字段读不出来时，另一栏必须照常给真实数字。
                 */}
-                {environment.bundlesKnown === false ? (
-                  <span className={css.envUnknown}>
-                    <Tag tone="warning">{t('env.bundlesUnknown')}</Tag>
-                    {environment.unknownReason === undefined
-                      ? null
-                      : <span className={css.envUnknownReason}>{environment.unknownReason}</span>}
-                  </span>
-                ) : (
-                  <span>{t('env.bundles', { count: environment.bundles.length })}</span>
-                )}
-                <span>{t('env.dependencies', { count: environment.dependencies.length })}</span>
+                {bundlesUnknown
+                  ? <Tag tone="warning">{t('env.unknown')}</Tag>
+                  : <span>{t('env.bundles', { count: environment.bundles.length })}</span>}
+                {dependenciesUnknown
+                  ? <Tag tone="warning">{t('env.unknown')}</Tag>
+                  : <span>{t('env.dependencies', { count: environment.dependencies.length })}</span>}
+                {unknownLine === undefined ? null : <span className={css.envUnknownReason}>{unknownLine}</span>}
                 {environment.runs.map(run => (
                   <span key={run.pid} className={css.envRun}>
                     {t('env.pid', { pid: run.pid })}
@@ -1252,7 +1279,13 @@ export function ConfigPanel({ t, useConfig, actions }: ConfigPanelProps) {
       <h3 className={css.sectionTitle}>{t('config.title')}</h3>
       <p className={css.hint}>{t('config.scope')}</p>
       {incomplete ? <p className={css.warn} role="status">{t('config.incomplete')}</p> : null}
-      {writable ? null : <p className={css.warn} role="status">{t('config.readOnly')}</p>}
+      {writable ? null : (
+        <p className={css.readOnlyLine} role="status">
+          <Tag tone="warning">{t('common.readOnly')}</Tag>
+          {/* 标记承载"只读"这个状态，句子只留后果（改动无法保存）。 */}
+          <span className={css.readOnlyConsequence}>{t('config.readOnly')}</span>
+        </p>
+      )}
       {failed ? <p className={css.error} role="status">{t('config.saveFailed')}</p> : null}
 
       <fieldset className={css.group} disabled={!writable}>

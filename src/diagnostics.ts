@@ -239,8 +239,7 @@ export async function analyzeEnvironment(
     skipped.push({
       check: 'runtime-inventory',
       layers: ['runtime', 'consistency'],
-      reason: '运行时事实不可用（Loader 服务缺失，或官方投影与 Loader 直读都失败）：'
-        + (runtime.reason ?? '原因未知'),
+      reason: '运行时事实不可用：' + (runtime.reason ?? '原因未知'),
     })
   }
 
@@ -299,8 +298,7 @@ export async function analyzeEnvironment(
   if (diagnostics.ecosystem && issues.every(issue => issue.layer !== 'ecosystem')) {
     skipped.push({
       check: 'ecosystem-index',
-      reason: '生态层骨架：市场索引（更新可用、已知风险）由市场模块提供，本模块不做网络请求，'
-        + '因此这一层当前没有可判定的事实。',
+      reason: '这一层当前没有可判定的事实：市场索引数据未接入。',
     })
   }
 
@@ -407,8 +405,7 @@ function manifestUnknownSkip(facts: StaticFacts): DiagnosticSkip | undefined {
     check: 'manifest-unknown',
     reason: '这个环境的 package.json 有读不出来的字段（' + fields.join('、') + '）：'
       + (manifest.unknownReason ?? '原因未知')
-      + '。与这些字段相关的结论（bundle 声明、层栈与运行时对照、依赖清单对照）本次**没有判断**，'
-      + '不要把它们当成"确实为空"。'
+      + '。与这些字段相关的结论本次没有判断。'
   }
 }
 
@@ -490,9 +487,8 @@ function collectStaticFacts(
     skipped.push({
       check: 'install-anchor',
       reason: env.installAnchor === undefined
-        ? '没有安装锚点（launcher 的 profileContext 不可用，环境对象也没带 installAnchor）：'
-          + '本次只按 profile 与共享兜底层解析，由安装侧提供的官方包会被判成不存在——'
-          + '这类结论不可信，别拿它当缺包证据。'
+        ? '没有安装锚点：本次只按 profile 与共享兜底层解析，'
+          + '由安装侧提供的官方包会被判成不存在。'
         : '启动这个环境的 dsh 安装锚点读不到或解析不出模块根（' + env.installAnchor + '）：'
           + '本次只按 profile 与共享兜底层解析，由安装侧提供的官方包会被判成不存在。',
     })
@@ -736,8 +732,8 @@ function peerIssues(name: string, manifest: Record<string, unknown>, facts: Stat
       severity: 'report-only',
       code: 'peer-mismatch',
       title: name + ' 要求 ' + peer + ' ' + range + '，实际装的 ' + version + ' 不满足',
-      detail: 'peerDependencies 是运行期契约：版本不满足时官方契约可能已经变化，'
-        + '失败点会出现在很远处（序列化、协议、单例假设）。此处只报告，不自动处理。',
+      detail: 'peer 版本要求不满足：' + peer + ' 以插件传入的实例为准（单例、序列化与协议假设都建立在它上面），'
+        + '出错点会离这里很远。这条只报告，不自动处理。',
       subjects: [name, peer],
       scope: name,
       evidence: [{ kind: 'file', at, note: 'peer 声明的来源包' }],
@@ -814,8 +810,8 @@ function bootBlockerFromError(
   const message = messageOf(error)
   const unresolved = /cannot resolve profile bundle\s+("[^"]+"|'[^']+')/.exec(message)
   const malformed = /profile bundle\s+("[^"]+"|'[^']+')\s+declares no dsh\.bundle/.exec(message)
-  const restarted = '装好（或修好这一项）后**重启该环境**才会生效。'
-  const unsure = '注意：本次解析**没有**用到安装锚点（拿不到或没给），所以本条只说明"这个 bundles 项装不上"，'
+  const restarted = '装好（或修好这一项）后重启该环境才会生效。'
+  const unsure = '注意：本次解析没有用到安装锚点（拿不到或没给），所以本条只说明"这个 bundles 项装不上"，'
     + '不能据此断言这次启动一定失败——环境可能由别的 dsh 安装提供该包。'
   if (unresolved !== null) {
     const name = stripQuotes(unresolved[1] ?? '')
@@ -826,9 +822,8 @@ function bootBlockerFromError(
       subjects: [name, env.name],
       evidence: [{ kind: 'official', at: 'loadProfileDirectory(env.dir)', note: truncatedNote(message) }],
       detail: 'dsh.profile.bundles 里的 ' + name + ' 既不在这个 profile 的 node_modules，也不在 dsh 安装的模块兜底层：'
-        + '官方启动路径读 bundles 层栈时会直接抛 cannot resolve profile bundle，'
-        + '**整个 profile 起不来**（不是某一层没查）。处置：装回这个 bundle（官方通道）或从 '
-        + absoluteManifestPath(env) + ' 的 dsh.profile.bundles 里删掉这一项；' + restarted
+        + '启动时抛 cannot resolve profile bundle，整个 profile 起不来。'
+        + '处置：装回这个 bundle，或从 ' + absoluteManifestPath(env) + ' 的 dsh.profile.bundles 里删掉这一项；' + restarted
         + (anchorConsulted ? '' : unsure),
       operation: '在 ' + absoluteManifestPath(env) + ' 的 dsh.profile.bundles 里装回 ' + name
         + '（或删掉这一项），然后重启该环境',
@@ -844,9 +839,9 @@ function bootBlockerFromError(
       subjects: [name, env.name],
       evidence: [{ kind: 'official', at: 'loadProfileDirectory(env.dir)', note: truncatedNote(message) }],
       detail: 'dsh.profile.bundles 里的 ' + name + ' 的 package.json 没有 dsh.bundle.patch：'
-        + '官方读这一层 patch 时会直接抛 declares no dsh.bundle，**整个 profile 起不来**。'
-        + '处置：把 ' + absoluteManifestPath(env) + ' 的 dsh.profile.bundles 里这一项删掉，或改用真正带 bundle 声明的包；'
-        + restarted,
+        + '启动时抛 declares no dsh.bundle，整个 profile 起不来。'
+        + '处置：把 ' + absoluteManifestPath(env) + ' 的 dsh.profile.bundles 里这一项删掉，'
+        + '或改用真正带 bundle 声明的包；' + restarted,
       operation: '从 ' + absoluteManifestPath(env) + ' 的 dsh.profile.bundles 里删掉 ' + name + '，然后重启该环境',
       id: 'invalid-bundle:' + name,
     }
@@ -944,8 +939,7 @@ async function readComposition(
       // 官方合成抛错 = 组合层这一次真的没查成（纯文本检查只是兜底的一部分），
       // 层计数格必须显示"没查"而不是 0——不然与"查过且干净"长得一样。
       layers: ['composition'],
-      reason: '官方组合口径（dsh-app-boot 的 loadProfileDirectory/composeEntries）不可用，'
-        + '只做纯文本检查，依赖禁用状态的检查已跳过：' + messageOf(error),
+      reason: '官方组合结果不可用，只做纯文本检查，依赖禁用状态没有检查：' + messageOf(error),
     })
   }
 
@@ -1019,10 +1013,9 @@ function crossGroupDuplicateIssue(
     severity: 'report-only',
     code: 'duplicate-row-id-across-groups',
     title: '同一个行 id 出现在不同的 insert 列表里：' + id,
-    detail: 'id ' + id + ' 在 ' + places.join('、') + ' 各出现一次，但它们不在同一个 insert 列表里，'
-      + '因此不会触发官方 loader 的 duplicate loader entry id 检查——实测这种组合 profile 能正常启动。'
-      + '仍然建议改掉：按 id 定位的操作（官方启停开关、逐行配置）只能命中其中一行，另一行不可达。'
-      + '修法：给其中一行换一个 id，或删掉不再需要的那一行。'
+    detail: 'id ' + id + ' 在 ' + places.join('、') + ' 各出现一次，但它们不在同一个 insert 列表里：'
+      + '实测这种组合 profile 能正常启动。按 id 定位的操作（官方启停开关、逐行配置）'
+      + '只能命中其中一行，另一行不可达，建议改掉。'
       + (first === undefined ? '' : manualEditSteps(env, first, id, facts.packageDirs, true, 'either')),
     subjects: [id],
     scope: scopeOfPatchFile(env.name, env.dir, rows[0]?.file),
@@ -1087,10 +1080,8 @@ function compositionLayer(
       code: 'duplicate-row-id',
       title: 'loader 行 id 重复：' + id,
       detail: 'id ' + id + ' 在' + (group === undefined ? '同一个 insert 列表里' : ' group ' + group + ' 下')
-        + '出现了 ' + rows.length + ' 次，而官方 loader 的重复检查正是按这份 insert 列表做的：'
-        + '挂载这一层时直接抛 TypeError（duplicate loader entry id: ' + id + '），'
-        + '**整个 profile 起不来**——不是这一行加载失败，而是启动阶段就停在 plugin tree failed to load，'
-        + 'HTTP 服务从未开始监听。保留第一处、删掉其余 ' + (rows.length - 1) + ' 处重复行即可恢复。'
+        + '出现了 ' + rows.length + ' 次：挂载时抛 duplicate loader entry id，'
+        + '整个 profile 起不来（真机实测：进程 exit=1，HTTP 服务从未开始监听）。'
         + manualEditSteps(env, first, id, facts.packageDirs, rowReachedComposition(composition, first)),
       subjects: [id, ...(group === undefined ? [] : [group])],
       extra: {
@@ -1113,9 +1104,8 @@ function compositionLayer(
       fix: {
         action: 'remove-duplicate-row',
         target: id,
-        summary: '这一层会让整个 profile 起不来；请手工保留第一处 id=' + id + '（'
-          + first.file + ':' + first.line + '），删除其余 ' + (rows.length - 1)
-          + ' 处后重启该环境（我们不代写 patch 文件）',
+        summary: '请手工保留第一处 id=' + id + '（' + first.file + ':' + first.line + '），删除其余 '
+          + (rows.length - 1) + ' 处，然后重启该环境（我们不代写 patch 文件）',
       },
       id: 'duplicate-row-id:' + id,
     }))
@@ -1132,10 +1122,9 @@ function compositionLayer(
       severity: 'report-only',
       code: 'unaddressable-row',
       title: 'insert 行没有显式 id（' + (row.name ?? '未命名') + '）',
-      detail: '这一行只写了 name，loader 挂载时会用随机值补 id（EntryTree.ensureId：'
-        + 'Math.random().toString(16) 后 8 位）。行本身能加载，但任何按 id 定位的操作'
-        + '（官方启停开关、后续 patch、行级配置）都无法稳定指向它，重启一次就换了身份。'
-        + '给这一行补一个显式 id 即可，没有副作用。',
+      detail: '这一行只写了 name，loader 挂载时会用随机值补 id。行本身能加载，'
+        + '但任何按 id 定位的操作（官方启停开关、后续 patch、行级配置）都无法稳定指向它，'
+        + '重启一次就换了身份。给这一行补一个显式 id，改动是安全的。',
       subjects: [row.name ?? '(anonymous)', at],
       scope: scopeOfPatchFile(env.name, env.dir, row.file),
       evidence: [{ kind: 'file', at, note: '缺少显式 id 的 insert 行' }],
@@ -1161,12 +1150,11 @@ function compositionLayer(
       code: 'orphan-row',
       title: 'insert 行的模块名解析不到：' + name,
       detail: 'patch 插入了 name=' + name + ' 的行，但该说明符在 ' + resolutionRootsNote(env.dir, facts)
-        + ' 下都解析不到。后果不是这一行加载失败：只要这一行被启用（它的 group 也启用），'
-        + '挂载时就是 ERR_MODULE_NOT_FOUND 直接打断 plugin tree，**整个 profile 起不来**'
-        + '（真机实测：进程 exit=1，HTTP 服务从未开始监听；同一行写成 disabled，或它所在的 group 被禁用时'
-        + ' profile 照常启动）。' + manualEditSteps(env, row, rowId, facts.packageDirs,
-        rowReachedComposition(composition, row))
-        + '另一条路是把包装进来（' + name + '），装好再重启该环境。',
+        + ' 下都解析不到：这一行被启用时（它的 group 也启用），整个 profile 起不来'
+        + '（真机实测：进程 exit=1，HTTP 服务从未开始监听、ERR_MODULE_NOT_FOUND；'
+        + '同一行写成 disabled，或它所在的 group 被禁用时 profile 照常启动）。'
+        + manualEditSteps(env, row, rowId, facts.packageDirs, rowReachedComposition(composition, row))
+        + '· 或把 ' + name + ' 装进来。',
       subjects: [name],
       scope: scopeOfPatchFile(env.name, env.dir, row.file),
       extra: {
@@ -1176,8 +1164,8 @@ function compositionLayer(
       fix: {
         action: 'remove-row',
         target: rowId,
-        summary: '这一行会让整个 profile 起不来；请手工删除 ' + row.file + ':' + row.line
-          + ' 的 id=' + rowId + ' 行后重启该环境（我们不代写 patch 文件）',
+        summary: '请手工删除 ' + row.file + ':' + row.line + ' 的 id=' + rowId
+          + ' 行后重启该环境（我们不代写 patch 文件）',
       },
       id: 'orphan-row:' + name,
     }))
@@ -1198,15 +1186,15 @@ function compositionLayer(
     if (consumer !== undefined && !consumer.enabled) continue
     const reason = target.conditional
       ? '它的 disabled 是条件表达式（静态判为"可能禁用"）'
-      : '它的 loader 行被禁用'
+      : ''
     issues.push(makeIssue({
       layer: 'composition',
       severity: 'safe-fix',
       code: 'disabled-dependency',
       title: edge.from + ' 依赖的 ' + edge.to + ' 被禁用',
       detail: edge.from + ' 在 ' + relativeTo(env.dir, edge.file) + ':' + edge.line + ' 导入 ' + edge.spec
-        + '，但 ' + edge.to + ' 的 loader 行（id=' + target.id + '）是禁用状态：' + reason + '。'
-        + '消费者会卡在 pending（注入的服务永远不就绪）或在首次使用时失败。若这是误禁用，重新启用该行即可。',
+        + '，但 ' + edge.to + ' 的 loader 行（id=' + target.id + '）是禁用状态。' + reason
+        + '消费者会卡在 pending（注入的服务永远不就绪），或在首次使用时失败。',
       subjects: [edge.from, edge.to, target.id],
       scope: edge.from,
       evidence: [
@@ -1494,7 +1482,7 @@ function runtimeLayer(
         title: family.label + '冲突：' + registered,
         detail: family.label + ' ' + registered + ' 被 ' + distinct.map(item => item.name).join(' 与 ')
           + ' 同时注册，且两者的 loader 行都处于存活状态。后注册的一方会失败或覆盖先注册的一方'
-          + '（官方托管注册表对重名直接抛错）。这是**源码静态扫描**的结论：请先核对下面几处源码，'
+          + '（官方托管注册表对重名直接抛错）。这是源码静态扫描的结论：请先核对下面几处源码，'
           + '确认它们确实在同一作用域注册，再决定禁用哪一个。',
         subjects: [registered, ...distinct.map(item => item.name)],
         evidence: distinct.slice(0, 3).map(item => ({
@@ -1594,10 +1582,8 @@ function consistencyLayer(
         severity: 'report-only',
         code: 'unmounted-dependency',
         title: '装上了但没被挂载：' + name,
-        detail: name + ' 的入口导出了插件形态（apply），但当前 loader 树里没有任何行指向它，'
-          + '它对运行中的环境完全不起作用——这正是官方明文空白的补位点：'
-          + '"loading plain plugin modules stays a file operation"。'
-          + '要让它生效，需要为它加一个 loader 行（挂载行本身由官方安装通道或用户决定）。',
+        detail: name + ' 的入口导出了插件形态（apply），但当前 loader 树里没有任何行指向它：'
+          + '它对运行中的环境完全不起作用。要让它生效，需要为它加一个 loader 行。',
         subjects: [name],
         evidence: [
           { kind: 'file', at, note: '依赖声明位置' },
@@ -2621,7 +2607,7 @@ function manualEditSteps(
     + ' 那一行（连同它缩进内的附属键：name、config 等）。' + (edit === 'delete'
       ? '删掉多余的那几行后保存。'
       : '给其中一行换一个不会撞的 id，或删掉不再需要的那一行，然后保存。')
-    + '改完**重启该环境**（patch 只在启动时读，不重启不生效）。'
+    + '改完重启该环境（patch 只在启动时读，不重启不生效）。'
   const recovery = '如果这个环境已经起不来：用 dsh --profile ' + (env.name.length > 0 ? env.name : '<环境名>')
     + ' --patch <一份空 patch.yml> 先把它拉起来，再按上面的位置改。'
   const uncertain = applied
@@ -2701,9 +2687,8 @@ function duplicateIdBootIssue(rows: readonly ComposedRow[], env: EnvironmentInfo
       code: 'boot-blocker-row',
       title: '组合层启动被阻断：同一个 insert 列表里重复的 id ' + row.id,
       detail: '官方 composeEntries 在这个组合上直接抛 TypeError（duplicate loader entry id: ' + row.id + '）：'
-        + '**整个 profile 起不来**，启动阶段就停在 plugin tree failed to load，HTTP 服务从未开始监听。'
-        + '删掉多余的重复行（只保留一处）后**重启该环境**才会生效。'
-        + '这条结论来自官方组合口径本身；具体改哪个文件、删哪一行见同一次报告里的 duplicate-row-id。',
+        + '整个 profile 起不来，启动阶段就停在 plugin tree failed to load，HTTP 服务从未开始监听。'
+        + '删掉多余的重复行（只保留一处）后重启该环境才会生效。',
       subjects: [row.id, env.name],
       evidence: [{
         kind: 'official',

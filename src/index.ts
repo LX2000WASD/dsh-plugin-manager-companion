@@ -417,7 +417,11 @@ async function dispatch(op: string, body: Record<string, unknown>, deps: OpDepen
       const envName = deps.capabilities().environmentName ?? ""
       if (!marketConfig.enabled) {
         // 关闭市场时不联网：只回答"本环境装了什么"。
-        return { items: [], generatedAt: new Date().toISOString(), cached: false, categories: {} }
+        // source: 'disabled' 让界面能说"市场在当前配置下已关闭"，而不是画成"没有匹配的条目"。
+        return {
+          items: [], generatedAt: new Date().toISOString(), cached: false, categories: {},
+          source: "disabled",
+        }
       }
       const index = await loadRegistryIndex({
         refresh: body["refresh"] === true,
@@ -432,6 +436,10 @@ async function dispatch(op: string, body: Record<string, unknown>, deps: OpDepen
         installed: buildInstalledIndex(envName),
         generatedAt: index.generatedAt,
         cached: index.cached,
+        // 索引事实一路带到界面：不可用时要能说"这次没拿到索引"，而不是"没有匹配的条目"。
+        source: index.source,
+        stale: index.stale,
+        notes: index.notes,
       })
       return result
     }
@@ -457,7 +465,9 @@ async function dispatch(op: string, body: Record<string, unknown>, deps: OpDepen
         // kindDirsOf 过滤掉，因此不会出现"dir 恰好等于根就静默跳过"的残留。
         for (const dir of kindDirsOf(record, root)) await removeKindDir(root, dir)
         await removeKindRecord(repo)
-        return { ok: true, output: `已卸载 ${record.kind} ${repo}` } as EnvironmentResult
+        // 文案全中文：record.kind 的枚举值是 'skill' / 'agent-preset'，直接插进中文句子就是中英混排。
+        const kindLabel = record.kind === "skill" ? "技能" : record.kind === "agent-preset" ? "预设" : "未知类型"
+        return { ok: true, output: `已卸载${kindLabel} ${repo}` } as EnvironmentResult
       })
 
     case "fix": {
@@ -580,6 +590,8 @@ export function apply(ctx: Context): void {
           const result = cachedMarketplace({
             profile: envName, items: registryItems(index.repos), generation: index.generation,
             installed: buildInstalledIndex(envName), generatedAt: index.generatedAt, cached: index.cached,
+            // 与 marketplace op 保持同一口径：少了这三个，会出现"工具说没有、页面说失败"的不一致。
+            source: index.source, stale: index.stale, notes: index.notes,
           })
           return { items: result.items as never, generatedAt: result.generatedAt, total: result.items.length }
         },

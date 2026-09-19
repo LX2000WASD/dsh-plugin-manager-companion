@@ -79,11 +79,42 @@ export function registryItems(repos: readonly RegistryRepo[]): MarketplaceCandid
   return repos.map(registryItem)
 }
 
+/** npm 包名形态（与官方 install-spec 的 PACKAGE_NAME 同形：小写 URL 安全段，可选 scope）。 */
+const NPM_PACKAGE_NAME = /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/
+
+/**
+ * 一个条目该用哪个安装 spec —— **host 侧的唯一决定点**。
+ *
+ * 为什么必须有这么一个函数：官方 `parseInstallSpec` 只接受四种形态（registry 名 / 绝对路径 /
+ * git URL / tarball），而市场条目的天然键是 `owner/repo`——它**不在**这四种里，官方直接判
+ * invalid-spec 拒绝（实测：`拒绝安装：invalid-spec —— not a package name the registry accepts`）。
+ * 修法不是让客户端去拼字符串（那等于把官方的 spec 规则复制一份，索引字段一变要改两处），
+ * 而是让 host 在这里定好，客户端原样送。
+ *
+ * 规则（顺序即优先级）：
+ * 1. 索引给了合法的 npm 包名 → 用它。npm 通道更快、可钉版本、不必整仓克隆。
+ * 2. 否则 → `github:` + owner/repo。这是官方认的 git 形态，永远可用（代价是整仓克隆）。
+ *
+ * 已知缺口（明确记账，不在本函数里假装解决）：这里**不做**反抢注校验——npm 上的同名包未必
+ * 就是该仓库发布的。真正的校验要查 registry 的 repository 字段是否指回本仓库（竞品
+ * dsh-plugin-mall 专门为此做了一条规则），需要额外网络往返，属后续排期（见
+ * docs/private/market-benchmark.md §3.6）。
+ *
+ * @param repo - owner/repo。
+ * @param packageName - 索引采集到的 npm 包名（可选）。
+ * @returns 可直接交给官方 inspect/installBundle 的 spec。
+ */
+export function installSpecFor(repo: string, packageName?: string): string {
+  const candidate = packageName?.trim().toLowerCase()
+  if (candidate !== undefined && candidate.length > 0 && NPM_PACKAGE_NAME.test(candidate)) return candidate
+  return 'github:' + repo
+}
+
 /**
  * 把候选条目投影回**严格的 wire 形状**。
  *
- * 单一出口的好处：多余字段（packageName）不会漏到 wire 上，缺失字段不会变成 undefined 键，
- * 上游 JSON 的形状漂移在这一处被收敛。
+ * 单一出口的好处：缺失字段不会变成 undefined 键，上游 JSON 的形状漂移在这一处被收敛；
+ * `installSpec` 也在这里定死——客户端拿到的就是"该送什么"，不需要（也不允许）自己拼。
  */
 export function toWireItem(item: MarketplaceCandidate): MarketItem {
   return {
@@ -98,6 +129,8 @@ export function toWireItem(item: MarketplaceCandidate): MarketItem {
     ...(item.installedVersion === undefined ? {} : { installedVersion: item.installedVersion }),
     ...(item.latestVersion === undefined ? {} : { latestVersion: item.latestVersion }),
     ...(item.kind === undefined ? {} : { kind: item.kind }),
+    ...(item.packageName === undefined ? {} : { packageName: item.packageName }),
+    installSpec: installSpecFor(item.repo, item.packageName),
   }
 }
 
@@ -412,10 +445,22 @@ export interface MarketplaceInput {
   readonly generatedAt: string | null
   /** 本次数据是否来自缓存。 */
   readonly cached: boolean
+  /** 数据来源标识（registry.ts 的 RegistryIndex.source）；缺失时不写进结果。 */
+  readonly source?: string
+  /** 数据是否已过期（来自过期缓存，或全部来源失败）。 */
+  readonly stale?: boolean
+  /** 逐跳失败原因（registry.ts 的 RegistryIndex.notes）；这里会截断到上限。 */
+  readonly notes?: readonly string[]
 }
 
+/** notes 送到 UI 的上限：多到能说清"哪几跳失败"，又不至于把工具栏淹掉。 */
+export const MARKET_NOTES_LIMIT = 4
+
 /**
- * 管线缓存键：profile | 代际 | **条目内容身份** | 已安装索引身份 | 索引生成时间 | 缓存标记。
+ * 管线缓存键：profile | 代际 | **条目内容身份** | 已安装索引身份 | 索引生成时间 | 缓存标记 | 来源 | 过期。
+ *
+ * 后两项也必须进键：两份内容完全相同的索引（同一份磁盘缓存）在"网络刚成功"与"六跳全失败后回退"
+ * 两种情形下，notes/stale 是不同的——键里不带它们，后到的失败原因会被先到的成功结果顶掉。
  *
  * 内容身份是这一处的核心（旧审计 M-1：键里只有时间戳，于是"同一时间戳 + 不同条目"命中旧结果，
  * 新数据被静默丢弃）。这里同时带上代际与内容哈希：代际负责"同内容不重算"，哈希负责
@@ -429,6 +474,8 @@ export function marketplaceCacheKey(input: MarketplaceInput): string {
     input.installed?.identity ?? 'none',
     input.generatedAt ?? '',
     input.cached ? 'cached' : 'fresh',
+    input.source ?? '',
+    input.stale === true ? 'stale' : 'fresh',
   ].join('|')
 }
 
@@ -446,11 +493,15 @@ export function finalizeMarketplace(input: MarketplaceInput): MarketplaceResult 
   for (const item of input.items) {
     items.push(toWireItem(flagInstalled(item, input.installed, ambiguous === undefined ? {} : { ambiguousSlugs: ambiguous })))
   }
+  const notes = input.notes === undefined ? undefined : input.notes.slice(0, MARKET_NOTES_LIMIT)
   return {
     items,
     generatedAt: input.generatedAt ?? '',
     cached: input.cached,
     categories: categoryCounts(items),
+    ...(input.source === undefined ? {} : { source: input.source }),
+    ...(input.stale === undefined ? {} : { stale: input.stale }),
+    ...(notes === undefined || notes.length === 0 ? {} : { notes }),
   }
 }
 

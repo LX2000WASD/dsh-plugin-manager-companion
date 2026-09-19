@@ -267,6 +267,8 @@ test('磁盘缓存：新鲜时短路网络；refresh 时忽略；全失败时回
   const empty = await registry.loadRegistryIndex({ fetcher: fakeFetcher({}), now })
   assert.deepEqual(empty.repos, [])
   assert.equal(empty.source, 'empty')
+  assert.equal(empty.stale, true)
+  assert.equal(empty.cached, false, '什么都没拿到时不能说"来自缓存"（P2：旧的 true 会让 UI 画成缓存的假象）')
   assert.ok(empty.notes.some((note) => note.includes('无磁盘缓存')))
 })
 
@@ -495,13 +497,131 @@ test('finalizeMarketplace：分类计数、wire 形状收敛、已安装标记',
   assert.equal(result.generatedAt, '2026-01-01T00:00:00Z')
   assert.equal(result.cached, false)
   assert.equal(result.items.length, 3)
-  // 不往 wire 上塞未声明的字段（packageName 只在服务端流转）
+  // wire 形状收敛：只出现契约声明的字段（本轮新增 packageName / installSpec）
+  const allowed = ['repo', 'name', 'description', 'stars', 'updatedAt', 'topics', 'category', 'installed', 'installedVersion', 'latestVersion', 'kind', 'packageName', 'installSpec']
   for (const entry of result.items) {
-    assert.deepEqual(Object.keys(entry).filter((key) => !['repo', 'name', 'description', 'stars', 'updatedAt', 'topics', 'category', 'installed', 'installedVersion', 'latestVersion', 'kind'].includes(key)), [])
+    assert.deepEqual(Object.keys(entry).filter((key) => !allowed.includes(key)), [], entry.repo)
   }
   assert.equal(result.items[0].installed, true)
   assert.equal(result.items[2].installed, false)
-  assert.equal(JSON.stringify(result).includes('packageName'), false)
+  // P0：每条都带上 host 定好的安装 spec，且**绝不是** owner/repo 那种官方拒收的形态
+  for (const entry of result.items) {
+    assert.equal(typeof entry.installSpec, 'string')
+    assert.ok(entry.installSpec.length > 0)
+    assert.notEqual(entry.installSpec, entry.repo)
+    assert.ok(entry.installSpec.startsWith('github:') || !entry.installSpec.includes('/') || entry.installSpec.startsWith('@'), entry.installSpec)
+  }
+  assert.equal(result.items[1].packageName, '@alice/tool', 'npm 名一路带到 wire')
+  assert.equal(result.items[1].installSpec, '@alice/tool', '有 npm 名就用 npm 名')
+  assert.equal(result.items[0].installSpec, 'github:bob/dsh-note', '没有 npm 名就用官方认的 github: 形态')
+})
+
+test('installSpecFor：host 侧唯一定 spec 的地方（P0）', () => {
+  assert.equal(marketplace.installSpecFor('alice/tool', 'dsh-tool'), 'dsh-tool')
+  assert.equal(marketplace.installSpecFor('alice/tool', '@alice/tool'), '@alice/tool')
+  assert.equal(marketplace.installSpecFor('alice/tool', '  DSH-Tool  '), 'dsh-tool', '归一化大小写与空白')
+  assert.equal(marketplace.installSpecFor('alice/tool'), 'github:alice/tool')
+  assert.equal(marketplace.installSpecFor('alice/tool', ''), 'github:alice/tool')
+  assert.equal(marketplace.installSpecFor('alice/tool', 'not a package name'), 'github:alice/tool', '非法 npm 名不能原样送')
+  assert.equal(marketplace.installSpecFor('alice/tool', 'Owner/Tool'), 'github:alice/tool', '带斜杠的不是包名')
+  // 核心不变量：返回值永远不是 owner/repo（官方 parseInstallSpec 会判 invalid-spec）
+  for (const spec of [marketplace.installSpecFor('a/b'), marketplace.installSpecFor('a/b', 'x'), marketplace.installSpecFor('a/b', 'A B')]) {
+    assert.ok(spec !== 'a/b', spec)
+  }
+})
+
+// 客户端 wire.ts 的归一化没有可导入的产物（client 侧 tsc 只出 .d.ts，js 由 tsdown 打成
+// 浏览器 bundle），因此它的过桥由真机取证覆盖（断网截图里的文案就是那条链路的输出）。
+// host 侧这一段必须可单测：source / stale / notes 要真的进得了结果。
+test('结果透传索引状态：source / stale / notes（P2 的 host 半边）', () => {
+  makeHome()
+  const input = {
+    profile: 'web',
+    items: [marketplace.registryItem(registry.normalizeRegistryRepo(repo('a/one')))],
+    generation: 1,
+    installed: null,
+    generatedAt: null,
+    cached: true,
+    source: 'cache-stale',
+    stale: true,
+    notes: ['api: HTTP 503', 'jsdelivr-gz: 索引过旧', 'raw-gz: HTTP 503', 'raw: HTTP 503', '第五条应被截断'],
+  }
+  const result = marketplace.finalizeMarketplace(input)
+  assert.equal(result.source, 'cache-stale')
+  assert.equal(result.stale, true)
+  assert.equal(result.notes.length, marketplace.MARKET_NOTES_LIMIT, 'notes 有上限（不把整页淹掉）')
+  assert.equal(result.notes[0], 'api: HTTP 503')
+  assert.equal(result.generatedAt, '', '未知生成时间是空串，不伪造一个时间')
+  // 缺省时不写这些字段（老契约的载荷形状保持干净）
+  const bare = marketplace.finalizeMarketplace({ ...input, source: undefined, stale: undefined, notes: undefined })
+  assert.equal('source' in bare, false)
+  assert.equal('stale' in bare, false)
+  assert.equal('notes' in bare, false)
+  // 索引状态进缓存键：同内容不同来源/过期状态不能互相顶掉
+  assert.notEqual(marketplace.marketplaceCacheKey(input), marketplace.marketplaceCacheKey({ ...input, source: 'network:api', stale: false }))
+})
+
+test('搜索（P1）：名称优先、字段命中在后，中文从 0 命中变成有命中', async () => {
+  const { prepareMarketSearch, searchMarket } = await import('../dist/marketView.js')
+  const { fuzzyFilter } = await import('../dist/rank.js')
+  const items = [
+    item({ repo: 'a/dsh-note', name: 'dsh-note', description: 'keeps project memory', topics: ['memory'] }),
+    item({ repo: 'b/unrelated', name: 'unrelated', description: '', topics: [] }),
+    item({ repo: 'c/记忆助手', name: 'memory-helper', description: '中文记忆插件', topics: ['记忆'] }),
+    item({ repo: 'd/topic-only', name: 'topic-only', description: '', topics: ['memory'] }),
+    item({ repo: 'e/desc-only', name: 'desc-only', description: 'about memory', topics: [] }),
+  ]
+  // 名称通道与改动前逐条一致（子序列模糊匹配）
+  const before = fuzzyFilter(items, (entry) => entry.name, 'mem').map((hit) => hit.item.repo)
+  const after = searchMarket(prepareMarketSearch(items), 'mem').map((entry) => entry.repo)
+  assert.deepEqual(after.slice(0, before.length), before, '名称命中仍排在前面且顺序不变')
+  assert.ok(after.length > before.length, '字段命中补上了名称看不见的条目')
+
+  // 中文：旧实现 0 命中，新实现能搜到（描述/主题/名称都算）
+  const cnBefore = fuzzyFilter(items, (entry) => entry.name, '记忆')
+  const cnAfter = searchMarket(prepareMarketSearch(items), '记忆').map((entry) => entry.repo)
+  assert.equal(cnBefore === null ? 0 : cnBefore.length, 0, '旧路径对中文恒为 0')
+  assert.deepEqual(cnAfter, ['c/记忆助手'], '中文命中来自描述/主题/名称的子串')
+
+  // 权重与排序：repo/主题 > 描述；同权重按星数
+  const weighted = [
+    item({ repo: 'z/desc', name: 'zzz', description: 'memory', topics: [], stars: 999 }),
+    item({ repo: 'y/topic', name: 'yyy', description: '', topics: ['memory'], stars: 1 }),
+  ]
+  assert.deepEqual(searchMarket(prepareMarketSearch(weighted), 'memory').map((entry) => entry.repo), ['y/topic', 'z/desc'], '主题 2 分 > 描述 1 分，星数只在同分时破平')
+
+  // 空查询 / 空白查询 → null（排序交给调用方）
+  assert.equal(searchMarket(prepareMarketSearch(items), ''), null)
+  assert.equal(searchMarket(prepareMarketSearch(items), '   '), null)
+  assert.deepEqual(searchMarket(prepareMarketSearch(items), 'zzzzz'), [])
+})
+
+test('搜索（P1）：掩码预筛不改变命中集合（与逐条全扫等价）', async () => {
+  const { prepareMarketSearch, searchMarket } = await import('../dist/marketView.js')
+  // 造一批含非 ASCII 的条目，确认掩码（只覆盖 ASCII 字母）只放过不误杀
+  const items = []
+  for (let index = 0; index < 60; index += 1) {
+    items.push(item({
+      repo: 'r/' + String(index),
+      name: index % 2 === 0 ? ('plugin-' + String(index)) : ('插件' + String(index)),
+      description: index % 3 === 0 ? '中文描述 memory' : 'ascii description',
+      topics: index % 5 === 0 ? ['记忆', 'rag'] : ['other'],
+    }))
+  }
+  const entries = prepareMarketSearch(items)
+  for (const query of ['memory', '记忆', 'rag', 'plugin', '插件', 'zzz']) {
+    const hits = searchMarket(entries, query).map((entry) => entry.repo)
+    // 参照实现：不做掩码，直接全扫同样的字段
+    const naive = []
+    for (const entry of items) {
+      const needle = query.toLowerCase()
+      // 注意 fuzzyFilter 对非空查询返回的是**数组**（空数组=没有命中），不是 null
+      const nameHit = (await import('../dist/rank.js')).fuzzyFilter([entry], (x) => x.name, query).length > 0
+      const hay = (entry.name + ' ' + entry.repo + ' ' + entry.topics.join(' ') + ' ' + entry.description).toLowerCase()
+      if (nameHit || hay.includes(needle)) naive.push(entry.repo)
+    }
+    assert.deepEqual([...hits].sort(), [...naive].sort(), '查询 ' + query + ' 的命中集合必须一致')
+  }
 })
 
 test('管线缓存键包含内容身份（M-1：同代际不同条目必须重算）', () => {

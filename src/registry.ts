@@ -577,7 +577,9 @@ export async function loadRegistryIndex(options: LoadRegistryIndexOptions = {}):
     if (stale !== null) {
       return publish(stale.repos, stale.generatedAt, now, [...result.notes, '全部网络来源失败，回退到过期磁盘缓存'], true, true, 'cache-stale', 0)
     }
-    return publish([], null, now, [...result.notes, '全部网络来源失败且无磁盘缓存'], true, true, 'empty', 0)
+    // cached=false 是有意的：这一支**什么都没有拿到**，说"来自缓存"是撒谎；调用方据 source='empty'
+    // 与 stale=true 呈现"索引不可用，可重试"（旧版本这里传 true，UI 会画出"来自缓存"的假象）。
+    return publish([], null, now, [...result.notes, '全部网络来源失败且无磁盘缓存'], false, true, 'empty', 0)
   })()
 
   // 在途去重：并发的刷新共享同一次走链。

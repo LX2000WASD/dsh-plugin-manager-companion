@@ -151,7 +151,8 @@ describe('task-40 · manifest 读不懂 ≠ 没有值（按字段表达）', () 
     const skip = report.skipped.find((item) => item.check === 'manifest-unknown')
     assert.ok(skip, '要在 skipped 里如实登记：' + JSON.stringify(report.skipped.map((item) => item.check)))
     assert.match(skip.reason, /bundles/, '要说清是哪个字段读不出来：' + skip.reason)
-    assert.match(skip.reason, /不要把它们当成/, '要说清这不是"确实为空"')
+    // task-53 删掉了"不要把它们当成确实为空"这句提醒，但"本次没有判断"是**不确定性事实**，必须留着
+    assert.match(skip.reason, /本次没有判断/, '要说清这次没有判断')
   })
 
   it('dependencies 未知时诊断同样登记 manifest-unknown', async () => {

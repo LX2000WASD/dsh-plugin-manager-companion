@@ -225,10 +225,21 @@ function group(raw: unknown, index: number): DiagnosticGroup | undefined {
 function unknownManifestFields(raw: unknown): ManifestField[] {
   const seen = new Set<ManifestField>()
   for (const name of texts(raw)) {
-    if (name === 'bundles' || name === 'dependencies') seen.add(name)
+    // 用可穷尽表而不是字符串字面量比较：ManifestField 一扩展，MANIFEST_FIELDS 就编译报错，
+    // 于是"过滤"不可能变成静默吞字段。
+    if (Object.hasOwn(MANIFEST_FIELDS, name)) seen.add(name as ManifestField)
   }
   return [...seen]
 }
+
+/**
+ * 派生字段闭集的可穷尽表。
+ *
+ * 过滤本身是必要的（线缆上的名字不受我们控制），但**过滤不能静默漏**：以后有人给
+ * ManifestField 加第三个成员时，这里少一个键就编译不过，实现者必须同时决定界面怎么显示。
+ * （host 侧类型收紧 + 边界处不静默丢弃，是两件事。）
+ */
+const MANIFEST_FIELDS: Record<ManifestField, true> = { bundles: true, dependencies: true }
 
 /**
  * 一条跳过记录。
@@ -350,8 +361,6 @@ export function normalizeEnvironments(raw: unknown): EnvironmentInfo[] | undefin
       ...(typeof record['unknownReason'] === 'string' && record['unknownReason'] !== ''
         ? { unknownReason: record['unknownReason'] as string }
         : {}),
-      // 层栈是不是确定的：只认明确的 false，缺字段（等价 true）与任何其它取值都不发明"未知"。
-      ...(record['bundlesKnown'] === false ? { bundlesKnown: false } : {}),
       dependencies: texts(record['dependencies']),
       runs: asArray(record['runs'])
         .map(entry => run(entry))

@@ -10,6 +10,13 @@
  * 官方复用：@deepseek-ai/dsh-client-ui-primitives（Button/Input/Tag/Modal/Toast/Tooltip/Menu…）。
  * 前提检查：索引抓取与合并都在 host（task-3 的市场管道），客户端不联网抓 GitHub，
  *   也不自建 pnpm：安装走自有 install op（内部是官方 Remote 的禁用态安装 + 回滚）。
+ *
+ * 本轮（task-41）修掉的两条实证缺陷：
+ *   1. **安装 spec 不在这里拼**：以前送 item.repo（owner/repo），官方 parseInstallSpec 判 invalid-spec，
+ *      每一条都装不上。现在送 host 在 MarketItem.installSpec 里定好的值。
+ *   2. **索引状态要说出来**：source/stale/notes 由 host 送来，不可用画成"索引不可用 + 原因 + 重试"，
+ *      过期画成"这是缓存索引（生成于 X）"，不再与"没有匹配的条目"混为一谈。
+ *   另：搜索从"只搜名称"改为 name/repo/主题/描述（中文查询以前命中恒为 0）。
  */
 
 import { useEffect, useMemo, useRef, useState } from 'react'
@@ -18,8 +25,10 @@ import {
   IconSearchOutline16, Input, Modal, Tag, Toast, Tooltip,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
-import { categoryOptions, filterByCategory, marketToolbarModel, sortRows, tagsOf, updateAvailable, type MarketSort } from '../marketView.ts'
-import { fuzzyFilter } from '../rank.ts'
+import {
+  categoryOptions, filterByCategory, marketToolbarModel, prepareMarketSearch, searchMarket, sortRows, tagsOf,
+  updateAvailable, type MarketSort,
+} from '../marketView.ts'
 import type { MarketItem, MarketItemKind } from '../types.ts'
 import { NS } from './locales.ts'
 import { PmSelect } from './pmSelect.tsx'
@@ -104,14 +113,19 @@ export function MarketplacePage({
     () => [{ id: '', label: t('market.all') }, ...KINDS.map(item => ({ id: item, label: t(KIND_LABEL[item]) }))],
     [t],
   )
+  // 分类/类型筛选：只有它变化时才重建候选集。
+  const scoped = useMemo(
+    () => filterByCategory(result?.items ?? [], category).filter(item => kind === '' || (item.kind ?? 'unknown') === kind),
+    [result, category, kind],
+  )
+  // 检索索引（小写字段 + 掩码）：**每次列表变化建一次**，绝不放进每键击路径。
+  const searchable = useMemo(() => prepareMarketSearch(scoped), [scoped])
   const rows = useMemo(() => {
-    const scoped = filterByCategory(result?.items ?? [], category)
-      .filter(item => kind === '' || (item.kind ?? 'unknown') === kind)
-    const hits = fuzzyFilter(scoped, item => item.name, query)
-    // 有搜索词时用相关度顺序（fuzzyFilter 已经排好），否则用契约排序：
-    // installed 恒在最前、方向键与比较器同源（marketToolbarModel.direction）。
-    return hits === null ? sortRows(scoped, toolbar.sort, toolbar.descending) : hits.map(hit => hit.item)
-  }, [result, category, kind, query, toolbar.sort, toolbar.descending])
+    const hits = searchMarket(searchable, query)
+    // 有搜索词时用相关度顺序（searchMarket 已经排好：名称命中优先，其后按字段权重 + 星数），
+    // 否则用契约排序：installed 恒在最前、方向键与比较器同源（marketToolbarModel.direction）。
+    return hits === null ? sortRows(scoped, toolbar.sort, toolbar.descending) : hits
+  }, [searchable, scoped, query, toolbar.sort, toolbar.descending])
 
   // 搜索 / 筛选 / 排序 / 索引刷新都会换一批结果：渲染量必须回到首屏水平，
   // 否则"切换一次就把一万多条全倒出来"，等于窗口形同虚设。
@@ -139,6 +153,19 @@ export function MarketplacePage({
 
   const closeInstall = (): void => { setTarget(undefined); dismissInstallNotice() }
 
+  /** 索引层提示：不可用（六跳全失败且无缓存）优先于过期（用的是旧缓存）。 */
+  const indexNotice = useMemo(() => {
+    if (result === undefined) return undefined
+    const notes = result.notes ?? []
+    if (result.source === 'empty') {
+      return { unavailable: true, notes, text: t('market.unavailable', { reason: notes[0] ?? t('market.failedUnknown') }) }
+    }
+    if (result.stale === true) {
+      return { unavailable: false, notes, text: t('market.stale', { at: formatRelative(t, result.generatedAt) }) }
+    }
+    return undefined
+  }, [result, t])
+
   return (
     <div className={css.page}>
       <div className={css.rowBetween}>
@@ -153,7 +180,10 @@ export function MarketplacePage({
           {loading ? t('market.refreshing') : t('market.refresh')}
         </Button>
       </div>
-      <p className={css.intro}>{t('market.intro')}</p>
+      {/* 这里原先渲染 market.intro（"社区索引里的插件、技能与预设。"）。删掉渲染点、**保留字典键**：
+          那句话枚举的三个类型，类型筛选器上已经列着（KIND_LABEL 的 插件/技能/预设），属于"把屏幕上已有的元素又念一遍"；
+          而且它还与事实不符——索引里并没有技能/预设的区分（kind 恒为 cordis-plugin），技能与预设是"技能与预设"页在管。
+          键由 copy-dev 在 task-47 收口时连字典一起删；本文件已无引用。 */}
       {error === undefined && errorKey === undefined ? null : (
         <p className={css.error} role="status">
           {t('market.failed', { message: errorKey === undefined ? error ?? '' : t(errorKey) })}
@@ -213,6 +243,24 @@ export function MarketplacePage({
         )}
       </div>
 
+      {/*
+        P2：索引不可用 / 数据过期必须说出来。只给 cached 布尔值时，这三件事在界面上长得一模一样：
+        「刚抓到的新索引」「用的是三天前的缓存」「六跳全失败」——用户会把后者读成"市场里没有这个插件"。
+      */}
+      {indexNotice === undefined ? null : (
+        <div className={css.notice} role="status">
+          <p className={css.error}>{indexNotice.text}</p>
+          {indexNotice.notes.length === 0 ? null : (
+            <ul className={css.gateList}>
+              {indexNotice.notes.map(note => <li key={note} className={css.gateItem}>{note}</li>)}
+            </ul>
+          )}
+          <Button variant="outline" size="sm" disabled={loading} onClick={() => { loadMarketplace(true) }}>
+            {loading ? t('market.refreshing') : t('market.retry')}
+          </Button>
+        </div>
+      )}
+
       {gateIssues.length === 0 && installError === undefined ? null : (
         <div className={css.notice} role="status">
           {installError === undefined ? null : <p className={css.error}>{t('market.installFailed', { message: installError })}</p>}
@@ -227,7 +275,12 @@ export function MarketplacePage({
         </div>
       )}
 
-      {result === undefined && loading ? <p className={css.intro} role="status">{t('common.loading')}</p> : rows.length === 0 ? <p className={css.intro}>{t('market.empty')}</p> : (
+      {result === undefined && loading
+        ? <p className={css.intro} role="status">{t('common.loading')}</p>
+        : rows.length === 0
+          // 索引不可用时上面已经说明了原因，这里不能再画"没有匹配的条目"——那是把故障画成空结果。
+          ? <p className={css.intro}>{indexNotice?.unavailable === true ? t('market.unavailableHint') : t('market.empty')}</p>
+          : (
         <ul className={css.list}>
           {shown.map((item) => {
             const tags = tagsOf(item)
@@ -319,7 +372,8 @@ export function MarketplacePage({
               size="md"
               disabled={target === undefined || installing !== undefined}
               onClick={() => {
-                if (target !== undefined) installMarketItem({ repo: target.repo, name: target.name })
+                // spec 由 host 决定（MarketItem.installSpec），这里只转发——客户端不拼字符串。
+                if (target !== undefined) installMarketItem({ repo: target.repo, name: target.name, installSpec: target.installSpec })
                 setTarget(undefined)
               }}
             >

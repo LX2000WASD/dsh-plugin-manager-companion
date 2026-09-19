@@ -187,7 +187,7 @@ describe('cli：分派与受保护操作', () => {
     assert.match(io.out(), /- dsh-foo/)
     assert.match(io.out(), /companion-installed skills\/presets/)
     assert.match(io.out(), /skill root: /)
-    assert.match(io.out(), /plugin_manager/)
+    assert.match(io.out(), /preset root: /)
   })
 
   it('mount 只读盘点并给出官方 plugin_manager 的下一步，不改任何文件', async () => {
@@ -407,5 +407,59 @@ describe('cli：analyze 只读逃生口（无宿主、环境起不来也要能�
     const missingAnchor = judgeAnalyze({ ...base, skipped: [] }, { anchorMissing: true })
     assert.equal(missingAnchor.verdict, 'incomplete')
     assert.equal(missingAnchor.code, 1)
+  })
+})
+describe('cli：文案契约（删掉的教学句 / 分工解释不许回来）', () => {
+  function sink() {
+    const out = []
+    const err = []
+    return { stdout: (text) => out.push(text), stderr: (text) => err.push(text), out: () => out.join(''), err: () => err.join('') }
+  }
+
+  /** 转义成可直接塞进 RegExp 的字面量。 */
+  function literal(text) {
+    return new RegExp(text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+  }
+
+  it('list / help 不出现分工解释与自我介绍', async () => {
+    await put(join(home, 'profiles', 'copy-web', 'package.json'), JSON.stringify({ name: 'dsh-profile-copy-web', private: true }))
+    const io = sink()
+    await main(['list', '--profile', 'copy-web', '--home', home], io)
+    await main(['help'], io)
+    const out = io.out()
+    // 删的是两类：分工解释（谁该干这件事）与自夸式收尾（我们只负责什么）。
+    // 它们不是事实、不是下一步动作，屏幕上也已经有等价信息（命令与输出本身）。
+    assert.doesNotMatch(out, literal('This CLI never edits cordis.patch.yml'))
+    assert.doesNotMatch(out, literal('through the official protected flow'))
+    // 保留的对照：帮助信息与磁盘事实仍在（下一步动作见 mount 用例）。
+    assert.match(out, /Usage: dshpmc/)
+    assert.match(out, /skill root: /)
+  })
+
+  it('analyze 的 INCOMPLETE 段不再解释「谁该把根因提升为问题」', async () => {
+    await put(join(home, 'profiles', 'copy-broken', 'package.json'), JSON.stringify({ name: 'dsh-profile-copy-broken', private: true }))
+    await put(join(home, 'profiles', 'copy-broken', 'cordis.patch.yml'), '[]' + nl)
+    const io = sink()
+    await main(['analyze', '--profile', 'copy-broken', '--home', home], { ...io, installAnchor: ' ' })
+    const out = io.out()
+    assert.match(out, /INCOMPLETE/)
+    assert.doesNotMatch(out, literal('把根因提升为正式问题'))
+    // 必须保住的事实：issues=0 不等于健康。
+    assert.match(out, /不代表环境健康/)
+  })
+
+  it('安装失败提示只留可执行动作（allowBuilds），不解释构建机制', async () => {
+    const target = join(repo, 'copy-fail.git')
+    await put(join(target, 'README.md'), 'no env vars here' + nl)
+    const io = sink()
+    await main(['install', target, '--home', home], {
+      ...io,
+      installAnchor: '/tmp/anchor.json',
+      runPluginCommand: async () => ({ exitCode: 1, output: 'boom', logPath: '/tmp/log/pnpm.log' }),
+    })
+    const err = io.err()
+    assert.match(err, /allowBuilds/)
+    assert.match(err, /pnpm-workspace\.yaml/)
+    assert.doesNotMatch(err, literal('git-hosted plugins build on install'))
   })
 })

@@ -623,8 +623,9 @@ describe('diagnostics · 需人工处理的提示（后果 + 三要素）', () =
     assert.ok(across, '跨列表重名要如实报出来：' + JSON.stringify(report.issues.map(candidate => candidate.code)))
     assert.equal(across.severity, 'report-only')
     assert.equal(across.fix, undefined, 'report-only 不给修复动作')
-    assert.match(across.detail, /不会触发官方 loader 的/, '要如实写明不致命')
-    assert.match(across.detail, /能正常启动/)
+    // task-53 删掉了机制解释，但"实测能正常启动"这条**事实**必须留着（用户据此判断优先级）
+    assert.match(across.detail, /实测这种组合 profile 能正常启动/, '要如实写明不致命')
+    assert.doesNotMatch(across.detail, /不会触发官方 loader 的 duplicate/, '机制解释已删')
     assert.ok(across.detail.includes('cordis.patch.yml:' + crossPlainLine),
       '要指回第一处：' + across.detail)
     assert.ok(across.detail.includes('cordis.patch.yml:' + crossSecondLine),

@@ -24,7 +24,8 @@
  * 官方 operations —— 差别只是传给 runPluginCommand 的 profile 参数，不是两套实现。
  */
 
-import { execFileSync, spawn } from 'node:child_process'
+import { execFileSync, spawn, spawnSync } from 'node:child_process'
+import type { ChildProcess } from 'node:child_process'
 import {
   accessSync, closeSync, constants, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync,
   rmSync, statSync,
@@ -267,6 +268,41 @@ function parseProcessLines(lines: readonly string[]): ProcessLine[] {
   return out
 }
 
+/**
+ * 把命令行切成 argv 片段，尊重引号。
+ *
+ * 为什么必须尊重引号：Windows 会给含空格的参数加引号，而官方安装包默认就在
+ * `C:\Program Files\nodejs`。按空白切词会把 `"C:\Program Files\…\bin.js"` 切成两段，
+ * isDshEntry 拿到 `bin.js"` 就不匹配 → 正在运行的实例被判成「没在运行」（审计 W-03，
+ * 已在真 win32 Node 上复现）。后果最重的一条是删除/改名前的「正在运行」护栏失效。
+ *
+ * 规则取 Windows 与 POSIX 的共同子集：引号内的空白不切分、引号本身剥掉、反斜杠不转义
+ * （cmd 不用反斜杠转义引号；ps 输出里也少见转义）。
+ *
+ * @param command - 命令行原文。
+ * @returns argv 片段。
+ */
+function tokenizeCommandLine(command: string): string[] {
+  const tokens: string[] = []
+  let current = ''
+  let quote: '"' | "'" | null = null
+  for (const char of command) {
+    if (quote !== null) {
+      if (char === quote) quote = null
+      else current += char
+      continue
+    }
+    if (char === '"' || char === "'") { quote = char; continue }
+    if (/\s/.test(char)) {
+      if (current.length > 0) { tokens.push(current); current = '' }
+      continue
+    }
+    current += char
+  }
+  if (current.length > 0) tokens.push(current)
+  return tokens
+}
+
 /** 一次性诊断命令：命令行里出现这些就不是常驻实例。 */
 const ONE_SHOT_FLAGS = new Set(['--help', '-h', '--version', '-v', '--dump-config'])
 
@@ -284,7 +320,9 @@ const ONE_SHOT_FLAGS = new Set(['--help', '-h', '--version', '-v', '--dump-confi
  * @returns 是否像 dsh 入口。
  */
 function isDshEntry(token: string): boolean {
-  const normalized = token.split('\\').join('/')
+  // 引号已在分词阶段剥掉；这里再兜一次首尾引号，防止不平衡引号留下的残片。
+  const unquoted = token.replace(/^["']|["']$/g, '')
+  const normalized = unquoted.split('\\').join('/')
   const base = normalized.slice(normalized.lastIndexOf('/') + 1)
   if (/^dsh(?:\.(?:cmd|exe|ps1|sh))?$/i.test(base)) return true
   if (!/^bin\.(?:js|ts|cjs|mjs)$/i.test(base)) return false
@@ -330,13 +368,35 @@ function portOf(tokens: readonly string[]): number | null {
 }
 
 /**
+ * 取某个环境在这份进程扫描结果里的运行实例。
+ *
+ * map 的键来自命令行文本（大小写由那个进程自己决定），所以不能逐字查找：在大小写不
+ * 敏感的文件系统上 `DEMO` 与 `demo` 是同一个环境（审计 W-01 的同族面）。判据统一走
+ * paths.ts 的 sameEnvironment，别在各处自己写比较。
+ *
+ * @param runs - scanRuns / scanRunsNow 的结果。
+ * @param name - 环境名（调用方给的原始大小写）。
+ * @returns 运行实例列表；没有则空数组。
+ */
+function runsForName(
+  runs: ReadonlyMap<string, readonly EnvironmentRun[]>, name: string,
+): readonly EnvironmentRun[] {
+  const direct = runs.get(name)
+  if (direct !== undefined) return direct
+  for (const [key, value] of runs) {
+    if (sameEnvironment(key, name)) return value
+  }
+  return []
+}
+
+/**
  * 解析一行进程表。
  *
  * @param line - pid 与命令行。
  * @returns 环境名与端口；不属于任何环境实例时 null。
  */
 function parseRun(line: ProcessLine): ParsedRun | null {
-  const tokens = line.command.split(/\s+/).filter((token) => token.length > 0)
+  const tokens = tokenizeCommandLine(line.command)
   let entry = -1
   for (let index = 0; index < tokens.length; index += 1) {
     if (isDshEntry(tokens[index] ?? '')) { entry = index; break }
@@ -562,7 +622,8 @@ export function listEnvironments(ctx?: Context, options: ListEnvironmentsOptions
     out.push({
       name,
       dir,
-      current: name === current,
+      // 这台机器上是否同一个目录（win32/darwin 大小写不敏感），不是字符串是否逐字相等。
+      current: sameEnvironment(name, current),
       builtin: isBuiltinEnvironment(name),
       bundles: manifest.bundles,
       // 读不懂 manifest 时**不能**让调用方把空数组当事实：把未知按字段如实带出去。
@@ -755,14 +816,18 @@ export async function renameEnvironment(
   const sourceDir = environmentDir(from)
   const targetDir = environmentDir(to)
   if (!existsSync(join(sourceDir, 'package.json'))) return failure('not-found', '环境不存在：' + from)
+  // 源与目标在这台机器上是同一个目录（win32/darwin 大小写不敏感）→ 先说清楚，别落到含糊的 already-exists。
+  if (sameEnvironment(from, to)) {
+    return failure('invalid-name', from + ' 与 ' + to + ' 在这台机器上是同一个环境（文件系统大小写不敏感），无需重命名')
+  }
   if (existsSync(targetDir)) return failure('already-exists', '目标环境已存在：' + to)
   const current = resolveCurrent(options)
-  if (current === from || current === to) {
+  if (sameEnvironment(current, from) || sameEnvironment(current, to)) {
     return failure('current', current + ' 是当前正在运行的环境，不能重命名')
   }
   // 改名不可逆：不拿 3s 陈旧缓存当依据，用即时扫描。
-  const busy = scanRuns({ fresh: true }).get(from)
-  if (busy !== undefined && busy.length > 0) {
+  const busy = runsForName(scanRuns({ fresh: true }), from)
+  if (busy.length > 0) {
     return failure('running', from + ' 正在运行（pid ' + busy.map((run) => run.pid).join(', ') + '），请先停止再重命名')
   }
   return enqueueMutation(async () => {
@@ -801,8 +866,8 @@ export async function removeEnvironment(
     return failure('current', name + ' 是当前正在运行的环境，不能删除（要删请先停止本进程）')
   }
   // 删除不可逆：不拿 3s 陈旧缓存当依据，用即时扫描。
-  const busy = scanRuns({ fresh: true }).get(name)
-  if (busy !== undefined && busy.length > 0) {
+  const busy = runsForName(scanRuns({ fresh: true }), name)
+  if (busy.length > 0) {
     return failure('running', name + ' 正在运行（pid ' + busy.map((run) => run.pid).join(', ') + '），请先停止再删除')
   }
   return enqueueMutation(async () => {
@@ -828,6 +893,14 @@ export interface LaunchSpec {
   readonly args: readonly string[]
   /** dsh 入口脚本绝对路径；走 PATH shim 时为 null。 */
   readonly entry: string | null
+  /**
+   * 是否需要经 shell 启动。
+   *
+   * Windows 上 PATH shim 是 `dsh.cmd`：Node ≥20.12 起 `spawn('x.cmd')` 不带 shell 会**抛 EINVAL**
+   * （审计 W-07 已在真 win32 Node 上实测），所以这条回退路径必须显式声明要 shell；
+   * 首选路径（process.execPath + bin.js）保持无 shell 的官方启动纪律。
+   */
+  readonly shell: boolean
   /** 环境目录。 */
   readonly dir: string
   /** 面向用户的等价命令行（原样展示，不执行）。 */
@@ -894,8 +967,8 @@ export async function startEnvironment(
   if (problem !== null) return failure('invalid-name', problem)
   const dir = environmentDir(name)
   if (!existsSync(join(dir, 'package.json'))) return failure('not-found', '环境不存在：' + name)
-  const running = scanRuns().get(name)
-  if (running !== undefined && running.length > 0) {
+  const running = runsForName(scanRuns(), name)
+  if (running.length > 0) {
     const ports = running.map((run) => run.port).filter((port): port is number => port !== null)
     return failure('running', name + ' 已经在运行'
       + (ports.length > 0 ? '（端口 ' + ports.join(', ') + '）' : '（pid ' + running.map((run) => run.pid).join(', ') + '）')
@@ -917,15 +990,32 @@ export async function startEnvironment(
       + '所以不发起启动。请换一个端口，或先停掉占用它的进程。')
   }
   const spec = launchSpec(name, dir, port, options)
-  const outcome = await (options.launch ?? defaultLaunch)(spec)
+  let outcome = await (options.launch ?? defaultLaunch)(spec)
   if (!outcome.ok) return failure('launch-failed', outcome.detail)
-  const status = await waitForReady(port, options)
+  let status = await waitForReady(port, options)
+  let retryNote = ''
+  if (status === null && outcome.mode === 'terminal') {
+    // 审计 W-09：终端窗口内的失败是**异步**的（窗口里的报错、没有 wt、无桌面会话），
+    // spawn 不抛，所以第一段就绪失败不能当作结论。但也不能在「第一次其实起来了、只是慢」
+    // 时再起一个（同端口会打架）—— 只在端口根本没人监听时才回退后台重试。
+    if (!await tcpListening(port)) {
+      // 走同一个启动器（可注入），只是换成后台形态 —— 这样调用方/测试只需要注入一次。
+      const retrySpec = backgroundSpec({ ...spec, mode: 'background' })
+      const fallback = await (options.launch ?? defaultLaunch)(retrySpec)
+      retryNote = '\n终端窗口尝试 ' + String(options.readyTimeoutMs ?? START_READY_TIMEOUT_MS)
+        + 'ms 未就绪，已改为后台启动重试。'
+      if (!fallback.ok) return failure('launch-failed', fallback.detail + retryNote)
+      outcome = fallback
+      status = await waitForReady(port, options)
+    }
+  }
   if (status === null) {
-    return failure('timeout', startTimeoutMessage(name, port, spec, outcome, options))
+    return failure('timeout', startTimeoutMessage(name, port, spec, outcome, options) + retryNote)
   }
   // 新实例立刻可见：丢弃陈旧缓存。
   resetRunCache()
-  return success(startedMessage(name, port, status, spec, outcome))
+  // 回退过一次的话，成功文案也要说清楚（用户需要知道第一次为什么没成）。
+  return success(startedMessage(name, port, status, spec, outcome) + retryNote)
 }
 
 /**
@@ -1023,6 +1113,7 @@ function launchSpec(name: string, dir: string, port: number, options: StartEnvir
     command: entryPoint.command,
     args,
     entry: entryPoint.entry,
+    shell: entryPoint.shell,
     dir,
     display: [entryPoint.command, ...args].join(' '),
   }
@@ -1037,13 +1128,26 @@ function launchSpec(name: string, dir: string, port: number, options: StartEnvir
  *
  * @returns 命令、前置参数与入口脚本路径。
  */
-function dshEntryPoint(): { command: string; args: readonly string[]; entry: string | null } {
-  const entry = process.argv[1]
+/**
+ * 被启动实例的入口（可注入 argv/platform，供测试）。
+ *
+ * @param argv - 进程参数；默认 process.argv。
+ * @param platform - 平台；默认 process.platform。
+ * @returns 命令、前置参数、入口脚本与是否需要 shell。
+ */
+export function dshEntryPoint(
+  argv: readonly string[] = process.argv, platform: NodeJS.Platform = process.platform,
+): { command: string; args: readonly string[]; entry: string | null; shell: boolean } {
+  const entry = argv[1]
   if (entry !== undefined && /(?:^|[\\/])bin\.(?:js|cjs|mjs)$/.test(entry)
     && /[\\/]@deepseek-ai[\\/]dsh(?:[\\/]|$)/.test(entry)) {
-    return { command: process.execPath, args: [entry], entry }
+    return { command: process.execPath, args: [entry], entry, shell: false }
   }
-  return { command: process.platform === 'win32' ? 'dsh.cmd' : 'dsh', args: [], entry: null }
+  if (platform === 'win32') {
+    // Windows 的 PATH shim 是 .cmd 批处理：必须交给 cmd.exe 执行（W-07）。
+    return { command: 'dsh.cmd', args: [], entry: null, shell: true }
+  }
+  return { command: 'dsh', args: [], entry: null, shell: false }
 }
 
 /**
@@ -1208,6 +1312,41 @@ async function findFreePort(start: number, span = 200): Promise<number | null> {
 }
 
 /**
+ * 起一个 detached 子进程，并在短窗口内探测**异步**启动失败。
+ *
+ * 为什么需要探测：spawn 对「找不到可执行文件」是异步报错的，同步 try/catch 抓不到。
+ * 审计 W-09 指出：终端模式原来的 ok 判定只看同步异常，于是「找不到终端」也会被报成
+ * 「已在终端窗口启动」。这里统一成一处可等待的判定。
+ *
+ * @param command - 可执行文件。
+ * @param args - 参数（argv 直传，不经 shell）。
+ * @param extra - 追加的 spawn 选项（如日志 fd、shell）。
+ * @returns 失败说明；成功（或 500ms 内没有报错）时 null。
+ */
+async function spawnDetached(
+  command: string, args: readonly string[], extra: Record<string, unknown> = {},
+): Promise<{ failure: string | null; child: ChildProcess | null }> {
+  let child: ChildProcess | null = null
+  try {
+    child = spawn(command, [...args], {
+      cwd: process.cwd(), detached: true, stdio: 'ignore', windowsHide: true, ...extra,
+    })
+  } catch (error) {
+    return { failure: messageOf(error), child: null }
+  }
+  let failure: string | null = null
+  const started = child
+  await new Promise<void>((settle) => {
+    const timer = setTimeout(settle, 500)
+    timer.unref()
+    started.once('spawn', () => { clearTimeout(timer); settle() })
+    started.once('error', (error) => { failure = messageOf(error); clearTimeout(timer); settle() })
+  })
+  started.unref()
+  return { failure, child: started }
+}
+
+/**
  * 默认启动器：终端窗口优先，没有可用终端就降级为后台。
  *
  * @param spec - 启动描述。
@@ -1215,11 +1354,11 @@ async function findFreePort(start: number, span = 200): Promise<number | null> {
  */
 async function defaultLaunch(spec: LaunchSpec): Promise<LaunchOutcome> {
   if (spec.mode === 'terminal') {
-    const terminal = openInTerminal(spec)
+    const terminal = await openInTerminal(spec)
     if (terminal !== null) {
       return {
         ok: true, mode: 'terminal', terminal,
-        detail: '已在 ' + terminal + ' 终端窗口中启动 —— 关闭该窗口即停止实例',
+        detail: '已在 ' + terminal + ' 终端窗口中启动（窗口内的启动结果尚未验证）—— 关闭该窗口即停止实例',
       }
     }
     return await spawnBackground(backgroundSpec(spec), '没有可用终端，已降级为后台启动')
@@ -1245,16 +1384,13 @@ async function spawnBackground(spec: LaunchSpec, note?: string): Promise<LaunchO
     mkdirSync(dirname(logPath), { recursive: true, mode: 0o700 })
     const fd = openSync(logPath, 'a', 0o600)
     try {
-      const child = spawn(spec.command, [...spec.args], {
-        cwd: process.cwd(), detached: true, stdio: ['ignore', fd, fd], windowsHide: true,
+      // shell 只对 Windows 的 .cmd shim 打开（W-07）：Node 自己用 ComSpec 执行批处理，
+      // 参数仍逐项传入；首选路径（execPath + bin.js）保持无 shell。
+      const { failure: spawnFailure } = await spawnDetached(spec.command, spec.args, {
+        stdio: ['ignore', fd, fd],
+        ...spec.shell ? { shell: true } : {},
       })
-      await new Promise<void>((settle) => {
-        const timer = setTimeout(settle, 500)
-        timer.unref()
-        child.once('spawn', () => { clearTimeout(timer); settle() })
-        child.once('error', (error) => { failure = messageOf(error); clearTimeout(timer); settle() })
-      })
-      child.unref()
+      failure = spawnFailure
     } finally {
       closeSync(fd)
     }
@@ -1271,32 +1407,49 @@ async function spawnBackground(spec: LaunchSpec, note?: string): Promise<LaunchO
 }
 
 /**
+ * Windows 可见终端窗口的启动形态（Windows Terminal，官方 open-in-app 目录的 Win 终端项就是 wt：
+ * packages/host/open-in-app/src/catalog.ts:361）。
+ *
+ * 为什么不用 `cmd /c start "" cmd /k <命令行>`：那条串是裸拼接的展示文本，交给 cmd 会**重新
+ * 分词**；官方安装包默认在 `C:\Program Files\nodejs`，含空格时新窗口里只有「找不到命令」，
+ * 而失败要等 30s 就绪超时才暴露（审计 W-08）。wt 收的是 argv，程序与每个参数各自成段，
+ * 不再经过 shell 分词。
+ *
+ * @param spec - 启动描述。
+ * @returns 要执行的命令与参数（argv 形态）。
+ */
+export function windowsTerminalInvocation(spec: LaunchSpec): { command: string; args: readonly string[] } {
+  const program = spec.shell ? 'cmd.exe' : spec.command
+  const args = spec.shell ? ['/d', '/s', '/c', spec.command, ...spec.args] : [...spec.args]
+  return { command: 'wt', args: ['-d', spec.dir, program, ...args] }
+}
+
+/**
  * 在可见终端窗口里启动。
  *
  * 窗口让实例一直在用户眼前（关掉窗口就停掉实例），也是旧实现里用户最认可的交互。
- * POSIX 下优先切到 $TERMINAL。找不到终端返回 null，由调用方降级到后台。
+ * POSIX 下优先切到 $TERMINAL；Windows 上只用官方目录项形态（Windows Terminal，wt）。
+ * 找不到可用终端、或启动**异步失败**（wt 不存在、无桌面会话）时返回 null，由调用方
+ * 降级为后台并如实说明 —— 不再出现「已启动」而其实窗口里是报错。
  *
  * @param spec - 启动描述。
  * @returns 终端名；没有可用终端时 null。
  */
-function openInTerminal(spec: LaunchSpec): string | null {
+async function openInTerminal(spec: LaunchSpec): Promise<string | null> {
   const line = shellLine(spec)
   if (process.platform === 'darwin') {
-    try {
-      spawn('osascript', ['-e', 'tell application "Terminal" to do script "' + line.split('"').join('\\"') + '"'],
-        { stdio: 'ignore' }).unref()
-      return 'Terminal.app'
-    } catch {
-      return null
-    }
+    const { failure } = await spawnDetached('osascript',
+      ['-e', 'tell application "Terminal" to do script "' + line.split('"').join('\\"') + '"'])
+    return failure === null ? 'Terminal.app' : null
   }
   if (process.platform === 'win32') {
-    try {
-      spawn('cmd', ['/c', 'start', '', 'cmd', '/k', spec.display], { stdio: 'ignore', windowsHide: true }).unref()
-      return 'cmd'
-    } catch {
-      return null
-    }
+    // 只用官方目录项形态（Windows Terminal，官方 open-in-app 目录里 Win 的终端项就是 wt）：
+    // packages/host/open-in-app/src/catalog.ts:361。程序与参数走 argv，不经过 shell 二次分词，
+    // 所以 `C:\Program Files\nodejs` 这类含空格的路径天然安全（审计 W-08 的根因就是裸拼接命令行）。
+    // 没有 wt（或启动失败）→ 返回 null，由调用方降级为后台并如实说明；不再自造 cmd /c start 命令行。
+    const invocation = windowsTerminalInvocation(spec)
+    const { failure } = await spawnDetached(invocation.command, invocation.args)
+    return failure === null ? 'wt' : null
   }
   const configured = process.env.TERMINAL?.trim() ?? ''
   const candidates = [
@@ -1307,12 +1460,9 @@ function openInTerminal(spec: LaunchSpec): string | null {
     if (candidate.length === 0) continue
     const resolved = whichSync(candidate)
     if (resolved === null) continue
-    try {
-      spawn(resolved, terminalArgv(basename(resolved), line), { stdio: 'ignore', windowsHide: true }).unref()
-      return basename(resolved)
-    } catch {
-      // 换下一个模拟器。
-    }
+    const { failure } = await spawnDetached(resolved, terminalArgv(basename(resolved), line))
+    if (failure === null) return basename(resolved)
+    // 换下一个模拟器。
   }
   return null
 }
@@ -1375,6 +1525,33 @@ function whichSync(bin: string): string | null {
   return null
 }
 
+/**
+ * 终止一个实例进程。**平台语义不同，必须如实区分。**
+ *
+ * POSIX：给那一个 pid 发 SIGTERM —— 可被对端 handler 处理，是「请退出」。
+ * Windows：Node 的 SIGTERM 等价于强制结束**那一个** pid（子进程收不到 handler），而且
+ *   **不覆盖进程树**：审计 W-02 实测杀掉 cmd 包装进程后，真正跑着 bin.js 的孙进程仍然
+ *   活着，而 stop 会报「已停止」。所以 Windows 走进程树终止：
+ *   `taskkill /PID <pid> /T /F` —— 与官方同形实现
+ *   packages/subprocess/subprocess-local/src/spawn.ts:113-122（taskkillProcessTree）一致；
+ *   这里按同形自己调系统命令，不依赖那个包（subprocess-local 的内部面不对外导出，
+ *   对外只有 ctx.subprocess 服务，而它只提供 spawn/spawnTerminal/resolveExecutable，
+ *   没有进程枚举与终止树的方法）。
+ *
+ * @param pid - 目标 pid（调用方已复核过命令行仍属于同名环境）。
+ * @returns 实际采用的方式，写进结果文案用（不假装优雅停止）。
+ */
+function terminateInstance(pid: number): 'sigterm' | 'taskkill' {
+  if (process.platform === 'win32') {
+    // 与官方同形：结果刻意不判成败 —— 进程树可能刚好自己退出、taskkill 也可能不在 PATH；
+    // 真正的判据是下面的存活轮询，那才是事实。
+    spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
+    return 'taskkill'
+  }
+  process.kill(pid, 'SIGTERM')
+  return 'sigterm'
+}
+
 /** stopEnvironment 的选项。 */
 export interface StopEnvironmentOptions extends CurrentEnvironmentOptions {
   /** 等待退出的上限；默认 STOP_TIMEOUT_MS。 */
@@ -1383,6 +1560,14 @@ export interface StopEnvironmentOptions extends CurrentEnvironmentOptions {
   readonly now?: () => number
   /** 注入等待（测试）。 */
   readonly sleep?: (ms: number) => Promise<void>
+  /**
+   * 注入「读某个 pid 的命令行」（测试）。
+   *
+   * 为什么需要它：kill 前的复核在 Windows 上走 powershell，POSIX 上读 /proc —— 在 Linux 上
+   * 伪装 process.platform='win32' 会让复核必然读不到（找不到 powershell），于是整条 Windows
+   * 分支无法在 Linux 回归里覆盖。这是与 probe/launch/sleep 同风格的测试接缝。
+   */
+  readonly readCommand?: (pid: number) => string | null
 }
 
 /**
@@ -1390,8 +1575,9 @@ export interface StopEnvironmentOptions extends CurrentEnvironmentOptions {
  *
  * 绝不 pkill -f "dsh --profile NAME"：那会连带杀掉命令行里恰好出现同一字符串的
  * 无关进程，也会杀掉同名的 pnpm 与一次性命令。这里的流程是：扫描，取同名环境的
- * pid，逐个用 readProcessCommand 复核该 pid 仍然是同一环境的实例，SIGTERM，轮询
- * 存活。
+ * pid，逐个用 readProcessCommand 复核该 pid 仍然是同一环境的实例，再终止（POSIX
+ * SIGTERM；Windows taskkill /T /F 结束进程树，见 terminateInstance），最后轮询存活。
+ * 结果文案如实说明是哪种终止方式 —— Windows 上不存在「优雅停止」这回事。
  *
  * @param name - 环境名。
  * @param options - 停止选项。
@@ -1411,29 +1597,31 @@ export async function stopEnvironment(
   }
   // 缓存先看（Windows 全表扫描可达数秒）；缓存里没有时用即时扫描复核一次，免得把
   // 刚起来的实例判成没起、或把刚停的实例当成还在跑。
-  let runs = scanRuns().get(name) ?? []
-  if (runs.length === 0) runs = scanRunsNow().get(name) ?? []
+  let runs = runsForName(scanRuns(), name)
+  if (runs.length === 0) runs = runsForName(scanRunsNow(), name)
   if (runs.length === 0) return failure('not-running', name + ' 没有运行中的实例')
 
   const killed: number[] = []
   const skipped: string[] = []
+  /** 本批实际用过的终止方式（决定文案说的是 SIGTERM 还是 taskkill）。 */
+  const modes = new Set<'sigterm' | 'taskkill'>()
   for (const run of runs) {
     if (run.pid === process.pid || run.pid === process.ppid) {
       skipped.push('pid ' + String(run.pid) + '（本进程/父进程）')
       continue
     }
-    const command = readProcessCommand(run.pid)
+    const command = (options.readCommand ?? readProcessCommand)(run.pid)
     if (command === null) {
       skipped.push('pid ' + String(run.pid) + '（已退出）')
       continue
     }
     const parsed = parseRun({ pid: run.pid, command })
-    if (parsed === null || parsed.name !== name) {
+    if (parsed === null || !sameEnvironment(parsed.name, name)) {
       skipped.push('pid ' + String(run.pid) + '（命令行已不属于 ' + name + '，拒绝 kill）')
       continue
     }
     try {
-      process.kill(run.pid, 'SIGTERM')
+      modes.add(terminateInstance(run.pid))
       killed.push(run.pid)
     } catch (error) {
       skipped.push('pid ' + String(run.pid) + '（' + messageOf(error) + '）')
@@ -1447,11 +1635,14 @@ export async function stopEnvironment(
   }
   const stillAlive = await waitForExit(killed, options)
   resetRunCache()
-  const lines = ['已停止 ' + name + '（pid ' + killed.join(', ') + '）']
+  const forced = modes.has('taskkill')
+  const lines = ['已停止 ' + name + '（pid ' + killed.join(', ') + '）'
+    + (forced ? '\n终止方式：Windows 上是 taskkill /T /F 强制结束进程树（含子进程），不是优雅停止' : '')]
   if (skipped.length > 0) lines.push('未处理：' + skipped.join('；'))
   if (stillAlive.length > 0) {
-    lines.push('仍在运行：pid ' + stillAlive.join(', ') + '（已发 SIGTERM，'
-      + String(options.timeoutMs ?? STOP_TIMEOUT_MS) + 'ms 内未退出）')
+    lines.push('仍在运行：pid ' + stillAlive.join(', ') + '（'
+      + (forced ? 'taskkill /T /F 之后' : '已发 SIGTERM，')
+      + String(options.timeoutMs ?? STOP_TIMEOUT_MS) + 'ms 内仍在）')
     return failure('kill-timeout', lines.join('\n'))
   }
   return success(lines.join('\n'))

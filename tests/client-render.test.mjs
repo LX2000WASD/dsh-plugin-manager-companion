@@ -316,7 +316,10 @@ describe('客户端渲染健壮性（残缺载荷不许变成空白页）', () =
 
       const { html, error } = renderSafely(reg.component, propsFor(face, makeT(dicts)))
       assert.equal(error, undefined)
-      assert.ok(html.includes('同类发现已归并为 4 组（共 173 条'), '要给出折叠总览：' + html.slice(0, 300))
+      // 括注「（共 173 条，逐条证据一条不少）」按用户第二次反馈删掉（DESIGN §12.3.1 实例3）：
+      // 总览句只说归并成几组；**条数的替代载体是组头的计数**（health.groupCount，下面 323 行断言）。
+      assert.ok(html.includes('同类发现已归并为 4 组'), '要给出折叠总览：' + html.slice(0, 300))
+      assert.ok(!html.includes('共 173 条'), '总览不该再重复计数（计数由组头承担）')
       for (const group of groups) {
         assert.ok(html.includes(group.exampleTitle), '组标题要在：' + group.exampleTitle)
       }
@@ -412,17 +415,23 @@ describe('客户端渲染健壮性（残缺载荷不许变成空白页）', () =
       // 而不是断言文案里没有"一键修复"——那段说明文字本身就会提到这个词。
       assert.ok(home.html.includes('一键修复') && home.html.includes('安装 foo'),
         '当前环境下修复按钮要在：' + home.html.slice(0, 300))
-      assert.ok(!home.html.includes('不是当前环境'))
+      // 旧句「（不是当前环境）」已按标准删除，这里改成断言真正承载该事实的标记（health.foreignTag），
+      // 否则这条否定断言会因为字面消失而变成空转。
+      assert.ok(!home.html.includes('非当前环境'), '当前环境不该出现「非当前环境」标记')
 
       // 切到另一个环境：同一份发现，但按钮不能出现（点了会改到当前环境）。
       face.setDiagnosticTarget('other')
       await until(() => face.hooks.health.getSnapshot().report, '非当前环境的报告落下')
       const away = renderSafely(reg.component, propsFor(face, makeT(dicts)))
       assert.equal(away.error, undefined)
-      assert.ok(away.html.includes('诊断目标：other（不是当前环境）'), '要说清报告属于谁：' + away.html.slice(0, 400))
+      assert.ok(away.html.includes('诊断目标：other'), '要说清报告属于谁：' + away.html.slice(0, 400))
+      // 删掉括注的替代载体：这个事实必须由「非当前环境」Tag 渲染出来（task-48 还会加「只读」标记）。
+      assert.ok(away.html.includes('非当前环境'), '非当前环境必须由标记表达：' + away.html.slice(0, 400))
       // 断言「页面说明了为什么没有修复按钮」，但不钉死某个句子：DESIGN §12 之后的文案标准要求这类说明
       // 只用一行用户视角的后果（task-12），所以按新句子断言，意图不变。
-      assert.ok(away.html.includes('只能诊断，不能修改'), '要说明为什么没有修复按钮（用户视角：只能诊断）')
+      // 前半句「非当前环境只能诊断，不能修改」按 Lead 裁定删掉（状态由上面的「非当前环境」标记表达），
+      // 留下的是**可执行出路**——它必须还在，否则用户只知道不能改、不知道去哪改。
+      assert.ok(away.html.includes('修改请到「环境」子页'), '要给出可执行出路：' + away.html.slice(0, 400))
       assert.ok(!away.html.includes('安装 foo'), '非当前环境不得给出会改错环境的按钮')
       assert.ok(away.html.includes('仅报告'), '改为如实标注仅报告')
     } finally { stub.restore() }
@@ -485,7 +494,8 @@ describe('客户端渲染健壮性（残缺载荷不许变成空白页）', () =
       const { html, error } = renderSafely(reg.component, propsFor(face, makeT(dicts)))
       assert.equal(error, undefined)
       assert.ok(html.includes('体检失败：环境 nope 不存在'), html.slice(0, 300))
-      assert.ok(html.includes('诊断目标：nope（不是当前环境）'), '失败时也要能看出目标是谁')
+      assert.ok(html.includes('诊断目标：nope'), '失败时也要能看出目标是谁')
+      assert.ok(html.includes('非当前环境'), '失败态也要由标记说清它不是当前环境')
     } finally { stub.restore() }
   })
 

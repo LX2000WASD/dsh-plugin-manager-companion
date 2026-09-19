@@ -669,51 +669,100 @@ describe('修复失败的归因与存续（task-35 P1）', () => {
   })
 })
 
-describe('环境列表：层栈读不懂时显示「未知」而不是 0（task-42）', () => {
+describe('环境列表：按字段显示「未知」而不是 0（task-43 字段清单）', () => {
   /** 造一个 listEnvironments 的载荷。 */
   const environmentPayload = (extra) => [{
     name: 'pm-unknown', dir: '/tmp/pm-unknown', current: true, builtin: false,
-    bundles: [], dependencies: ['@deepseek-ai/dsh-base'], runs: [],
+    bundles: [], dependencies: [], runs: [],
     ...extra,
   }]
 
   /** 用 fetch 桩喂列表，再渲染「环境」子页（走 wire 归一，最接近真机路径）。 */
-  async function renderEnvWith(payload, t) {
+  async function renderEnvWith(payload) {
     const booted = boot()
     const stub = stubFetch({ listEnvironments: () => ({ ok: true, value: payload }) })
     try {
       booted.face.refreshEnvironments()
       await until(() => booted.face.hooks.environments.getSnapshot().loading === false, '环境列表落地')
-      return { ...booted, html: renderTab(booted.entry, booted.face, t ?? booted.t, 'env') }
+      return { ...booted, html: renderTab(booted.entry, booted.face, booted.t, 'env') }
     } finally { stub.restore() }
   }
 
-  it('bundlesKnown=false：显示「未知」与可见原因，且不出现 0 个组合包', async () => {
-    const reason = 'package.json 结构读不懂：dsh.profile.bundles 存在但不是字符串数组'
-    // task-40 复数化：线缆上按字段表达未知（unknownFields + unknownReason），bundlesKnown 是派生谓词
+  /** 直接喂 store 再渲染：兜底那条要在"上游产不出未映射字段"时也能测到（防御纵深）。 */
+  function renderEnvWithRawState(environment) {
+    const booted = boot()
+    booted.face.hooks.environments.update((draft) => { draft.environments = [environment] })
+    return { ...booted, html: renderTab(booted.entry, booted.face, booted.t, 'env') }
+  }
+
+  it('unknownFields 含 bundles：组合包栏「未知」+ 原因可见，且不出现 0 个组合包', async () => {
+    const reason = 'dsh.profile.bundles 存在但不是字符串数组'
     const { html } = await renderEnvWith(environmentPayload({
-      bundlesKnown: false, unknownFields: ['bundles'], unknownReason: reason,
+      bundles: [], dependencies: ['@deepseek-ai/dsh-base'],
+      unknownFields: ['bundles'], unknownReason: reason,
     }))
     assert.ok(html.includes('未知'), '组合包那一栏要显示「未知」：' + html.slice(0, 400))
     assert.ok(!html.includes('0 个组合包'), '读不懂不能画成"0 个组合包"（把不知道说成知道）')
     assert.ok(html.includes(reason), '原因必须是可见文本，不是只挂 title')
   })
 
-  it('反向：bundlesKnown 缺省（等价 true）时仍显示真实数字，且不出现「未知」', async () => {
-    const { html } = await renderEnvWith(environmentPayload({ bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'] }))
+  it('反向：没有 unknownFields 时显示真实数字，且不出现「未知」', async () => {
+    const { html } = await renderEnvWith(environmentPayload({
+      bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'], dependencies: ['@deepseek-ai/dsh-base'],
+    }))
     assert.ok(html.includes('2 个组合包'), '确定的事实用真实数字：' + html.slice(0, 400))
+    assert.ok(html.includes('1 个依赖'), '依赖栏也是真实数字')
     assert.ok(!html.includes('未知'), '不是未知就不能出现未知')
   })
 
-  it('只透传已知字段：bundlesKnown 是别的取值时不发明「未知」', async () => {
-    const { html } = await renderEnvWith(environmentPayload({ bundlesKnown: 'yes', bundles: ['@deepseek-ai/dsh-base'] }))
-    assert.ok(html.includes('1 个组合包'), '非 false 一律按已知处理：' + html.slice(0, 400))
+  it('两栏互不串味：只含 dependencies 时组合包栏仍显示真实数字', async () => {
+    const reason = 'dependencies 不是对象'
+    const { html } = await renderEnvWith(environmentPayload({
+      bundles: ['@deepseek-ai/dsh-base'], dependencies: [],
+      unknownFields: ['dependencies'], unknownReason: reason,
+    }))
+    assert.ok(html.includes('1 个组合包'), '组合包是确定事实，必须给数字：' + html.slice(0, 400))
+    assert.ok(!html.includes('0 个依赖'), '依赖读不懂就不能显示 0 个依赖')
+    assert.ok(html.includes('未知'), '依赖栏要显示未知')
+    assert.ok(html.includes(reason), '原因可见')
+  })
+
+  it('unknownFields 为空数组：两栏都显示真实数字', async () => {
+    const { html } = await renderEnvWith(environmentPayload({
+      bundles: ['@deepseek-ai/dsh-base'], dependencies: ['@deepseek-ai/dsh-base'],
+      unknownFields: [], unknownReason: '',
+    }))
+    assert.ok(html.includes('1 个组合包') && html.includes('1 个依赖'), '空清单=全部确定：' + html.slice(0, 400))
+    assert.ok(!html.includes('未知'), '空清单不该出现未知')
+  })
+
+  it('wire 只透传闭集里的名字：清单里塞垃圾不发明「未知」', async () => {
+    const { html } = await renderEnvWith(environmentPayload({
+      bundles: ['@deepseek-ai/dsh-base'], dependencies: [],
+      unknownFields: ['layers', 42, null], unknownReason: '未来字段',
+    }))
+    assert.ok(html.includes('1 个组合包'), '不认识的名字不入清单：' + html.slice(0, 400))
     assert.ok(!html.includes('未知'), '不发明未知')
   })
 
-  it('只有 reason 没有 bundlesKnown=false 时不显示未知（原因不能单独成立）', async () => {
-    const { html } = await renderEnvWith(environmentPayload({ unknownReason: '一些原因', bundles: ['@deepseek-ai/dsh-base'] }))
+  it('只有 reason 没有清单时不显示未知（原因不能单独成立）', async () => {
+    const { html } = await renderEnvWith(environmentPayload({
+      bundles: ['@deepseek-ai/dsh-base'], dependencies: [],
+      unknownReason: '一些原因',
+    }))
     assert.ok(html.includes('1 个组合包'), '按已知显示：' + html.slice(0, 400))
-    assert.ok(!html.includes('未知'), '没有 false 就不该出现未知')
+    assert.ok(!html.includes('未知'), '没有清单就不该出现未知')
+  })
+
+  it('兜底：清单里有界面没映射的字段名时，两栏照常给数字，另外显示一次通用原因', () => {
+    const reason = 'dsh.profile.layers 读不懂'
+    const { html } = renderEnvWithRawState({
+      name: 'pm-future', dir: '/tmp/pm-future', current: false, builtin: false,
+      bundles: ['@deepseek-ai/dsh-base'], dependencies: ['@deepseek-ai/dsh-base'], runs: [],
+      unknownFields: ['layers'], unknownReason: reason,
+    })
+    assert.ok(html.includes('1 个组合包') && html.includes('1 个依赖'), '两栏照常给数字：' + html.slice(0, 400))
+    assert.equal(html.split(reason).length - 1, 1, '兜底原因只出现一次')
+    assert.ok(html.includes('环境事实不完整'), '兜底行要标明"事实不完整"：' + html.slice(0, 500))
   })
 })
