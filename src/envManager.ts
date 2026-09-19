@@ -158,6 +158,8 @@ export type EnvironmentErrorCode =
   | 'unrestorable'
   /** 参数为空（例如没有选中任何插件）。 */
   | 'empty-selection'
+  /** 快照做不到"只含源环境现在的清单"（删不掉上一次物化留下的 node_modules 等）。 */
+  | 'snapshot-not-shallow'
   /** 文件系统操作失败。 */
   | 'io-failed'
 
@@ -2295,6 +2297,80 @@ export function judgeBootStderr(stderr: string): BootVerdict {
   }
 }
 
+/**
+ * 官方 web app 的就绪行（**stdout**，console.log）。
+ *
+ * 为什么它是可信的挂载凭证：官方在 `connectionCtx.get('loader')?.await()`（Loader settle）
+ * **之后**才打印这一行，注释逐字写着它是给 supervisor 的就绪信号。实测形如：
+ * `dsh web: http://127.0.0.1:46141/?token=…`。
+ *
+ * 结尾要求一个空白（`(?=\\s)`）：流式读取不保证按行对齐，半行 URL（`…:461`）不能当成就绪——
+ * 官方走 console.log，行尾一定有换行，所以这个要求不会漏掉真信号。
+ */
+const BOOT_READY_LINE = /dsh web:\s*(https?:\/\/\S+)(?=\s)/
+
+/**
+ * 服务形态的启动参数（官方自己的 e2e 与发布脚本同款：`dsh web --no-open --host 127.0.0.1 --port 0`）。
+ *
+ * `--port 0` 由 OS 分配端口，因此**永不与 GUI 抢 3080**；官方 CLI 只解析启动器自己的标志
+ * （--profile / --patch / dump-config），其余参数原样交给树。
+ */
+const SERVICE_MODE_ARGS = ['--port', '0', '--no-open'] as const
+
+/**
+ * 一次验证启动的超时上限。
+ *
+ * 官方 smoke 用 90s 是在等一个真实服务；我们只等**就绪行**（实测报文 <1s），
+ * 所以收在 15s：既是 20 倍余量，也把"判不出来"的等待从 30s 砍到 15s。
+ */
+export const VERIFY_TIMEOUT_MS = 15_000
+
+/**
+ * 验证启动的参数：**按层栈决定形态**（未知参数不能盲加——headless 类环境不认 --port）。
+ *
+ * @param prefixArgs - 启动器入口自己的参数（`dshEntryPoint().args`）。
+ * @param name - 环境名。
+ * @param webLayer - 该环境的 web 层判定（environmentWebLayer）。
+ * @returns 完整参数表。
+ */
+export function verificationArgs(
+  prefixArgs: readonly string[], name: string, webLayer: WebLayerPresence,
+): readonly string[] {
+  const base = [...prefixArgs, '--profile', name]
+  return webLayer === 'present' ? [...base, ...SERVICE_MODE_ARGS] : base
+}
+
+/** 一次验证启动收集到的原始信号（判定只看它，退出码不参与）。 */
+export interface BootSignals {
+  /** 子进程 stderr 原文。 */
+  readonly stderr: string
+  /** 子进程 stdout 原文（服务形态的就绪行在这里）。 */
+  readonly stdout?: string
+  /** 就绪行里的地址（`dsh web: http://…`）；没有信号时 null。 */
+  readonly readyUrl?: string | null
+  /** 退出码；**仅供展示与排查，不参与判定**（§5.2）。 */
+  readonly exitCode: number | null
+  /** 是否读到就绪行后主动杀了子进程（服务形态常驻，必须收工）。 */
+  readonly killedAfterReady?: boolean
+}
+
+/**
+ * 从一次启动的原始信号给判定（纯函数，可注入文本测试）。
+ *
+ * 两类环境各用各的就绪信号，**谁先出现算谁**（谁先出现由启动器决定，见 defaultHeadlessRun）：
+ *   · 服务形态：stdout 的官方就绪行 → mounted；
+ *   · headless 形态：stderr 的 `dsh: a task is required…` → mounted（走 judgeBootStderr）。
+ * 失败一律读 stderr（`plugin tree failed to load` / `cannot resolve profile bundle` + cause 链）；
+ * 什么信号都没有 → undetermined（**不许当通过**）。
+ *
+ * @param signals - 原始信号。
+ * @returns 三态判定。
+ */
+export function judgeBootSignals(signals: BootSignals): BootVerdict {
+  if (typeof signals.readyUrl === 'string' && signals.readyUrl.length > 0) return { kind: 'mounted' }
+  return judgeBootStderr(signals.stderr)
+}
+
 /** 试装的三种结论（§5.2：各有措辞、不得混；无法试装**不算通过**）。 */
 export type TrialConclusion =
   /** 基线起得来、装完候选包也起得来 → 通过。 */
@@ -2366,6 +2442,8 @@ export interface SnapshotMaterialization {
   readonly depth: SnapshotDepth
   /** 从真实环境复制过来的文件名。 */
   readonly copied: readonly string[]
+  /** 物化前清掉的**上一次物化残留**（例如 node_modules）：快照不能带着旧依赖。 */
+  readonly cleared: readonly string[]
   /** 是否跑了官方 pnpm 通道（full 深度时）。 */
   readonly installed: boolean
   /** 面向用户的说明。 */
@@ -2374,6 +2452,20 @@ export interface SnapshotMaterialization {
 
 /** 浅快照复制的文件（§5.2 实测：新建 profile 只有前三个，没有 node_modules）。 */
 const SNAPSHOT_FILES = ['package.json', 'cordis.yml', 'cordis.patch.yml', 'pnpm-workspace.yaml', 'pnpm-lock.yaml'] as const
+
+/**
+ * 物化前必须清掉的**残留** —— 也就是**只有物化过程自己会造出来**的那两项：
+ *   · `node_modules`：上一次完整快照装的依赖（浅快照本不该有依赖，留着会让金丝雀假通过）；
+ *   · `pnpm-lock.yaml`：上一次完整快照生成的锁文件（源环境没有它时，留着会把快照钉在旧状态）。
+ *
+ * 刻意**不动** `package.json` / `cordis.yml` / `cordis.patch.yml` / `pnpm-workspace.yaml`：
+ * 它们是官方 initProfile 建出来的**profile 骨架**（本机实测：新建 profile 里就是
+ * package.json + cordis.patch.yml + pnpm-workspace.yaml 三个），而且 pnpm-workspace.yaml 带着
+ * `nodeLinker: hoisted` / `autoInstallPeers: false` 这类**会改变 pnpm 行为**的设置——
+ * 删掉它会让我们在测试环境里用另一套安装语义去验证（那才是真的失真）。
+ * 源环境有这些文件时，复制那一步会把它们覆盖成源环境的版本。
+ */
+const SNAPSHOT_STALE_ENTRIES = ['node_modules', 'pnpm-lock.yaml'] as const
 
 /** materializeSnapshot 的选项。 */
 export interface MaterializeSnapshotOptions extends CrossEnvironmentOptions {
@@ -2407,6 +2499,28 @@ export async function materializeSnapshot(
   const anchor = options.installAnchor ?? profileContextOf(options.ctx)?.installAnchor
   const depth = options.depth ?? snapshotDepthFor(sourceDir, bundles, anchor)
 
+  // 物化前先清掉**上一次物化留下的东西**：测试环境是被复用的（§5.4 一个真实环境一个测试环境），
+  // 上一次的完整快照会在里面留下 node_modules —— 不清的话这次"浅快照"其实带着旧依赖，
+  // 于是本该抓出来的依赖缺失被残留掩盖（金丝雀假通过）。删不掉就**如实报无法试装**，绝不静默沿用。
+  const cleared: string[] = []
+  for (const stale of SNAPSHOT_STALE_ENTRIES) {
+    const path = join(targetDir, stale)
+    if (!existsSync(path)) continue
+    try {
+      rmSync(path, { recursive: true, force: true })
+    } catch (error) {
+      throw new EnvironmentError('snapshot-not-shallow',
+        '快照要求目录里只有源环境现在的清单，但上一次物化留下的 ' + stale + ' 删不掉（' + messageOf(error)
+        + '）：不能带着旧依赖去验证（那会让结论假通过），这次试装报无法试装。')
+    }
+    if (existsSync(path)) {
+      throw new EnvironmentError('snapshot-not-shallow',
+        '快照要求目录里只有源环境现在的清单，但上一次物化留下的 ' + stale + ' 删完之后仍然在：'
+        + '不能带着旧依赖去验证（那会让结论假通过），这次试装报无法试装。')
+    }
+    cleared.push(stale)
+  }
+
   const copied: string[] = []
   for (const file of SNAPSHOT_FILES) {
     const from = join(sourceDir, file)
@@ -2414,11 +2528,13 @@ export async function materializeSnapshot(
     copyFileSync(from, join(targetDir, file))
     copied.push(file)
   }
+  const clearedNote = cleared.length === 0 ? '' : '；并清掉了上一次物化留下的 ' + cleared.join('、')
 
   if (depth === 'shallow') {
     return {
-      depth, copied, installed: false,
-      output: '已物化浅快照（' + copied.join(', ') + '）：层栈全部由安装锚点提供，不需要装依赖',
+      depth, copied, cleared, installed: false,
+      output: '已物化浅快照（复制 ' + (copied.length === 0 ? '无' : copied.join(', ')) + clearedNote
+        + '）：浅快照不含依赖，层栈全部由安装锚点提供',
     }
   }
   let runner: PluginCommandRunner
@@ -2438,8 +2554,9 @@ export async function materializeSnapshot(
       '真实快照的官方安装失败（exitCode=' + String(result.exitCode) + '）：' + result.output.trim().slice(-500))
   }
   return {
-    depth, copied, installed: true,
-    output: '已物化真实快照（复制 ' + copied.join(', ') + '；官方 install --prefer-offline 成功）',
+    depth, copied, cleared, installed: true,
+    output: '已物化真实快照（复制 ' + (copied.length === 0 ? '无' : copied.join(', ')) + clearedNote
+      + '；官方 install --prefer-offline 成功）',
   }
 }
 
@@ -2733,6 +2850,12 @@ export interface BootVerification {
   readonly elapsedMs: number
   /** 子进程 stderr 原文（截断到 8KiB，供展示与判定复核）。 */
   readonly stderr: string
+  /** 子进程 stdout 原文（截断到 8KiB）；服务形态的就绪行在这里。老调用点可省略。 */
+  readonly stdout?: string
+  /** 就绪行里的地址（服务形态）；没有信号时 null。 */
+  readonly readyUrl?: string | null
+  /** 是否读到就绪行后主动杀了子进程（服务形态常驻，必须收工）。 */
+  readonly killedAfterReady?: boolean
   /** 退出码；**仅供展示与排查，不参与判定**（§5.2）。 */
   readonly exitCode: number | null
   /** 本次验证所在的构建指纹。 */
@@ -2741,11 +2864,19 @@ export interface BootVerification {
 
 /** runHeadlessVerification 的选项。 */
 export interface HeadlessVerificationOptions {
-  /** 超时上限；默认 30s。
-   */
+  /** 超时上限；默认 VERIFY_TIMEOUT_MS（15s）。 */
   readonly timeoutMs?: number
-  /** 启动器注入（测试）：返回 {stderr, exitCode}；省略时真起进程。 */
-  readonly run?: (name: string) => Promise<{ readonly stderr: string; readonly exitCode: number | null }>
+  /**
+   * 启动器注入（测试）：省略时真起进程。
+   * stdout / readyUrl / killedAfterReady 是服务形态那一路的证据，可以省略（headless 形态用不到）。
+   */
+  readonly run?: (name: string) => Promise<{
+    readonly stderr: string
+    readonly exitCode: number | null
+    readonly stdout?: string
+    readonly readyUrl?: string | null
+    readonly killedAfterReady?: boolean
+  }>
 }
 
 /**
@@ -2763,61 +2894,149 @@ export async function runHeadlessVerification(
 ): Promise<BootVerification> {
   const build = buildIdentity()
   const started = Date.now()
-  const run = options.run ?? defaultHeadlessRun(options.timeoutMs ?? 30_000)
-  let stderr = ''
-  let exitCode: number | null = null
+  const run = options.run ?? defaultHeadlessRun(options.timeoutMs ?? VERIFY_TIMEOUT_MS)
+  let signals: BootSignals = { stderr: '', exitCode: null, stdout: '', readyUrl: null }
   try {
     const result = await run(name)
-    stderr = result.stderr
-    exitCode = result.exitCode
+    signals = {
+      stderr: result.stderr,
+      exitCode: result.exitCode,
+      stdout: result.stdout ?? '',
+      readyUrl: result.readyUrl ?? null,
+      killedAfterReady: result.killedAfterReady ?? false,
+    }
   } catch (error) {
     return {
       verdict: { kind: 'undetermined', reason: '启动失败：' + messageOf(error) },
-      elapsedMs: Date.now() - started, stderr: '', exitCode: null, build,
+      elapsedMs: Date.now() - started, stderr: '', stdout: '', readyUrl: null, killedAfterReady: false,
+      exitCode: null, build,
     }
   }
-  return { verdict: judgeBootStderr(stderr), elapsedMs: Date.now() - started, stderr: stderr.slice(-8192), exitCode, build }
+  return {
+    verdict: judgeBootSignals(signals),
+    elapsedMs: Date.now() - started,
+    stderr: signals.stderr.slice(-8192),
+    stdout: (signals.stdout ?? '').slice(-8192),
+    readyUrl: signals.readyUrl ?? null,
+    killedAfterReady: signals.killedAfterReady ?? false,
+    exitCode: signals.exitCode,
+    build,
+  }
+}
+
+/** 失败特征：出现在 stderr 里的这两条，谁先出现算谁（就绪行之后才出现的失败不算挂载失败）。 */
+const BOOT_FAILURE_HINT = /plugin tree failed to load|cannot resolve profile bundle/
+
+/** 边收边判的启动信号收集器（纯逻辑，可按 chunk 驱动测试）。 */
+export interface BootSignalCollector {
+  /** 收一段 stderr。 */
+  pushStderr(chunk: string): void
+  /**
+   * 收一段 stdout；返回**本次是否新认出就绪行**（调用方据此收工）。
+   *
+   * 两条纪律：
+   *   · 就绪行可能跨 chunk（官方一行也是一个 write，但流式读取不保证对齐）→ 每次都在累积文本里找；
+   *   · stderr 里已经出现失败特征时，**不再认**后来的就绪行（谁先出现算谁）。
+   */
+  pushStdout(chunk: string): boolean
+  readonly readyUrl: string | null
+  readonly stderr: string
+  readonly stdout: string
 }
 
 /**
- * 默认启动器：真起一个 headless 实例并读它的 stderr。
+ * 造一个启动信号收集器。
+ *
+ * 为什么把它抽出来：就绪行的识别是"跨 chunk"和"顺序"两件事，真机跑一次证明不了边界，
+ * 而这两条边界恰恰是最容易写错的（先来的失败被后来的就绪行盖掉、半行就绪行被漏掉）。
+ *
+ * @returns 收集器。
+ */
+export function createBootSignalCollector(): BootSignalCollector {
+  let stderrText = ''
+  let stdoutText = ''
+  let readyUrl: string | null = null
+  return {
+    pushStderr(chunk) { stderrText += chunk },
+    pushStdout(chunk) {
+      stdoutText += chunk
+      if (readyUrl !== null) return false
+      if (BOOT_FAILURE_HINT.test(stderrText)) return false
+      const hit = BOOT_READY_LINE.exec(stdoutText)
+      if (hit === null) return false
+      readyUrl = hit[1] ?? 'http://（就绪行里没带地址）'
+      return true
+    },
+    get readyUrl() { return readyUrl },
+    get stderr() { return stderrText },
+    get stdout() { return stdoutText },
+  }
+}
+
+/**
+ * 默认启动器：真起一个实例，按层栈读**对应的就绪信号**。
+ *
+ * 两类环境（§5.2，2026-09-19 真机改定）：
+ *   · **含 web 层** → 服务形态（`--port 0 --no-open`）：官方 CLI 只解析启动器自己的标志，
+ *     其余参数原样交给树；`--port 0` 让 OS 分配端口，永不与 GUI 抢 3080。就绪 = **stdout** 的
+ *     `dsh web: http://…`（Loader settle 之后才打印），读到即判 mounted 并**立刻杀子进程**
+ *     （服务形态不会自己退，等下去只会超时）。
+ *   · **headless 类** → 缺任务形态（只有 `--profile`）：真挂载整棵树后以"缺任务"收场，
+ *     就绪 = stderr 的 `dsh: a task is required…`（原判据不变）。
+ * 两种形态都**绝不传任务文本**（§5.2）。
  *
  * @param timeoutMs - 超时上限（超时杀掉 → 无法判定，不许当成功）。
  * @returns 启动函数。
  */
-function defaultHeadlessRun(timeoutMs: number) {
-  return async (name: string): Promise<{ readonly stderr: string; readonly exitCode: number | null }> => {
+function defaultHeadlessRun(
+  timeoutMs: number,
+): (name: string) => Promise<{ readonly stderr: string; readonly stdout: string; readonly readyUrl: string | null; readonly killedAfterReady: boolean; readonly exitCode: number | null }> {
+  return async (name) => {
+    const dir = environmentDir(name)
+    const webLayer = environmentWebLayer(dir, readEnvironmentManifest(dir).bundles)
     const entryPoint = dshEntryPoint()
-    // 只有 --profile：**绝不传任务文本**（§5.2）。
-    const args = [...entryPoint.args, '--profile', name]
+    const args = verificationArgs(entryPoint.args, name, webLayer)
     const invocation = entryPoint.shell
       ? windowsShimInvocation({ ...emptyLaunchSpec(name), command: entryPoint.command, args, shell: true })
       : { command: entryPoint.command, args }
     return await new Promise((done, fail) => {
       const child = spawn(invocation.command, [...invocation.args], {
-        stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true,
+        // stdout 也要读：服务形态的就绪行走 console.log（stdout），不是 stderr。
+        stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
       })
-      let text = ''
+      const collector = createBootSignalCollector()
+      let killedAfterReady = false
       let settled = false
-      const timer = setTimeout(() => {
+      let timer: NodeJS.Timeout | undefined
+      const finish = (exitCode: number | null): void => {
         if (settled) return
         settled = true
+        if (timer !== undefined) clearTimeout(timer)
+        done({
+          stderr: collector.stderr, stdout: collector.stdout,
+          readyUrl: collector.readyUrl, killedAfterReady, exitCode,
+        })
+      }
+      timer = setTimeout(() => {
         try { child.kill('SIGKILL') } catch { /* 已退出 */ }
-        done({ stderr: text, exitCode: null })
+        finish(null)
       }, timeoutMs)
-      child.stderr?.on('data', (chunk: Buffer) => { text += chunk.toString('utf8') })
+      child.stdout?.on('data', (chunk: Buffer) => {
+        if (settled) return
+        if (!collector.pushStdout(chunk.toString('utf8'))) return
+        // 读到官方就绪行：树已经 settle、服务已经起来 —— 立刻收工（服务形态不会自己退）。
+        killedAfterReady = true
+        try { child.kill('SIGKILL') } catch { /* 已退出 */ }
+        finish(null)
+      })
+      child.stderr?.on('data', (chunk: Buffer) => { collector.pushStderr(chunk.toString('utf8')) })
       child.once('error', (error) => {
         if (settled) return
         settled = true
-        clearTimeout(timer)
+        if (timer !== undefined) clearTimeout(timer)
         fail(error)
       })
-      child.once('close', (code) => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        done({ stderr: text, exitCode: code })
-      })
+      child.once('close', (code) => { finish(code) })
     })
   }
 }

@@ -215,21 +215,29 @@ node_modules 实体、凭据、缓存都不进来——备份的价值是可重�
 `trial` 段在 TypeScript 里是**可选**字段（客户端镜像配置形状的节奏与宿主不同步，
 写成必填会让"宿主加字段"变成"客户端编译失败"）；运行期由 schema 补齐。
 
-### 真机实测的两条限制（2026-09-19，临时 DSH_HOME + 3531；构建 md5=a590ce908218）
+### 验证形态：两类环境各读各的就绪信号（2026-09-19 真机改定，task-75）
 
-1. **含 web app 的环境今天拿不到判定。** 验证启动的形态是 `<dsh> --profile <name>`（不给任务、不指定端口）。
-   实测（GUI 正占着 3080）：
-   - 默认端口冲突：profile 的 web 层会去绑 3080 → `EADDRINUSE` → 整棵树挂不起来。
-     照原样读会被归因成"基线起不来"（错误归因）；host 侧已把它降级为 `cannot-trial` 并给出精确原因。
-   - 把兜底端口让开（证据脚本里把 webserver 的兜底端口改成 0）之后：树**挂载成功，但进程以服务形态常驻**，
-     30s 超时被杀、stderr 为空 → `undetermined` → 同样只能给 `cannot-trial`。
-   结论：今天只有**不带 web 层**的环境（headless 模板）才可能得到 `passed`。
-   候选修复方向（动的是 §5.2 的"验证形态"，需要设计批准）：验证启动改用服务形态，并以官方打印的
-   `dsh web: http://…?token=…`（它的注释写明"在 Loader 树 settle 之后才打印"）当作挂载凭证，随后杀掉子进程；
-   或者为试装环境覆写 webserver 端口，并换一个能在服务形态下收敛的判据。
-2. **浅快照会复用上一次完整快照留下的 `node_modules`。** `createTrialEnvironment` 复用已存在的测试环境，
-   而浅快照只覆盖那几个清单文件。实测第二次试装的 `shallow` 带着上一次 full 物化出来的依赖（因此它挂载成功）。
-   结论本身不错，但"这次是浅快照"的语义被稀释了：要么物化前显式清理，要么在结论里标注。
+验证启动按**层栈**决定形态（`environmentWebLayer`；层栈事实拿不到时按 headless 形态，绝不盲加未知参数）：
+
+| 层栈 | 启动参数 | 就绪信号 | 真机实测 |
+|---|---|---|---|
+| 含 web 层（官方默认模板建的、以及 GUI 自己那个环境）| `--profile <名> --port 0 --no-open`（服务形态：`--port 0` 由 OS 分配，永不与 GUI 抢 3080）| **stdout** 的 `dsh web: http://…`（官方在 Loader settle 之后才打印，注释写明它是给 supervisor 的就绪信号）→ 判 `mounted` 并**立刻杀子进程** | 655–666ms/次，无端口冲突 |
+| headless 类 | `--profile <名>`（缺任务形态，原判据不变）| stderr 的 `dsh: a task is required…` → `mounted` | 526–555ms/次 |
+
+- 失败一律读 stderr（`plugin tree failed to load` / `cannot resolve profile bundle` + cause 链）；
+  两类信号都没有 → `undetermined`，**不许当通过**。
+- 顺序纪律：**谁先出现算谁**（`createBootSignalCollector`）——stderr 里已经出现失败特征时，后来的就绪行不算数。
+- 半行就绪行不算就绪（URL 后必须跟空白）：流式读取不按行对齐，`…:461` 这种半行不能当成地址。
+- 验证超时 15s（官方 smoke 用 90s 是在等真实服务，我们只等就绪行）。
+
+### 快照物化：只反映"源环境现在的清单"（task-75）
+
+- 物化前清掉**上一次物化留下的**两项：`node_modules` 与 `pnpm-lock.yaml`（证据在 `SnapshotMaterialization.cleared`）。
+  不清的话，上一次完整快照留下的依赖会让下一次"浅快照"照样挂载成功——金丝雀会**假通过**。
+- 删不掉或删完仍在 → `snapshot-not-shallow`，整轮试装报 `cannot-trial`（**绝不静默沿用旧依赖**）。
+- 刻意**不动** profile 骨架（`package.json` / `cordis.yml` / `cordis.patch.yml` / `pnpm-workspace.yaml`）：
+  它们是官方 initProfile 建出来的，且 `pnpm-workspace.yaml` 带着 `nodeLinker: hoisted` 这类会改变 pnpm 语义的设置——
+  删掉它等于换一套安装语义去验证（那才是失真）。源环境有这些文件时，复制那一步会覆盖成源环境的版本。
 
 ### 客户端跟进事项（UI 任务）
 

@@ -8,7 +8,7 @@ import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { createServer } from 'node:net'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -1142,6 +1142,139 @@ test('W-12: 权限说辞如实（Linux 0600 / Windows 依赖目录 ACL），不�
   const source = readFileSync(new URL('../dist/envManager.js', import.meta.url), 'utf8')
   assert.match(source, /Windows：权限位\*\*不生效\*\*|权限位不生效/, '要写明 Windows 上权限位不生效')
   assert.match(source, /ACL/, '要写明依赖目录 ACL')
+})
+
+
+// ── task-75：按层栈决定验证形态（含 web 层的环境读官方就绪行） ────────────────
+
+test('验证启动的参数按层栈决定：含 web 层加 --port 0 --no-open，headless 类保持原形态', () => {
+  const prefix = ['/dsh/lib/bin.js']
+  // 含 web 层：服务形态。--port 0 由 OS 分配端口，永不与 GUI 抢 3080。
+  assert.deepEqual([...env.verificationArgs(prefix, 'wenv', 'present')],
+    ['/dsh/lib/bin.js', '--profile', 'wenv', '--port', '0', '--no-open'])
+  // headless 类：缺任务形态（原判据）。
+  assert.deepEqual([...env.verificationArgs(prefix, 'henv', 'absent')], ['/dsh/lib/bin.js', '--profile', 'henv'])
+  // 层栈事实拿不到 → 不许盲加未知参数（headless 类环境不认 --port）
+  assert.deepEqual([...env.verificationArgs(prefix, 'uenv', 'unknown')], ['/dsh/lib/bin.js', '--profile', 'uenv'])
+})
+
+test('就绪信号：官方就绪行 → mounted；headless 的缺任务判据仍然有效；无信号 → 判不出来', () => {
+  assert.equal(env.judgeBootSignals({
+    stderr: '', stdout: 'dsh web: http://127.0.0.1:46141/?token=x\n',
+    readyUrl: 'http://127.0.0.1:46141/?token=x', exitCode: null, killedAfterReady: true,
+  }).kind, 'mounted', '就绪行是官方定义的挂载完成信号')
+  assert.equal(env.judgeBootSignals({ stderr: 'dsh: a task is required, for example: …\n', exitCode: 1 }).kind, 'mounted')
+  assert.equal(env.judgeBootSignals({ stderr: 'Error: dsh: plugin tree failed to load: x', exitCode: 1 }).kind, 'failed')
+  assert.equal(env.judgeBootSignals({ stderr: '', exitCode: null }).kind, 'undetermined', '没有信号不许当通过')
+})
+
+test('runHeadlessVerification 把就绪行的证据一路带出来（stdout / 地址 / 是否主动收工）', async () => {
+  makeEnv('ready-ev', { bundles: ['@deepseek-ai/dsh-base'] })
+  const verification = await env.runHeadlessVerification('ready-ev', {
+    run: async () => ({
+      stderr: '', stdout: 'dsh web: http://127.0.0.1:46141/?token=abc\n',
+      readyUrl: 'http://127.0.0.1:46141/?token=abc', killedAfterReady: true, exitCode: null,
+    }),
+  })
+  assert.equal(verification.verdict.kind, 'mounted')
+  assert.equal(verification.readyUrl, 'http://127.0.0.1:46141/?token=abc')
+  assert.equal(verification.killedAfterReady, true)
+  assert.match(verification.stdout, /dsh web:/, 'stdout 原文要留作证据')
+  assert.equal(verification.exitCode, null, '服务形态是我们主动收工的，没有退出码')
+})
+
+// ── task-75：浅快照必须真的浅（不许复用上一次完整快照的 node_modules） ─────────
+
+test('浅快照真的浅：清掉上一次物化留下的 node_modules 与陈旧清单，并把证据带出来', async () => {
+  const src = makeEnv('shallow-src', { bundles: ['@deepseek-ai/dsh-base'] })
+  writeFileSync(join(src, 'cordis.yml'), '# root\n')
+  const created = await env.createTrialEnvironment('shallow-src', { materialize: false })
+  assert.equal(created.ok, true, created.output)
+  const target = env.trialEnvironmentName('shallow-src')
+  const targetDir = join(PROFILES, target)
+  // 造出「上一次完整快照留下的东西」：依赖 + 源环境现在没有的清单文件。
+  mkdirSync(join(targetDir, 'node_modules', '@fake', 'stale-dep'), { recursive: true })
+  writeFileSync(join(targetDir, 'node_modules', '@fake', 'stale-dep', 'package.json'), '{"name":"@fake/stale-dep"}')
+  writeFileSync(join(targetDir, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n')
+
+  const snapshot = await env.materializeSnapshot('shallow-src', target, { depth: 'shallow' })
+  assert.equal(snapshot.depth, 'shallow')
+  assert.equal(existsSync(join(targetDir, 'node_modules')), false, '浅快照不许带着旧依赖（否则金丝雀会假通过）')
+  assert.equal(existsSync(join(targetDir, 'pnpm-lock.yaml')), false, '源环境没有的陈旧 lockfile 不许留')
+  assert.deepEqual([...snapshot.cleared].sort(), ['node_modules', 'pnpm-lock.yaml'])
+  // profile 骨架不许被清：pnpm-workspace.yaml 带着 nodeLinker: hoisted 这类会改变 pnpm 语义的设置，
+  // 删掉它等于让我们在另一套安装语义下验证（那才是失真）。
+  assert.equal(existsSync(join(targetDir, 'pnpm-workspace.yaml')), true, '骨架文件必须留着')
+  assert.equal(existsSync(join(targetDir, 'cordis.patch.yml')), true, '骨架文件必须留着')
+  assert.match(snapshot.output, /清掉了上一次物化留下的/)
+  assert.match(snapshot.output, /浅快照不含依赖/)
+  // 骨架与源环境有的清单仍要在（测试环境要能起来）
+  assert.equal(existsSync(join(targetDir, 'package.json')), true)
+  assert.equal(readFileSync(join(targetDir, 'cordis.yml'), 'utf8'), '# root\n')
+  assert.ok(snapshot.copied.includes('package.json'))
+})
+
+test('就绪行收集器：跨 chunk 也能认；失败先出现就不认后来的就绪行', () => {
+  // 一条完整的就绪行（官方形如 dsh web: http://127.0.0.1:46141/?token=…）
+  const whole = env.createBootSignalCollector()
+  assert.equal(whole.pushStdout('dsh web: http://127.0.0.1:46141/?token=abc\n'), true)
+  assert.equal(whole.readyUrl, 'http://127.0.0.1:46141/?token=abc')
+
+  // 半行就绪行：第一段不认，第二段补齐后才认（流式读取不保证按行对齐）
+  const split = env.createBootSignalCollector()
+  assert.equal(split.pushStdout('dsh web: http://127.0.0.1:4614'), false, '半行不算就绪')
+  assert.equal(split.readyUrl, null)
+  assert.equal(split.pushStdout('1/?token=abc\n'), true, '补齐后必须认出来')
+  assert.equal(split.readyUrl, 'http://127.0.0.1:46141/?token=abc')
+
+  // 同一个收集器不重复报（调用方据此只收一次工）
+  assert.equal(split.pushStdout('dsh web: http://127.0.0.1:9/?token=z\n'), false)
+
+  // 失败先出现：后来的就绪行不许把失败盖掉（谁先出现算谁）
+  const failedFirst = env.createBootSignalCollector()
+  failedFirst.pushStderr('Error: dsh: plugin tree failed to load: boom\n')
+  assert.equal(failedFirst.pushStdout('dsh web: http://127.0.0.1:46141/?token=abc\n'), false)
+  assert.equal(failedFirst.readyUrl, null)
+
+  // 就绪行先出现、失败在后（后置的运行时错误）：就绪行仍然成立
+  const readyFirst = env.createBootSignalCollector()
+  assert.equal(readyFirst.pushStdout('dsh web: http://127.0.0.1:46141/?token=abc\n'), true)
+  readyFirst.pushStderr('Error: 之后的运行时错误\n')
+  assert.equal(readyFirst.readyUrl, 'http://127.0.0.1:46141/?token=abc')
+})
+
+test('残留删不掉时如实报「无法试装」，绝不静默沿用旧依赖', async (t) => {
+  if (typeof process.getuid === 'function' && process.getuid() === 0) {
+    t.skip('root 下权限位不生效，这条用例的前提（删不掉）造不出来')
+    return
+  }
+  const src = makeEnv('stale-src', { bundles: ['@deepseek-ai/dsh-base'] })
+  await env.createTrialEnvironment('stale-src', { materialize: false })
+  const target = env.trialEnvironmentName('stale-src')
+  const targetDir = join(PROFILES, target)
+  const locked = join(targetDir, 'node_modules', 'locked')
+  mkdirSync(locked, { recursive: true })
+  writeFileSync(join(locked, 'file.txt'), 'x')
+  chmodSync(locked, 0o500)
+  try {
+    await assert.rejects(
+      () => env.materializeSnapshot('stale-src', target, { depth: 'shallow' }),
+      (error) => error.code === 'snapshot-not-shallow',
+    )
+    assert.equal(existsSync(join(locked, 'file.txt')), true, '删不掉就原样留着，不许假装清过')
+
+    // 端到端：这一步失败必须是"无法试装"，不是通过
+    const runnerOk = async () => ({ exitCode: 0, output: 'ok', truncated: false, logPath: '/dev/null' })
+    const trial = await env.runTrialInstall('@fake/pkg', 'stale-src', {
+      installAnchor: '/anchor/package.json', runCommand: runnerOk,
+      verify: async () => ({ verdict: { kind: 'mounted' }, elapsedMs: 1, stderr: '', exitCode: 1, build: env.buildIdentity() }),
+    })
+    assert.equal(trial.conclusion, 'cannot-trial', '快照做不到真的浅 = 无法试装')
+    assert.match(trial.output, /无法试装/)
+    assert.match(trial.output, /snapshot-not-shallow/)
+  } finally {
+    chmodSync(locked, 0o700)
+  }
 })
 
 /** async 版平台伪装：必须在 await 之后才还原（否则伪装在第一个 await 处失效）。 */
