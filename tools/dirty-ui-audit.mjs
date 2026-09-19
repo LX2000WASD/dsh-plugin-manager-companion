@@ -1,7 +1,7 @@
 /** 脏环境 · 体检页取证：分组折叠/展开、问题证据、修复按钮、跳过标注。只读，不点任何修复按钮。 */
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { launchChrome, openTab, evaluate, capture, clickText } from '/home/sixiao/aicode/test/test8/dsh-plugin-manager-companion/tools/cdp-shot.mjs'
+import { launchChrome, openTab, evaluate, capture, clickText } from './cdp-shot.mjs'
 
 const env = Object.fromEntries(readFileSync(process.argv[2], 'utf8').split('\n').filter(Boolean).map(l => { const i = l.indexOf('='); return [l.slice(0, i), l.slice(i + 1)] }))
 const PORT = env.PORT, TOKEN = env.TOKEN

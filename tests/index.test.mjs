@@ -8,9 +8,10 @@
  */
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { lstatSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const home = mkdtempSync(join(tmpdir(), "companion-home-"))
 const originalHome = process.env.DSH_HOME
@@ -246,7 +247,10 @@ function makeRollbackManager(envDir, packageName, sourceDir, { removeLink }) {
       manifest.dependencies = { ...(manifest.dependencies ?? {}), [packageName]: 'link:' + sourceDir }
       writeManifest(manifest)
       mkdirSync(join(envDir, 'node_modules'), { recursive: true })
-      symlinkSync(sourceDir, join(envDir, 'node_modules', packageName))
+      // 必须给 type：Windows 上省略会按 file 建、普通用户直接失败。用官方同款形态
+      // （app-boot 的 ensureSymlink 就是 symlinkSync(target, link, 'junction')，平台审计 W-22）；
+      // junction 要求目标为绝对路径，而 mkdtempSync 给的 sourceDir 正是绝对路径。POSIX 下 type 参数被忽略。
+      symlinkSync(sourceDir, join(envDir, 'node_modules', packageName), 'junction')
       return { application: 'applied', bundle: packageName, stage: 'install', target: packageName, changed: true }
     },
     setBundleEnabled: async () => ({ application: 'applied', stage: 'enable', target: packageName, changed: true }),
@@ -308,6 +312,49 @@ test('P4: 回滚干净时（没有残留）才报 rolledBack=true 并说明无�
   assert.equal(result.rolledBack, true)
 })
 
+/**
+ * tools/ 与 tests/ 里的**模块说明符**不得是本机绝对路径。
+ *
+ * 平台审计 W-25 的形态：tools/dirty-ui-audit.mjs 曾写 `from '/home/sixiao/.../tools/cdp-shot.mjs'`——
+ * 在本机能跑，换机器/换目录/进 CI/上 Windows 直接 ERR_MODULE_NOT_FOUND。
+ * 只看 import/export 语句与 import() 里的说明符；夹具里的字符串常量（如 '/home/u'）不受影响。
+ */
+test('tools/ 与 tests/ 里没有本机绝对路径的模块说明符（W-25）', () => {
+  const root = fileURLToPath(new URL('..', import.meta.url))
+  const SQ = String.fromCharCode(39)
+  const DQ = String.fromCharCode(34)
+  const offenders = []
+  for (const dir of ['tools', 'tests']) {
+    for (const name of readdirSync(join(root, dir))) {
+      if (!name.endsWith('.mjs')) continue
+      const text = readFileSync(join(root, dir, name), 'utf8')
+      text.split(String.fromCharCode(10)).forEach((line, index) => {
+        const trimmed = line.trim()
+        // 注释行不参与判断：说明文字里会出现举例用的路径字符串。
+        if (trimmed.startsWith('*') || trimmed.startsWith('//') || trimmed.startsWith('/*')) return
+        let cursor = -1
+        if (trimmed.startsWith('import ') || trimmed.startsWith('export ')) {
+          const fromAt = trimmed.indexOf('from ')
+          // 无 from 的副作用导入（import './x.js'）：说明符紧跟 import 之后。
+          cursor = fromAt === -1 ? trimmed.indexOf('import ') + 7 : fromAt + 5
+        } else {
+          const dynAt = trimmed.indexOf('import(')
+          if (dynAt === -1) return
+          cursor = dynAt + 7
+        }
+        const rest = trimmed.slice(cursor)
+        const quote = rest.trimStart()[0]
+        if (quote !== SQ && quote !== DQ) return
+        const open = rest.indexOf(quote)
+        const close = rest.indexOf(quote, open + 1)
+        if (close === -1) return
+        const spec = rest.slice(open + 1, close)
+        if (spec.startsWith('/')) offenders.push(dir + '/' + name + ':' + String(index + 1) + ' -> ' + spec)
+      })
+    }
+  }
+  assert.deepEqual(offenders, [], '绝对路径说明符换台机器就会 ERR_MODULE_NOT_FOUND')
+})
 after(() => {
   if (originalHome === undefined) delete process.env.DSH_HOME
   else process.env.DSH_HOME = originalHome

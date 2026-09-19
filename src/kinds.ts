@@ -559,7 +559,10 @@ export async function installSkill(repoRoot: string, repoName: string, options: 
     }
     const dest = assertInstallTarget(destRoot, name)
     await rmRetry(dest)
-    await cp(skillRoot, dest, { recursive: true, filter: copyFilter })
+    // dereference：技能是**纯文件**（不是包），源里的符号链接要展开成真实文件。
+    // 不展开的后果有两个：装出一堆指向别处的链接（用户改到的是别人），以及 Windows 上
+    // 创建链接需要特权、普通用户直接 EPERM 失败（平台审计 W-15）。
+    await cp(skillRoot, dest, { recursive: true, filter: copyFilter, dereference: true })
     names.push(name)
     dirs.push(dest)
   }
@@ -602,7 +605,8 @@ export async function installPreset(repoRoot: string, repoName: string, options:
     }
     const dest = assertInstallTarget(destRoot, id)
     await rmRetry(dest)
-    await cp(presetRoot, dest, { recursive: true, filter: copyFilter })
+    // 同上：预设也是纯文件，展开链接（W-15）。
+    await cp(presetRoot, dest, { recursive: true, filter: copyFilter, dereference: true })
     await writeOwnerMarker(dest, [repoName])
     names.push(id)
     dirs.push(dest)

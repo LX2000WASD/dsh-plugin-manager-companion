@@ -8,9 +8,9 @@
 
 import { describe, it, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, readFile, rm, writeFile, stat } from 'node:fs/promises'
+import { lstat, mkdtemp, mkdir, readFile, rm, symlink, writeFile, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join, win32 } from 'node:path'
 import {
   __resetKindCacheForTests, __setHomeForTests, addBlockedRepo, blockedReposFile, cacheRoot,
   canonicalKindKey, detectRepoType, findKindRecord, findOrphanKindDirs, findPluginRoots, findPresetRoots,
@@ -187,7 +187,8 @@ describe('detectRepoType 分层检测', () => {
 describe('根发现', () => {
   it('findSkillRoots 跳过点目录 / node_modules / vendored', async () => {
     const roots = await findSkillRoots(join(fixture, 'skill-set'))
-    const names = roots.map(root => root.split('/').pop()).sort()
+    // 用 basename 而不是 split('')：Windows 上分隔符是反斜杠，split('/') 会返回整条路径（平台审计 W-22）。
+    const names = roots.map(root => basename(root)).sort()
     assert.deepEqual(names, ['alpha', 'beta'])
   })
 
@@ -625,5 +626,41 @@ describe('卸载目录清单 kindDirsOf：新记录精确、旧记录不回归',
     assert.deepEqual(kindDirsOf(record, skillsRoot()), [], '绝不返回根本身（那是"删掉全部技能"）')
     assert.equal(await exists(skillsRoot()), true)
     assert.deepEqual(await findOrphanKindDirs(), [], '主目录名与仓库 slug 相同时按已认领处理（宁少报）')
+  })
+})
+describe('符号链接：复制技能/预设时展开（平台审计 W-15）', () => {
+  async function cleanWorld() {
+    __setHomeForTests(home)
+    for (const dir of [skillsRoot(), presetsRoot(), cacheRoot()]) {
+      await rm(dir, { recursive: true, force: true })
+    }
+    __resetKindCacheForTests()
+  }
+
+  it('技能仓库里的符号链接落地为真实文件，而不是指向别处的链接', async (t) => {
+    await cleanWorld()
+    const repoRoot = join(fixture, 'symlink-skill')
+    await mkdir(join(repoRoot, 'shared'), { recursive: true })
+    await writeFile(join(repoRoot, 'shared', 'payload.md'), 'PAYLOAD', 'utf8')
+    await writeFile(join(repoRoot, 'SKILL.md'), skillManifest('symlink-skill'), 'utf8')
+    try {
+      await symlink(join(repoRoot, 'shared', 'payload.md'), join(repoRoot, 'link.md'))
+    } catch (error) {
+      // Windows 普通用户建符号链接需要特权：夹具造不出来时如实跳过，不假装通过。
+      t.skip('该平台不允许创建符号链接（' + String((error && error.code) || error) + '）：本用例无法在此平台取证')
+      return
+    }
+    const outcome = await installSkill(repoRoot, 'owner/symlink-skill')
+    const landed = join(outcome.dirs[0], 'link.md')
+    const info = await lstat(landed)
+    // 加 dereference:true 之前：Linux 上这里是个符号链接；Windows 普通用户上整次安装直接 EPERM 失败。
+    assert.equal(info.isSymbolicLink(), false, '落地必须是真实文件')
+    assert.equal(await readFile(landed, 'utf8'), 'PAYLOAD', '展开后的内容要跟被指向的文件一致')
+  })
+
+  it('basename 在 Windows 路径形态下也取末段（W-22 的判据，Linux 上可跑）', () => {
+    // 把旧写法为什么不行钉成可执行事实：同一输入下 split('/') 返回整串，win32.basename 返回末段。
+    assert.equal(win32.basename('C:\\Users\\me\\skills\\alpha'), 'alpha')
+    assert.equal('C:\\Users\\me\\skills\\alpha'.split('/').pop(), 'C:\\Users\\me\\skills\\alpha')
   })
 })
