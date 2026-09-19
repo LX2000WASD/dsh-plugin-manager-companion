@@ -22,6 +22,7 @@ import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { bootBundle, React, stubFetch } from './client-harness.mjs'
+import { violationsOf } from './copy-rules.mjs'
 
 /** 纯决策层（四态映射、结果分类）：可直接 import dist，不需要 DOM。 */
 const view = await import('../dist/upgradeView.js')
@@ -883,8 +884,8 @@ describe('结果块渲染：四档各自可辨（失败态不得渲染成完成�
       await untilChecked(handle, 'probe-plugin')
       const { html } = await upgradeOnce(handle)
       assert.match(html, /data-upgrade-outcome="done"/, '结论必须是 done：' + html)
-      assert.match(html, /已升级 probe-plugin：0\.2\.1 → 0\.3\.0/)
-      assert.match(html, /下次启动生效/, '生效时机沿用官方口径')
+      assert.match(html, /probe-plugin 已升级：0\.2\.1 → 0\.3\.0/)
+      assert.match(html, /新版本在下次启动时加载/, '生效时机按 §12.9 定稿措辞')
       assert.match(html, /验证通过/)
     } finally { stub.restore() }
   })
@@ -894,20 +895,36 @@ describe('结果块渲染：四档各自可辨（失败态不得渲染成完成�
     const stub = stubFetch(upgradeStub({
       ok: true, output: '已升级 probe-plugin：0.2.1 → 0.3.0', name: 'probe-plugin',
       fromVersion: '0.2.1', toVersion: '0.3.0', spec: 'probe-plugin@0.3.0',
-      canary: { ran: false, skippedReason: '试装总开关关着', cleanup: '没有创建测试环境' },
+      canary: {
+        ran: false,
+        // 一棵真树（host 侧的真实形状）：缩进就是层次，必须原样渲染。
+        skippedReason: ['试装总开关已关闭', '  → 直接升级，没有先验证', '    → 新版本能否加载未经验证'].join(String.fromCharCode(10)),
+        cleanup: '没有创建测试环境',
+      },
       diskFacts: [], restartRequired: true,
     }))
     try {
       await untilChecked(handle, 'probe-plugin')
       const { html } = await upgradeOnce(handle)
       assert.match(html, /data-upgrade-outcome="unverified"/, '必须是 unverified，不能是 done：' + html)
-      assert.match(html, /已升级 probe-plugin（这次没有验证）/, '标题要说清"这次没有验证"：' + html)
-      assert.match(html, /原因：试装总开关关着/)
+      assert.match(html, /probe-plugin 已升级（未验证）/, '标题要按 §12.9 R1 说清"未验证"：' + html)
+      // R2（§12.9）：原因是**树状**呈现（一层一个因果），不是「原因：」后面接一个句子。
+      assert.match(html, /upgradeReason/, '原因必须按树状容器渲染：' + html)
+      assert.match(html, /试装总开关已关闭/)
+      // R2 的**层次**必须真的画出来：缩进靠前导空格表达，渲染时不能被 trim 掉。
+      // 真机实测踩过——第一版写了 line.trim()，三行被拍平成同一列，"树"没了（截图一眼看出来）。
+      // 层次必须**真的画出来**（不是靠两个空格凑）：每层 padding-left 递增 14px。
+      // 真机实测踩过两次——第一版被 line.trim() 拍平，第二版只靠 pre-wrap 显示空格，
+      // 12px 字号下三行看起来在同一列，"树"根本看不出来（截图一眼可见）。
+      assert.match(html, />试装总开关已关闭</, '第一层要在：' + html)
+      assert.match(html, /padding-left:0px[^>]*>试装总开关已关闭/, '第一层深度应为 0：' + html)
+      assert.match(html, /padding-left:14px[^>]*>→ 直接升级，没有先验证/, '第二层深度应为 1：' + html)
+      assert.match(html, /padding-left:28px[^>]*>→ 新版本能否加载未经验证/, '第三层深度应为 2：' + html)
       assert.ok(!html.includes('验证通过'), '"没验证"绝不能出现"验证通过"：' + html)
       // 同一件事只说一遍（§12.3.1）：真机实测里「这次没有验证」出现过两次（标题一次、
       // 金丝雀那一行又一次），这一条照着截图改。
-      assert.equal((html.match(/这次没有验证/g) ?? []).length, 1,
-        '「这次没有验证」只能说一次（标题已经说了，金丝雀那行不许重复）：' + html)
+      assert.deepEqual(violationsOf(html, 'rendered'), [],
+        '结果块必须过 §12.9 的 R1–R7（R4：结论只留一处）：' + html)
     } finally { stub.restore() }
   })
 
@@ -927,7 +944,7 @@ describe('结果块渲染：四档各自可辨（失败态不得渲染成完成�
       await untilChecked(handle, 'probe-plugin')
       const { html } = await upgradeOnce(handle)
       assert.match(html, /data-upgrade-outcome="rolled-back"/, '必须是 rolled-back：' + html)
-      assert.match(html, /没有升级 probe-plugin：新版本没通过验证/)
+      assert.match(html, /probe-plugin 没有升级：新版本没通过验证/)
       assert.match(html, /duplicate loader entry id/, '根因链必须在界面上可追责')
       assert.match(html, /新版本已进入启动列表/, '激活证据要说出来')
       assert.ok(!html.includes('已升级'), '试装拦下时绝不能出现"已升级"：' + html)
@@ -947,8 +964,8 @@ describe('结果块渲染：四档各自可辨（失败态不得渲染成完成�
       await untilChecked(handle, 'probe-plugin')
       const { html } = await upgradeOnce(handle)
       assert.match(html, /data-upgrade-outcome="failed"/, '必须是 failed：' + html)
-      assert.match(html, /升级没有完成：probe-plugin/)
-      assert.ok(!html.includes('已升级 probe-plugin'), '失败绝不能画成"已升级"：' + html)
+      assert.match(html, /probe-plugin 升级没有完成/)
+      assert.ok(!html.includes('probe-plugin 已升级'), '失败绝不能画成"已升级"：' + html)
     } finally { stub.restore() }
   })
 

@@ -345,7 +345,7 @@ test('金丝雀通过才升级：官方 add <name>@<version>，测试环境用�
 })
 
 test('金丝雀候选坏 / 没验证：一律不升级，且说清是哪种（"没验证"不是"通过"）', async () => {
-  for (const [conclusion, expected] of [['candidate-broken', /金丝雀没通过/], ['cannot-trial', /没能验证/], ['baseline-broken', /没做出判断/]]) {
+  for (const [conclusion, expected] of [['candidate-broken', /试装验证没通过/], ['cannot-trial', /没能得出结论/], ['baseline-broken', /没有给出判定/]]) {
     makeEnv('canary-' + conclusion, { bundles: ['probe-plugin'], dependencies: { 'probe-plugin': '^1.0.0' }, installed: { 'probe-plugin': '1.0.0' } })
     makeEnv('canary-' + conclusion + '-dpmc')
     const trial = makeTrial(conclusion)
@@ -388,7 +388,9 @@ test('试装总开关关闭：不跑金丝雀，但必须如实说明"未验证�
   })
   assert.equal(result.ok, true)
   assert.equal(result.canary.ran, false)
-  assert.match(result.canary.skippedReason, /未做金丝雀/)
+  // R2（§12.9）：skippedReason 现在是**树状**（一层一个因果），不再是「未做金丝雀」那种一句话。
+  assert.match(result.canary.skippedReason, /试装总开关已关闭/)
+  assert.match(result.canary.skippedReason, /直接升级，没有先验证/, 'R2：原因必须给出因果链')
   assert.match(result.output, /未做/)
   assert.equal(trial.calls.length, 0)
   assert.equal(runner.calls.length, 1)
@@ -533,7 +535,7 @@ test('金丝雀自核验激活：替身说"通过"但层栈里没有候选 → �
   assert.equal(result.code, 'canary-not-passed')
   assert.equal(result.canary.conclusion, 'cannot-trial', '替身说通过也不算：自核验说了算')
   assert.equal(result.canary.activation.activated, false)
-  assert.match(result.output, /没能验证/)
+  assert.match(result.output, /没能得出结论/)
 })
 
 test('负缓存是逐包逐环境的：一个包成功不放行另一个包的静默期', async () => {
@@ -592,7 +594,7 @@ test('升级失败如实报：官方退出码非零 / 盘上没到位，都不�
   assert.equal(result.ok, false)
   assert.equal(result.code, 'package-operation-failed')
   assert.match(result.output, /退出码 1/)
-  assert.match(result.output, /盘上版本是 1\.0\.0/)
+  assert.match(result.output, /安装版本是 1\.0\.0/)
 })
 
 // ── ⑦ 回滚：按盘上事实核对 ────────────────────────────────────────────────

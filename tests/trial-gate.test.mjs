@@ -265,7 +265,7 @@ test('试装通过：照常安装，结果里带结论与深度', async () => {
   assert.equal(typeof calls[0].options.listBundles, 'function', '当前环境下必须给官方层栈事实')
 })
 
-test('候选包导致挂载失败 + 默认 block：不装、已回滚、给出根因', async () => {
+test('候选包导致启动失败 + 默认 block：不装、已回滚、给出根因', async () => {
   const envDir = makeEnvironment('broken-env')
   const manager = makeManager(envDir)
   const { runner } = makeTrialRunner('candidate-broken')
@@ -277,11 +277,11 @@ test('候选包导致挂载失败 + 默认 block：不装、已回滚、给出�
   assert.equal(result.rolledBack, true)
   assert.ok(manager.calls.includes('removeBundle'), '必须真的回滚')
   assert.ok(!manager.calls.includes('setBundleEnabled'), '未通过就不许激活')
-  assert.match(result.output, /没有安装 dsh-probe-candidate：候选包导致挂载失败\n已回滚/)
+  assert.match(result.output, /没有安装 dsh-probe-candidate：候选包导致启动失败\n已回滚/)
   assert.match(result.output, /试装结论（替身）：candidate-broken/)
 })
 
-test('候选包导致挂载失败 + warn：装上了，但结论如实写着"没通过"', async () => {
+test('候选包导致启动失败 + warn：装上了，但结论如实写着"没通过"', async () => {
   const envDir = makeEnvironment('warn-env')
   const manager = makeManager(envDir)
   const { runner } = makeTrialRunner('candidate-broken')
@@ -318,8 +318,8 @@ test('快照基线起不来：文案不赖候选包', async () => {
   const deps = makeDeps({ ctxName: 'baseline-env', manager, trial: runner, config: configWith({ ...DEFAULT_TRIAL_CONFIG, enabled: true }) })
   const result = await install(deps, 'baseline-env')
   assert.equal(result.ok, false)
-  assert.match(result.output, /快照基线起不来（不是候选包的问题）/)
-  assert.doesNotMatch(result.output, /候选包导致挂载失败/)
+  assert.match(result.output, /环境副本的基线起不来（不是候选包的问题）/)
+  assert.doesNotMatch(result.output, /候选包导致启动失败/)
   assert.equal(result.trial.baseline, 'failed')
 })
 

@@ -72,6 +72,21 @@
   flex-wrap: wrap;
 }
 
+/* R2（DESIGN §12.9）：原因按树状呈现——一层一个因果，靠缩进表达层次，不用冒号串起来。 */
+.upgradeReason {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.upgradeReasonLine {
+  margin: 0;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-secondary);
+  white-space: pre-wrap;
+}
+
 .upgradeFacts {
   margin: 0;
   padding-left: 18px;

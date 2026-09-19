@@ -62,11 +62,11 @@ describe('试装设置页（task-52）：披露来自 host、未知如实、warn
   it('八项都在，且宿主文档缺 trial 段时按客户端默认值渲染（不是空白）', () => {
     const { entry, face, t } = boot('settings.section', 'console', {})
     const html = renderSettings(entry, face, t)
-    for (const label of ['试装总开关', '快照深度', '试装前做基线启动', '允许联网拉取候选包', '试装失败时的行为', '自动清理测试环境', '保留天数', '最多保留数量（0 = 不限）']) {
+    for (const label of ['试装总开关', '验证深度', '试装前做基线启动', '允许联网拉取候选包', '试装失败时的行为', '自动清理测试环境', '保留天数', '最多保留数量（0 = 不限）']) {
       assert.ok(html.includes(label), '缺 trial 段也要渲染出这一项：' + label)
     }
     assert.ok(html.includes('14'), '保留天数默认 14 应可见（客户端归一补的值）')
-    assert.ok(html.includes('自动（浅快照起步）'), '快照深度默认值应可见')
+    assert.ok(html.includes('自动（先建轻量副本）'), '验证深度默认值应可见')
   })
 
   it('披露事实整条来自 host：数字与口径跟着载荷变，且没有硬编码的 161', async () => {
@@ -218,7 +218,7 @@ describe('试装设置页（task-52）：披露来自 host、未知如实、warn
       const html = renderToStaticMarkup(React.createElement(entry.component, propsFor(face, t, {}, entry)))
       assert.ok(html.includes('未通过，按警告模式放行'), '成功路径必须说未通过：' + html.slice(0, 600))
       assert.ok(html.includes('放行不等于通过：这次安装没有通过验证'), '关键那句必须在')
-      assert.ok(html.includes('候选包导致挂载失败'), '结论要说出来')
+      assert.ok(html.includes('候选包导致启动失败'), '结论要说出来')
     } finally {
       stub.restore()
     }
@@ -248,7 +248,7 @@ describe('试装设置页（task-52）：披露来自 host、未知如实、warn
     }
     const blocked = await run({ conclusion: 'candidate-broken', policy: 'blocked', policyNote: '已回滚候选包', output: 'x' })
     assert.ok(blocked.includes('已阻止安装并回滚'), 'blocked 要说处置：' + blocked.slice(0, 600))
-    assert.ok(blocked.includes('候选包导致挂载失败'), 'blocked 要说结论（不是一句泛化错误）')
+    assert.ok(blocked.includes('候选包导致启动失败'), 'blocked 要说结论（不是一句泛化错误）')
     const skipped = await run({ conclusion: 'cannot-trial', policy: 'skipped', policyNote: '质量门关闭', output: 'x' })
     assert.ok(skipped.includes('这次没有执行试装'), 'skipped 要有处置标签')
     assert.ok(skipped.includes('按设置或豁免名单跳过了试装'), 'skipped 不静默')

@@ -31,8 +31,11 @@
  */
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { applyWithMocks, bootBundle, NS } from './client-harness.mjs'
+import { RESULT_BLOCK_RULES, violationsOf, INTERNAL_CODENAMES } from './copy-rules.mjs'
 
 /** 文案的真源（本测试的第二个数据源）。 */
 const SOURCE = 'src/client/locales.ts'
@@ -45,6 +48,29 @@ const SOURCE = 'src/client/locales.ts'
  * 一路绿灯上了屏。客户端字典管不到 host 拼出来的字符串，两处必须各有一条护栏。
  */
 const HOST_SOURCES = ['src/envManager.ts', 'src/index.ts', 'src/upgrade.ts']
+
+/**
+ * §12.9（R1–R7）**已纳入**的 host 源文件。
+ *
+ * 为什么不是整个 HOST_SOURCES：§12.9 的落地要求是"覆盖范围如实登记"——
+ * 未纳入的部分要**点名**，不能默认它干净。
+ */
+const R_COVERED_HOST_SOURCES = ['src/index.ts', 'src/upgrade.ts']
+
+/**
+ * §12.9 **未纳入**的 host 源文件（每条必须写明原因与当时的命中数）。
+ *
+ * 这是一条**会自己报警的登记**：命中数一旦变化（尤其是清零）就会红，
+ * 逼着后来人把它挪进已纳入清单，而不是让"漏了一个文件"静默存在。
+ */
+const R_UNCOVERED_HOST_SOURCES = [
+  {
+    file: 'src/envManager.ts',
+    hits: 28,
+    why: '本轮该文件由另一个在跑的写任务持有（task-80 正在改试装那一段），同时改同一批行必然冲突；'
+      + '它的命中集中在试装/副本那一组文案上，与该任务的改动面重叠。已请 Lead 裁决归属。',
+  },
+]
 
 /**
  * 以模拟模块表启动产物，取它注册的字典。
@@ -954,6 +980,174 @@ describe('UI 文案标准（DESIGN §12）', () => {
 
   // ── 规则 P1：短文本不用句号（DESIGN §12.8，第四次反馈 2026-09-19）─────────────
 
+
+  // ── 规则 H4（§12.9）：R1–R7 必须落在**用户真正看到的那个字符串**上 ────────────
+  //
+  // 为什么不能只扫字面量（§12.9 的落地要求点名了这一条）：本轮实测 `金丝雀` 在客户端字典里 0 条、
+  // 在 host 侧 11 处，而它们几乎都是**运行时拼出来的**（`'金丝雀：' + (canary.ran ? … : …)`、
+  // `'原因：' + skippedReason`）。源码扫描只看得到碎片，整句长什么样只有跑一遍才知道。
+  // 判据同 H4：驱动真实路径，拿 result.output 过同一张表。
+
+  /**
+   * 造一个升级场景的 ctx/deps（与上面 H4 升级路径那条同形，抽出来给本组的用例共用）。
+   *
+   * @param home - 临时 DSH_HOME。
+   * @param envDir - 环境目录。
+   * @param trial - 注入的试装执行器替身（决定走哪条分支）；undefined 时走真引擎。
+   * @returns handleOp 的 deps。
+   */
+  function upgradeDeps(home, envDir, trial, configPatch = {}, runCommand) {
+    const ctx = {
+      get(name) {
+        if (name === 'profileContext') return { name: 'up-env', dir: envDir, installAnchor: '/anchor/package.json', cwd: tmpdir(), home }
+        return undefined
+      },
+      logger: { info() {}, warn() {}, error() {} },
+      effect(fn) { const d = fn(); return typeof d === 'function' ? d : () => {} },
+    }
+    const jobs = new Map()
+    let seq = 0
+    return {
+      ctx,
+      config: () => ({
+        diagnostics: { dependency: true, composition: true, runtime: true, consistency: true, ecosystem: false },
+        qualityGate: { enabled: true, mode: 'block', allowlist: [] },
+        marketplace: { enabled: false, cacheTtlMinutes: 1440, timeoutMs: 15000, indexUrl: '' },
+        trial: { enabled: true, depth: 'shallow', baseline: false, allowNetwork: true, onFailure: 'block', autoCleanup: true, retentionDays: 14, maxKept: 0, ...configPatch.trial },
+        upgrade: { autoCheck: false, interval: 'manual', registryUrl: '' },
+      }),
+      configUpdate: async (patch) => patch,
+      capabilities: () => ({ profileBacked: true, manager: true, inventory: false, environmentName: 'up-env', missing: [] }),
+      jobs: {
+        start(task) { seq += 1; const id = 'job-' + String(seq); const rec = { done: false }; jobs.set(id, rec); void Promise.resolve().then(task).then((v) => { rec.result = v; rec.done = true }, (e) => { rec.error = String(e), rec.done = true }); return id },
+        status(id) { const r = jobs.get(id); return r === undefined ? { done: true, missing: true } : { done: r.done, result: r.result, error: r.error } },
+      },
+      // 升级引擎的注入面：**必须挂在 deps.upgrade 上**。
+      // index.ts 的 upgrade op 是 `upgradePackage({ ...input, ...deps.upgrade ?? {} })`——
+      // 顶层放 trial/runCommand 根本传不进去（第一版就是这么写的，于是用例跑的是真引擎，
+      // 拿到的是"官方安装通道不可用"，而断言却以为自己在测用户截图那一幕）。
+      upgrade: {
+        // ctx 与 installAnchor 必须一起带进去：`officialContext()` 是从
+        // `deps.ctx.get('profileContext').installAnchor` 取安装位置的，而 index.ts 只把
+        // input 的字段摊进去（input 本身不含 ctx）——少了这两个，官方通道会抛
+        // "这个进程不是以某个环境启动的"，用例就永远走不到要验的那条路。
+        ctx,
+        installAnchor: '/anchor/package.json',
+        ...trial === undefined ? {} : { trial },
+        ...runCommand === undefined ? {} : { runCommand },
+      },
+    }
+  }
+
+  /** 跑一次升级并等它落定，返回渲染输出。 */
+  async function runUpgradeToOutput(deps) {
+    const { handleOp } = await import('../dist/index.js')
+    const started = await handleOp('upgrade', { name: 'dsh-probe-up', version: '0.0.2', environment: 'up-env' }, deps)
+    assert.equal(started.ok, true, '升级 op 没起来：' + JSON.stringify(started))
+    for (let i = 0; i < 200; i += 1) {
+      const st = await handleOp('job', { id: started.value.jobId }, deps)
+      if (st.value.done === true) return String(st.value.result?.output ?? '')
+      await new Promise((r) => setTimeout(r, 5))
+    }
+    assert.fail('升级 job 没有落定')
+  }
+
+  /** 造一个临时 HOME + 环境目录（三条升级路径共用）。 */
+  async function withUpgradeHome(body) {
+    const mk = mkdirSync
+    const wr = writeFileSync
+    const rm = rmSync
+    const j = join
+    const home = mkdtempSync(j(tmpdir(), 'pmc-r7-'))
+    const originalHome = process.env.DSH_HOME
+    process.env.DSH_HOME = home
+    try {
+      const envDir = j(home, 'profiles', 'up-env')
+      mk(j(envDir, 'node_modules'), { recursive: true })
+      wr(j(envDir, 'package.json'), JSON.stringify({
+        name: 'p',
+        dependencies: { 'dsh-probe-up': 'link:/probe-up' },
+        dsh: { profile: { bundles: ['@deepseek-ai/dsh-base'] } },
+      }, undefined, 2))
+      mk(j(envDir, 'node_modules', 'dsh-probe-up'), { recursive: true })
+      wr(j(envDir, 'node_modules', 'dsh-probe-up', 'package.json'), JSON.stringify({ name: 'dsh-probe-up', version: '0.0.1' }))
+      return await body(home, envDir, j)
+    } finally {
+      if (originalHome === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = originalHome
+      rm(home, { recursive: true, force: true })
+    }
+  }
+
+  it('规则 H4（§12.9）：升级未做验证的真实输出必须过 R1–R7（金丝雀/挂载那类是运行时拼的）', async () => {
+    // 这条路就是用户截图那一幕：试装总开关关着 → skippedReason 被拼进结果块。
+    // 「金丝雀」「挂载」都在那个**运行时拼出来的**字符串里，只扫字面量抓不到。
+    // 参数位：upgradeDeps(home, envDir, trial, configPatch, runCommand)。
+    // 总开关关着 —— 这就是用户截图那一幕：试装整段跳过，原因由 host 现拼。
+    const output = await withUpgradeHome((home, envDir) => runUpgradeToOutput(upgradeDeps(
+      home, envDir, undefined, { trial: { enabled: false } },
+      async () => ({ exitCode: 0, truncated: false, logPath: '/dev/null', output: 'added' }),
+    )))
+    assert.ok(output.length > 0, '没拿到升级渲染输出，这条用例会空转')
+    const hits = violationsOf(output, 'host')
+    assert.deepEqual(hits, [], '升级（未验证）输出命中了 §12.9：' + hits.join(', ') + String.fromCharCode(10) + output)
+    // 反向：这条用例必须真的走到了"未做验证"那条路，否则它测的不是用户截图那一幕。
+    assert.match(output, /试装总开关已关闭/, '这条用例没走到"未做验证"路径：' + output)
+  })
+
+  it('规则 H4（§12.9）：试装拦下的真实输出必须过 R1–R7（含 R2 树状与 R5 日志标识）', async () => {
+    const output = await withUpgradeHome((home, envDir) => runUpgradeToOutput(upgradeDeps(home, envDir, {
+      trial: async () => ({
+        conclusion: 'candidate-broken', depth: 'shallow', escalated: false, elapsedMs: 12,
+        output: '候选包装进去之后起不来：duplicate loader entry id',
+        cleanup: null,
+        build: { artifactMd5: null, artifactMtime: null, gitHead: null },
+        baseline: { kind: 'mounted' }, candidate: { kind: 'failed' },
+      }),
+    })))
+    assert.ok(output.length > 0, '没拿到升级渲染输出，这条用例会空转')
+    const hits = violationsOf(output, 'host')
+    assert.deepEqual(hits, [], '试装拦下的输出命中了 §12.9：' + hits.join(', ') + String.fromCharCode(10) + output)
+    assert.match(output, /没有在真实环境执行升级/, '这条用例没走到"试装拦下"路径：' + output)
+    assert.equal(output.includes('金丝雀'), false, '内部代号"金丝雀"上了屏：' + output)
+  })
+
+  it('规则 H4（§12.9）：升级成功的真实输出必须过 R1–R7，且 R5 的日志标识必须在', async () => {
+    const output = await withUpgradeHome((home, envDir, j) => {
+      // 官方通道替身：真去改盘（依赖 + node_modules），让"升级成功"这条路真的成立。
+      return runUpgradeToOutput(upgradeDeps(home, envDir, async () => ({
+        conclusion: 'passed', depth: 'shallow', escalated: false, elapsedMs: 9,
+        output: '替身：基线起得来、候选也起得来', cleanup: null,
+        build: { artifactMd5: null, artifactMtime: null, gitHead: null },
+        baseline: { kind: 'mounted' }, candidate: { kind: 'mounted' },
+      }), {}, (context, args) => {
+        // 官方通道替身：真去改盘（依赖 + node_modules），让"升级成功"这条路真的成立；
+        // 尾部输出就是用户截图里那段 pnpm 原始日志（R5 要它带标识）。
+        //
+        // 注意 activationFor 会**包一层**再调用它（先记 remove、add 后读层栈），
+        // 而它读的是试装环境（<env>-dpmc）——所以 add 那一次要往**那个目录**写候选，
+        // 否则激活守卫判 cannot-trial（那是另一条用例的事，这条要验的是成功路径的输出）。
+        const dir = context.dir ?? envDir
+        const m = JSON.parse(readFileSync(j(dir, 'package.json'), 'utf8'))
+        m.dependencies['dsh-probe-up'] = '0.0.2'
+        if (!m.dsh.profile.bundles.includes('dsh-probe-up')) m.dsh.profile.bundles.push('dsh-probe-up')
+        writeFileSync(j(dir, 'package.json'), JSON.stringify(m, undefined, 2))
+        mkdirSync(j(dir, 'node_modules', 'dsh-probe-up'), { recursive: true })
+        writeFileSync(j(dir, 'node_modules', 'dsh-probe-up', 'package.json'), JSON.stringify({ name: 'dsh-probe-up', version: '0.0.2' }))
+        return {
+          exitCode: 0, truncated: false, logPath: '/dev/null',
+          output: 'Progress: resolved 2, reused 2, downloaded 0, added 2, done' + String.fromCharCode(10)
+            + '[WARN] Issues with peer dependencies found.',
+        }
+      }))
+    })
+    assert.ok(output.length > 0, '没拿到升级渲染输出，这条用例会空转')
+    const hits = violationsOf(output, 'host')
+    assert.deepEqual(hits, [], '升级成功的输出命中了 §12.9：' + hits.join(', ') + String.fromCharCode(10) + output)
+    // R5 的反向断言：那条原始日志真的被贴出来了，所以"标识必须在"这件事是被测到的，不是空转。
+    assert.match(output, /Progress: resolved 2/, '这条用例没走到"贴原始日志"那条路：' + output)
+    assert.match(output, /命令输出（pnpm，升级命令）：/, 'R5：原始日志必须带标识：' + output)
+  })
   it('P1：客户端字典（zh + en）的短文本一律不以句号结尾', () => {
     const dict = dictionaries()
     const hits = []
@@ -1067,6 +1261,107 @@ describe('UI 文案标准（DESIGN §12）', () => {
     assert.ok(!isShortCopy('x'.repeat(61) + '.'), '英文超过 60 字符不再是短文本')
   })
 
+
+  // ── 规则 R1–R7：结果块的行文结构（DESIGN §12.9，第五次反馈 2026-09-19）─────────
+  //
+  // 判据本体在 tests/copy-rules.mjs（两个驱动共用：这里扫字典与 host 源，
+  // tests/upgrade-ui.test.mjs 扫客户端结果块的真实渲染结果）。
+  // 用户是**对着升级结果块的截图**逐条提的，所以每个面都必须被扫到，缺一个面就等于漏掉他看得见的那部分。
+
+  it('R1–R7：每条规则的反例都必须被自己的判据拦下（判据不许空转）', () => {
+    // 为什么这条必须存在：一条 `judge` 写成 `() => false` 时，下面所有"零命中"的断言都会绿。
+    // 判据本身先自证，后面那些零命中才有意义。
+    const dead = []
+    for (const rule of RESULT_BLOCK_RULES) {
+      if (rule.judge(rule.negative) !== true) dead.push(rule.id + '·反例没被拦下')
+      if (rule.judge(rule.positive) !== false) dead.push(rule.id + '·误伤正例')
+    }
+    assert.deepEqual(dead, [], '判据空转或误伤：' + dead.join('; '))
+  })
+
+  it('R1–R7：每条规则都写明了来源（哪次反馈 / 用户原话 / 日期）与可判定判据', () => {
+    const missing = RESULT_BLOCK_RULES.filter(rule =>
+      typeof rule.source !== 'string' || rule.source.trim() === ''
+      || typeof rule.why !== 'string' || rule.why.trim() === ''
+      || typeof rule.judge !== 'function'
+      || typeof rule.negative !== 'string' || typeof rule.positive !== 'string')
+    assert.deepEqual(missing.map(rule => rule.id), [], '这些规则没写全来源/理由/判据/正反例（§12.4）')
+    assert.deepEqual(RESULT_BLOCK_RULES.map(rule => rule.id), ['R1', 'R2', 'R3', 'R4', 'R5', 'R6', 'R7'],
+      '规则编号必须正好是 §12.9 的 R1–R7')
+  })
+
+  it('R1–R7：客户端字典（zh + en）零命中', () => {
+    const dict = dictionaries()
+    const hits = []
+    for (const lang of ['zh', 'en']) {
+      for (const [key, value] of Object.entries(dict[lang])) {
+        if (typeof value !== 'string') continue
+        const found = violationsOf(value, 'dict')
+        if (found.length > 0) hits.push(lang + ' ' + key + ' [' + found.join(',') + '] :: ' + value)
+      }
+    }
+    assert.deepEqual(hits, [], '客户端字典命中了 §12.9 的规则：' + String.fromCharCode(10) + hits.join(String.fromCharCode(10)))
+  })
+
+  it('R1–R7：host 侧用户可见行零命中（金丝雀那类运行时拼接见 H4）', () => {
+    const hits = []
+    for (const file of R_COVERED_HOST_SOURCES) {
+      for (const entry of hostUserLines(file)) {
+        const found = violationsOf(entry.value, 'host')
+        if (found.length > 0) hits.push(file + ':' + String(entry.line) + ' [' + found.join(',') + '] :: ' + entry.value.slice(0, 120))
+      }
+    }
+    assert.deepEqual(hits, [], 'host 侧文案命中了 §12.9 的规则：' + String.fromCharCode(10) + hits.join(String.fromCharCode(10)))
+  })
+
+  it('R1–R7：覆盖面如实登记（未纳入的文件必须点名，不许把"已纳入"读成"全仓覆盖"）', () => {
+    // §12.9 的落地要求：覆盖范围如实登记。`src/envManager.ts` 也在 §12.9 点名的三个 host 文件里，
+    // 但**本轮没纳入**——它当时由另一个在跑的写任务持有（task-80 正在改试装那一段），
+    // 同时改同一批行必然冲突。所以这里把"没纳入"写成一条**可断言的登记**：
+    //   · 已纳入的文件里必须零命中（上面那条）；
+    //   · 未纳入的文件必须出现在这张表里，且必须写明原因与它当时还有多少处。
+    // 这样"漏了一整个文件"不会静默通过：要么补上，要么改这张表并写下理由。
+    assert.deepEqual(R_COVERED_HOST_SOURCES, ['src/index.ts', 'src/upgrade.ts'],
+      '已纳入的 host 文件清单变了；变了就要同时更新 R_UNCOVERED_HOST_SOURCES 的说明')
+    const notCovered = R_UNCOVERED_HOST_SOURCES.map(item => item.file)
+    assert.deepEqual(notCovered, ['src/envManager.ts'], '未纳入清单必须点名 envManager.ts（§12.9 的三个 host 文件之一）')
+    for (const item of R_UNCOVERED_HOST_SOURCES) {
+      assert.ok(item.why.trim().length > 0, item.file + ' 没写"为什么没纳入"')
+      assert.ok(Number.isInteger(item.hits) && item.hits > 0,
+        item.file + ' 的命中数必须是正整数（0 就该把它挪进已纳入清单，而不是继续挂在未纳入里）')
+    }
+    // 未纳入的那些文件**现在仍然有命中**——这条断言让"忘了这件事"变得可见：
+    // 哪天有人把它们清干净了，这里会红，提醒他把文件挪进已纳入清单。
+    for (const item of R_UNCOVERED_HOST_SOURCES) {
+      const count = hostUserLines(item.file).filter(entry => violationsOf(entry.value, 'host').length > 0).length
+      assert.equal(count, item.hits,
+        item.file + ' 的实际命中数从 ' + String(item.hits) + ' 变成了 ' + String(count)
+        + '——若已清零，请把它移进 R_COVERED_HOST_SOURCES 并删掉这条登记')
+    }
+  })
+
+  it('R3：内部代号对照表逐条实现（§12.9 的清单不许被悄悄删项）', () => {
+    assert.deepEqual(INTERNAL_CODENAMES.map(item => item.term),
+      ['金丝雀', '盘上事实', '挂载', '快照', '层栈', '锚点'],
+      '§12.9 点名的六个内部代号必须都在表里')
+    // 每个词都必须真的能被判出来（否则表里放着一行死数据）。
+    const dead = INTERNAL_CODENAMES.filter(item => item.re.test(item.term) !== true)
+    assert.deepEqual(dead.map(item => item.term), [], '这些代号的正则匹配不到自己')
+    // 替换建议不许留空：R3 要求"换成用户语言"，不是"删掉这个词"。
+    const empty = INTERNAL_CODENAMES.filter(item => typeof item.to !== 'string' || item.to.trim() === '')
+    assert.deepEqual(empty.map(item => item.term), [], '这些代号没写替换建议（§12.9 的对照表要求给出用户语言）')
+  })
+
+  it('R1/R2/R6 的正反例逐字取自 §12.9 与用户截图（防止判据被改成"只认自己写的例子"）', () => {
+    // 反例是用户截图里的原文；把它们硬编码在这里，是为了让"判据被偷偷放宽"这件事暴露出来。
+    assert.deepEqual(violationsOf('已升级 @deepseek-ai/dsh-experimental-auto-review（这次没有验证）', 'rendered'), ['R1'])
+    assert.deepEqual(violationsOf('@deepseek-ai/dsh-experimental-auto-review 已升级（未验证）', 'rendered'), [])
+    assert.deepEqual(
+      violationsOf('原因：试装总开关已关闭：未做金丝雀，直接升级（没有验证新版本能否挂载）', 'rendered'),
+      ['R2', 'R3'], '用户实拍那句必须同时命中 R2（冒号套冒号）与 R3（金丝雀/挂载）')
+    assert.deepEqual(violationsOf('上次升级结果', 'dict'), ['R6'])
+    assert.deepEqual(violationsOf('最近一次升级', 'dict'), [])
+  })
   it('每条 host 禁止项都写明了来源（哪次反馈 / 用户原文 / 日期）', () => {
     const missing = HOST_FORBIDDEN.filter(rule => typeof rule.source !== 'string' || rule.source.trim() === '')
     assert.deepEqual(missing.map(rule => rule.id), [], '这些 host 禁止项没写来源（DESIGN §12.4）')

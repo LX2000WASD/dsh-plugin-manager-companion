@@ -288,6 +288,31 @@ const OUTCOME_KEY = {
 } as const
 
 /**
+ * 把 host 给的**树状原因**切成可渲染的层次。
+ *
+ * 输入是 host 侧拼好的多行文本，一层一个因果，深度靠**前导空格**表达：
+ *   `试装总开关已关闭` / `  → 直接升级，没有先验证` / `    → 新版本能否加载未经验证`
+ *
+ * 为什么要有这一层：缩进是**数据**（空格个数 = 深度），但渲染时不能只把它当普通空格——
+ * 12px 字号下两个空格只有几个像素，三行看起来在同一列，"树"就没了（真机截图实测）。
+ * 所以把深度解析出来，交给组件用显式 padding 画。
+ *
+ * 每两个空格算一层（host 侧就是这个约定）；首行无缩进 → 深度 0。
+ *
+ * @param note - host 给的树状原因文本。
+ * @returns 逐行的文本与深度。
+ */
+function reasonTree(note: string): readonly { readonly text: string; readonly depth: number }[] {
+  return note.split(String.fromCharCode(10))
+    .map((line) => line.replace(/\s+$/, ''))
+    .filter((line) => line.trim().length > 0)
+    .map((line) => {
+      const indent = line.length - line.trimStart().length
+      return { text: line.trimStart(), depth: Math.floor(indent / 2) }
+    })
+}
+
+/**
  * 从 host 拼好的结论原文里取出**官方通道的尾部输出**（结构化事实之外的那一段）。
  *
  * 为什么需要它：结论原文（host 侧 src/upgrade.ts 拼的）里已经含有一份盘上事实，
@@ -366,7 +391,30 @@ export function UpgradeResult({
             其余三档在这里给金丝雀结论：它们与标题说的是**不同**的事（标题给结论，这行给验证状态）。
           */}
           {action.outcome === 'unverified' ? null : <p className={css.upgradeNote}>{t(CANARY_KEY[action.canary])}</p>}
-          {action.canaryNote === undefined ? null : <p className={css.upgradeNote}>{t('upgrade.canary.note', { note: action.canaryNote })}</p>}
+          {/*
+            R2（DESIGN §12.9）：原因必须**归属**，不许冒号套冒号。
+            host 给的 canaryNote 是一棵**已经缩进好的树**（它自己就是多行、每行带缩进与 →），
+            所以这里按行拆开、逐行原样渲染——不能塞进一个句子模板里（那会把换行压平、
+            又把整棵树挤在「原因：」后面，正是用户说的"并行与分句，让人的理解很困难"）。
+            R3：树里的词由 host 侧保证（金丝雀 → 试装验证），这里不做二次改写。
+          */}
+          {action.canaryNote === undefined ? null : (
+            <div className={css.upgradeReason}>
+              <p className={css.upgradeNote}>{t('upgrade.canary.reasonLabel')}</p>
+              {reasonTree(action.canaryNote).map(node => (
+                <p
+                  key={node.text}
+                  className={css.upgradeReasonLine}
+                  // 层次用**显式缩进**画：前导空格的个数就是深度（host 侧一层一个因果）。
+                  // 只靠 `white-space: pre-wrap` 显示两个空格太弱——真机截图里三行几乎在同一列，
+                  // "树"看不出来（第一版就是这样，而且当时还被 trim 拍平过一次）。
+                  style={{ paddingLeft: String(node.depth * 14) + 'px' }}
+                >
+                  {node.text}
+                </p>
+              ))}
+            </div>
+          )}
           {action.canaryActivated === undefined ? null : (
             <p className={css.upgradeNote}>{t(action.canaryActivated ? 'upgrade.canary.activated' : 'upgrade.canary.notActivated')}</p>
           )}
@@ -393,8 +441,16 @@ export function UpgradeResult({
               </ul>
             </>
           )}
+          {/*
+            R5（DESIGN §12.9）：原始日志必须有标识。这里先给一行标识（说明它是什么、来自哪条命令），
+            再贴原始输出——否则中英混杂的一堆进度行会被读者当成我们的说明。
+            标识文案与 host 侧那句同源（都点明 pnpm + 官方安装通道），两处说的是同一件事。
+          */}
           {officialTail(action.output) === undefined ? null : (
-            <pre className={css.upgradeOutput}>{officialTail(action.output)}</pre>
+            <>
+              <p className={css.upgradeNote}>{t('upgrade.result.commandOutput')}</p>
+              <pre className={css.upgradeOutput}>{officialTail(action.output)}</pre>
+            </>
           )}
         </>
       )}
@@ -421,7 +477,10 @@ export function UpgradeResult({
             </ul>
           )}
           {officialTail(rollback.output) === undefined ? null : (
-            <pre className={css.upgradeOutput}>{officialTail(rollback.output)}</pre>
+            <>
+              <p className={css.upgradeNote}>{t('upgrade.result.commandOutput')}</p>
+              <pre className={css.upgradeOutput}>{officialTail(rollback.output)}</pre>
+            </>
           )}
         </>
       )}

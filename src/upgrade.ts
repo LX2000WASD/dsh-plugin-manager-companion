@@ -945,7 +945,20 @@ export async function runUpgradeCanary(
 ): Promise<UpgradeCanaryReport> {
   const trial = effectiveTrialConfig(config)
   if (!trial.enabled) {
-    return { ran: false, skippedReason: '试装总开关已关闭：未做金丝雀，直接升级（没有验证新版本能否挂载）', cleanup: '没有创建测试环境' }
+    // R2（DESIGN §12.9）：原因不许冒号套冒号。原来那一句是
+    //   '试装总开关已关闭：未做金丝雀，直接升级（没有验证新版本能否挂载）'
+    // —— 一层冒号套一层冒号再套括号，用户原话是"并行与分句，让人的理解很困难"。
+    // 改成缩进树状：一层一个因果，读者顺着箭头读下去就知道后果是什么。
+    // R3：'金丝雀' 是内部代号（用户第一反应是"什么鸟"），换成用户语言"先验证一遍"。
+    return {
+      ran: false,
+      skippedReason: [
+        '试装总开关已关闭',
+        '  → 直接升级，没有先验证',
+        '    → 新版本能否加载未经验证',
+      ].join('\n'),
+      cleanup: '没有创建测试环境',
+    }
   }
   const runner = deps.trial ?? runTrialInstall
   const target = trialEnvironmentName(environment)
@@ -969,7 +982,7 @@ export async function runUpgradeCanary(
     const thrownEvidence = activation.read()
     return {
       ran: true, conclusion: 'cannot-trial', cleanup,
-      output: '金丝雀执行时出错：' + messageOf(error),
+      output: '试装验证执行时出错：' + messageOf(error),
       ...thrownEvidence === null ? {} : { activation: thrownEvidence },
     }
   }
@@ -986,9 +999,12 @@ export async function runUpgradeCanary(
     escalated: result.escalated,
     elapsedMs: result.elapsedMs,
     output: unactivated
-      ? '金丝雀没能验证（不等于通过）：候选 ' + evidence.name + ' 装完之后没有进入启动列表'
-        + '——启动时不会加载它，这次验证没有验证到新版本。'
-        + '（判定依据：启动列表共 ' + String(evidence.bundles.length) + ' 项，不含它）\n'
+      // R2（DESIGN §12.9）：原因不许冒号套冒号。原来一行里「…（不等于通过）：候选…（判定依据：…）」
+      // 套了两层冒号还带两层括号。改成分行：结论一行，理由缩进一层，证据再缩进一层。
+      ? '试装验证没能得出结论（不等于通过）'
+        + '\n  候选 ' + evidence.name + ' 装完之后没有进入启动列表，启动时不会加载它'
+        + '\n    这次验证没有验证到新版本'
+        + '\n    判定依据：启动列表共 ' + String(evidence.bundles.length) + ' 项，不含它\n'
         + evidence.removeNote + '\n' + result.output
       : result.output,
     cleanup,
@@ -1065,11 +1081,13 @@ async function removeCanaryEnvironment(environment: string, deps: UpgradeEngineD
   const target = trialEnvironmentName(environment)
   const result = await removeTrialEnvironment(target, deps.ctx === undefined ? {} : { ctx: deps.ctx })
   if (result.ok) {
-    appendCanaryLog('removed ' + target + '：升级金丝雀用完即删（一次性资产）', deps)
+    appendCanaryLog('removed ' + target + '：升级试装验证用完即删（一次性资产）', deps)
     return '测试环境已删除：' + target
   }
   appendCanaryLog('kept ' + target + '：删除被拒（' + String(result.code) + '）', deps)
-  return '测试环境没删掉（' + String(result.code) + '）：' + result.output
+  // R2（DESIGN §12.9）：原来写「测试环境没删掉（not-found）：<原文>」——冒号套括号。
+  // 改成分行：第一行给结论与原因，原文缩进一行。
+  return '测试环境没删掉（' + String(result.code) + '）\n  ' + result.output
 }
 
 // ── 升级与回滚 ───────────────────────────────────────────────────────────
@@ -1112,22 +1130,22 @@ export async function upgradePackage(input: UpgradeActionInput): Promise<Upgrade
   //   · 试装总开关关着 → 那是"未验证就升级"，文案必须把这件事说出来。
   // 后者交给 runUpgradeCanary 自己回答（它持有那条口径，不在这里抄一份会漂移的措辞）。
   const canary = input.canary === false
-    ? { ran: false, skippedReason: '调用方显式跳过了金丝雀', cleanup: '没有创建测试环境' } satisfies UpgradeCanaryReport
+    ? { ran: false, skippedReason: '调用方显式跳过了试装验证', cleanup: '没有创建测试环境' } satisfies UpgradeCanaryReport
     : await runUpgradeCanary(environment, spec, input.config, input)
 
   if (canary.ran && canary.conclusion !== 'passed') {
     const headline = canary.conclusion === 'candidate-broken'
-      ? '金丝雀没通过：新版本装进快照环境后挂不起来 —— 没有在真实环境执行升级'
+      ? '试装验证没通过：新版本装进环境副本后起不来 —— 没有在真实环境执行升级'
       : canary.conclusion === 'baseline-broken'
-        ? '金丝雀没做出判断：快照基线本身就起不来（这不是新版本的问题）—— 没有在真实环境执行升级'
-        : '金丝雀没能验证（不等于通过）—— 没有在真实环境执行升级'
+        ? '试装验证没有给出判定：环境副本的基线本身就起不来（这不是新版本的问题）—— 没有在真实环境执行升级'
+        : '试装验证没能得出结论（不等于通过）—— 没有在真实环境执行升级'
     return {
       ok: false,
       code: 'canary-not-passed',
       output: headline + '\n' + [
         '目标：' + spec,
         canary.cleanup,
-        canary.output === undefined ? '' : '金丝雀结论：\n' + canary.output,
+        canary.output === undefined ? '' : '试装验证结论：\n' + canary.output,
       ].filter((line) => line.length > 0).join('\n'),
       name,
       fromVersion,
@@ -1157,21 +1175,23 @@ export async function upgradePackage(input: UpgradeActionInput): Promise<Upgrade
   const ok = result.exitCode === 0 && landed === version
   const lines = [
     ok
-      ? '已升级 ' + name + '：' + String(fromVersion ?? '（未知）') + ' → ' + version
-      : '升级命令退出码 ' + String(result.exitCode) + '，盘上版本是 ' + String(landed ?? '读不到') + '（期望 ' + version + '）',
+      ? name + ' 已升级：' + String(fromVersion ?? '（未知）') + ' → ' + version
+      : name + ' 升级没有完成：命令退出码 ' + String(result.exitCode) + '，安装版本是 ' + String(landed ?? '读不到') + '（期望 ' + version + '）',
     '本次 spec：' + spec,
-    '金丝雀：' + (canary.ran
+    '试装验证：' + (canary.ran
       ? '通过（深度 ' + String(canary.depth ?? '—') + '，耗时 ' + String(canary.elapsedMs ?? 0) + 'ms）'
       : '未做（' + String(canary.skippedReason ?? '原因未知') + '）'),
     canary.cleanup,
-    isSelf ? '本插件自身：正在运行的是旧代码，新版本要等下次启动才生效' : '生效时机：下次启动后加载',
+    isSelf ? '本插件自身：正在运行的是旧代码，新版本在下次启动时加载' : '生效时机：新版本在下次启动时加载',
     '',
     '升级前：',
     ...before.map((line) => '  ' + line),
     '升级后：',
     ...after.map((line) => '  ' + line),
   ]
-  if (tail.length > 0) lines.push('', '官方输出：', ...tail.map((line) => '  ' + line))
+  // R5（DESIGN §12.9）：原始日志必须有标识。原来只写「官方输出：」——读者不知道那是**哪条命令**的
+  // 输出，中英混杂的一堆进度行会被当成我们的说明。现在点明工具与通道。
+  if (tail.length > 0) lines.push('', '命令输出（pnpm，升级命令）：', ...tail.map((line) => '  ' + line))
   // 升级成功后该包的版本事实就旧了：让它下次检查重新取（不靠"猜"来更新界面）。
   invalidateTagsCache(name)
   return {
@@ -1221,14 +1241,14 @@ export async function rollbackUpgrade(input: UpgradeActionInput): Promise<Upgrad
       : '回滚没能到位：官方退出码 ' + String(result.exitCode) + '，盘上版本是 ' + String(landed ?? '读不到')
         + '（期望 ' + version + '）',
     '本次 spec：' + spec,
-    '生效时机：下次启动后加载（官方口径）',
+    '生效时机：新版本在下次启动时加载',
     '',
     '回滚前：',
     ...before.map((line) => '  ' + line),
     '回滚后：',
     ...after.map((line) => '  ' + line),
   ]
-  if (!clean) lines.push('', '上面这份盘上事实就是现状：残留需要按它处理，界面不该说"环境未被改动"')
+  if (!clean) lines.push('', '上面这份当前状态就是现状：残留需要按它处理，界面不该说"环境未被改动"')
   invalidateTagsCache(name)
   return {
     ok: clean,
@@ -1264,7 +1284,7 @@ function failResult(input: UpgradeActionInput, code: string, output: string): Up
     fromVersion: null,
     toVersion: input.version,
     spec: input.name + '@' + input.version,
-    canary: { ran: false, skippedReason: '输入不合法，没有跑金丝雀', cleanup: '没有创建测试环境' },
+    canary: { ran: false, skippedReason: '输入不合法，没有跑试装验证', cleanup: '没有创建测试环境' },
     diskFacts: [],
     restartRequired: false,
   }

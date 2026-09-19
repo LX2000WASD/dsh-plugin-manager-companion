@@ -203,8 +203,8 @@ export interface GatedInstallOptions {
  */
 const TRIAL_LABEL: Record<TrialConclusion, string> = {
   "passed": "试装通过",
-  "baseline-broken": "快照基线起不来（不是候选包的问题）",
-  "candidate-broken": "候选包导致挂载失败",
+  "baseline-broken": "环境副本的基线起不来（不是候选包的问题）",
+  "candidate-broken": "候选包导致启动失败",
   "cannot-trial": "无法试装（不算通过）",
 }
 
@@ -319,7 +319,7 @@ async function runTrialStep(
   }
   const realName = currentEnvironmentName(ctx) ?? runtime?.capabilities.environmentName ?? ""
   if (realName.length === 0) {
-    return cannotTrial("读不到当前是哪个环境，无法确定候选包会落进哪里，也就没有可以对照的快照源")
+    return cannotTrial("读不到当前是哪个环境，无法确定候选包会落进哪里，也就没有可以对照的环境副本")
   }
   if (targetName.length > 0 && !sameEnvironment(targetName, realName)) {
     return cannotTrial("这次安装的目标是 " + targetName + "，但官方安装通道只作用于当前环境 " + realName
@@ -350,7 +350,7 @@ async function runTrialStep(
   const baselineUndetermined = result.baseline !== null && result.baseline.kind === "undetermined"
   if (baselineConflict !== null && conclusion !== "passed") {
     // 端口冲突这一支：**整段替换**引擎的结论叙述。
-    // 为什么替换而不是"在前面加一句"：引擎那段会说"快照基线起不来 / 这个环境当前状态有问题"，
+    // 为什么替换而不是"在前面加一句"：引擎那段会说"环境副本的基线起不来 / 这个环境当前状态有问题"，
     // 而端口冲突下这两句都不成立（真机实测：GUI 占着 3080，验证启动必然撞上它）。
     conclusion = "cannot-trial"
     output = trialNarrative(result, [
@@ -360,11 +360,11 @@ async function runTrialStep(
         + "端口空出来之后，这次验证才有意义",
     ])
   } else if (baselineUndetermined) {
-    // 基线"判不出来"这一支同样替换：引擎会说"快照基线本身就起不来"，但那句话没被任何事实支持
+    // 基线"判不出来"这一支同样替换：引擎会说"环境副本的基线本身就起不来"，但那句话没被任何事实支持
     // （判不出来恰恰是"不知道"）。真机实测：含 web app 的环境在验证启动里以**服务形态常驻**，
-    // 30s 超时后被杀、stderr 为空——既没挂载成功的凭证，也没有失败凭证。
+    // 30s 超时后被杀、stderr 为空——既没启动成功的凭证，也没有失败凭证。
     output = trialNarrative(result, [
-      "无法试装：验证启动没有给出判定——它既没挂载成功，也没报挂载失败"
+      "无法试装：验证启动没有给出判定——它既没启动成功，也没报启动失败"
         + (result.baseline !== null && result.baseline.kind === "undetermined" ? "（" + result.baseline.reason + "）" : "") + "。",
       "这是验证形态给不出结论，不是候选包的问题，也不是环境坏了",
     ])
@@ -373,8 +373,10 @@ async function runTrialStep(
   // 所以结论不动，只把这条事实补进输出——让人能判断，而不是由我们替他下结论。
   const candidateConflict = bootPortConflict(result.candidate)
   if (candidateConflict !== null) {
-    output += "\n注意：候选启动的失败形态是端口冲突（" + candidateConflict + " 已被占用）："
-      + "可能是候选包自己要绑这个端口，也可能是与环境里已有进程冲突，需要人工判断"
+    // R2（DESIGN §12.9）：原因不许冒号套冒号。原来那一行是「…（3080 已被占用）：可能是…」——
+    // 冒号之后再套一层解释。改成分行：第一行给事实，第二行给两种可能。
+    output += "\n注意：候选启动的失败形态是端口冲突（" + candidateConflict + " 已被占用）"
+      + "\n  可能是候选包自己要绑这个端口，也可能是与环境里已有进程冲突，需要人工判断"
   }
   const { policy, policyNote } = trialPolicyFor(trial, conclusion)
   const cleanupNote = await maybeAutoCleanupTrialEnvironments(config)
@@ -406,8 +408,12 @@ async function runTrialStep(
  */
 function trialNarrative(result: TrialInstallResult, head: readonly string[]): string {
   const chain = result.baseline !== null && result.baseline.kind === "failed" ? result.baseline.chain : []
-  const depthLine = "实际深度：" + String(result.depth)
-    + (result.escalated ? "（由 shallow 升级：" + String(result.escalationReason) + "）" : "")
+  // R2：原来写成「实际深度：shallow（由 shallow 升级：原因）」——冒号套冒号。
+  // 改成分行：第一行给深度，升级原因另起一行缩进。
+  // R3：'shallow' 是内部代号（引擎的 depth 值），换成用户语言。
+  const depthLabel = result.depth === "shallow" ? "轻量副本" : result.depth === "full" ? "完整副本" : String(result.depth)
+  const depthLine = "实际深度：" + depthLabel
+    + (result.escalated ? "\n  由轻量副本升级为完整副本，原因：" + String(result.escalationReason) : "")
     + "｜验证耗时 " + String(result.elapsedMs) + "ms"
   const buildLine = "构建：md5=" + (result.build.artifactMd5 === null ? "不可读" : result.build.artifactMd5.slice(0, 12))
     + (result.build.gitHead === null ? "（读不到 git HEAD）" : " head=" + result.build.gitHead.slice(0, 12))
@@ -706,7 +712,7 @@ export async function gatedInstall(
   const warned = gate.issues.length === 0 ? "" : `（质量门有 ${gate.issues.length} 条提示，按 warn 模式放行）`
   const trialLine = trial === undefined ? "" : trial.policy === "warned"
     ? `（${TRIAL_LABEL[trial.conclusion]}，按 warn 模式照常安装 —— 它在验证启动里没通过，环境起不来时先移除它）`
-    : `（${TRIAL_LABEL[trial.conclusion]}；实际深度 ${trial.depth ?? "未物化快照"}，耗时 ${trial.elapsedMs}ms）`
+    : `（${TRIAL_LABEL[trial.conclusion]}；实际深度 ${trial.depth ?? "未建立副本"}，耗时 ${trial.elapsedMs}ms）`
   return {
     ok: true, output: `已安装并启用 ${packageName}${warned}${trialLine}`,
     packageName, gateIssues: gate.issues,

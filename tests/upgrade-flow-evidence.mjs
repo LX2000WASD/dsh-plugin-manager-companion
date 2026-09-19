@@ -23,6 +23,8 @@ const arg = (name, fallback) => {
   return index === -1 ? fallback : argv[index + 1]
 }
 const PORT = Number(arg('port', '3471'))
+/** 主题（§12.9 的取证要求：同一场景的浅色 + 深色实拍——用户是看着那张图提的意见）。 */
+const THEME = arg('theme', 'light')
 const TOKEN = arg('token', '')
 const OUT = arg('out', '/tmp/upg-flow')
 const BASE = 'http://127.0.0.1:' + String(PORT) + '/?token=' + TOKEN
@@ -103,6 +105,10 @@ async function main() {
     await tab.send('Page.enable')
     await tab.send('Runtime.enable')
     await tab.send('Emulation.setDeviceMetricsOverride', { width: 1500, height: 1200, deviceScaleFactor: 1, mobile: false })
+    // 主题：官方把主题挂在 prefers-color-scheme 上，用 CDP 模拟媒体特性即可（不碰任何配置）。
+    await tab.send('Emulation.setEmulatedMedia', {
+      features: [{ name: 'prefers-color-scheme', value: THEME === 'dark' ? 'dark' : 'light' }],
+    })
     await tab.send('Page.navigate', { url: BASE })
     await waitFor(tab, '!!document.querySelector("body")')
     await sleep(2500)
@@ -111,6 +117,9 @@ async function main() {
     const PKG = '@deepseek-ai/dsh-experimental-auto-review'
     const opened = await openPluginDetail(tab, '自动授权审查')
     check('flow: 打开可升级包的页面', opened === true)
+    // 等版本对落定再读："进入即查"是异步的，读太早会读到"尚未检查更新"那一帧
+    // （第一轮取证就是这么误判的——同一份文本在 debug 里明明有版本对）。
+    await waitFor(tab, '/当前 0\\.1\\.6-alpha\\.1 → 0\\.1\\.6-alpha\\.2/.test(' + DETAIL_TEXT + ')', 60_000)
     let before = await evaluate(tab, DETAIL_TEXT)
     check('flow: 升级前显示"当前 0.1.6-alpha.1 → 0.1.6-alpha.2"',
       /当前 0\.1\.6-alpha\.1 → 0\.1\.6-alpha\.2/.test(before))
@@ -146,7 +155,21 @@ async function main() {
     check('flow: 结论不是"完成"以外的含糊态（有明确的 outcome 属性）',
       typeof outcome === 'string' && outcome.length > 0, String(outcome))
     check('flow: 结果里没有字面 ** （§12.6 陷阱 #1）', !/\*\*/.test(after))
-    shots.push(await capture(tab, join(OUT, '03-result.png'), { fullPage: false }))
+    // §12.9（R1–R7）：真机渲染出来的结果块必须过同一张表。
+    // 这条是**最终判据**——前面所有源码/字典级的护栏，都是为了让它成立。
+    const { violationsOf } = await import('./copy-rules.mjs')
+    const ruleHits = violationsOf(after, 'rendered')
+    check('flow: 结果块过 §12.9 的 R1–R7（真机渲染文本）', ruleHits.length === 0,
+      ruleHits.length === 0 ? undefined : '命中 ' + ruleHits.join(', '))
+    // 逐条点名（让证据能对上用户的每一条意见）：
+    check('flow: R1 结论紧随主语（不是「已升级 <包名>」）', !/已升级\s+@|已升级\s+dsh-/.test(after))
+    check('flow: R3 无内部代号（金丝雀/盘上事实/挂载/快照/层栈/锚点）',
+      !/金丝雀|盘上事实|挂载|快照|层栈|锚点/.test(after))
+    check('flow: R6 历史记录交代时间性（最近一次升级）', /最近一次升级/.test(after))
+    check('flow: R2 原因里没有冒号套冒号',
+      !after.split(String.fromCharCode(10)).some(line => (line.match(/：/g) ?? []).length >= 2))
+    // §12.9 的取证主角：升级结果块本身。浅色/深色各一张，文件名带主题。
+    shots.push(await capture(tab, join(OUT, '03-result-' + THEME + '.png'), { fullPage: false }))
 
     // ③ 注册对账：官方通道卸掉一个包 → 那一节当场消失。
     // 用官方 UI 的卸载按钮（不是调 op）——证的是"用户点了卸载，那一节跟着没"。
