@@ -17,7 +17,7 @@ import { DEFAULT_ENVIRONMENT_TEMPLATE, backupDiff, backupExport, backupRestore, 
 import { findOrphanKindDirs, kindDirsOf, loadKindRecords, presetsRoot, pruneGhostRecords, removeKindDir, removeKindRecord, skillsRoot } from "./kinds.ts"
 import { buildInstalledIndex, cachedMarketplace, invalidateInstalledIndex, registryItems } from "./marketplace.ts"
 import { probeOfficialCapabilities, requireManager, type OfficialCapabilities } from "./official.ts"
-import { environmentDir as pathEnvironmentDir, OUR_PACKAGE_NAME, readEnvironmentManifest } from "./paths.ts"
+import { environmentDir as pathEnvironmentDir, OUR_PACKAGE_NAME, readEnvironmentManifest, sameEnvironment } from "./paths.ts"
 import { inspectPackage } from "./qualityGate.ts"
 import { applyFix } from "./fix.ts"
 import { loadRegistryIndex } from "./registry.ts"
@@ -257,7 +257,11 @@ function requireString(body: Record<string, unknown>, field: string): string {
 function currentEnvironment(deps: OpDependencies): EnvironmentInfo | undefined {
   const name = deps.capabilities().environmentName
   if (name === null) return undefined
-  return listEnvironments(deps.ctx).find(env => env.name === name)
+  // 用 sameEnvironment 而不是逐字比较：大小写不敏感的文件系统上（Windows/macOS）WEB 与 web 是同一个环境。
+  // 独立复验（platform-audit §10.8 N-02）在真 win32 上实测：以 --profile WEB 启动时，列表里 web 行的
+  // current 已经是 true（新护栏算对了），但这里逐字比较返回 undefined → 报告降级成"无法确定当前环境"、
+  // diagnose 传大小写变体会得到"环境不存在：WEB"。非破坏性，但属于本仓库最在意的"把存在的说成不存在"。
+  return listEnvironments(deps.ctx).find(env => sameEnvironment(env.name, name))
 }
 
 /**
@@ -283,7 +287,8 @@ function currentEnvironment(deps: OpDependencies): EnvironmentInfo | undefined {
  */
 function targetEnvironment(deps: OpDependencies, name: string | undefined): EnvironmentInfo {
   if (name === undefined || name.length === 0) return analysisTarget(deps)
-  const found = listEnvironments(deps.ctx).find(env => env.name === name)
+  // 同上：用户给的是环境名，落点是目录，逐字比较在大小写不敏感的文件系统上会误判"不存在"。
+  const found = listEnvironments(deps.ctx).find(env => sameEnvironment(env.name, name))
   if (found === undefined) throw new Error(`环境不存在：${name}`)
   return found
 }
