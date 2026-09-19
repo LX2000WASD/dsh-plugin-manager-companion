@@ -151,12 +151,16 @@ async function main() {
     // 文案按场景分开断言（三个场景三句话，见 ConsolePage.cleanupText）：
     //   · 会删 N 个 → 给数字；· 会删 0 个 → 说"没有需要清理的"；· 读不到 → 说"读不到"。
     // 第一版把"给数字"那条无条件套在两个场景上，于是 empty 场景误报 FAIL——那是断言写错，不是产品错。
-    if (STATE === 'planned') {
-      check('确认框说清了会删几个（按当前计划删除 N 个）', /按当前计划删除 \d+ 个测试环境/.test(modalText),
-        (modalText.match(/按当前计划删除 \d+ 个测试环境/) ?? ['(没找到)'])[0])
-    } else {
+    // 三个场景各自的确认框正文（见 ConsolePage.cleanupText）：
+    //   · planned / delete → 有计划，给数字；· empty → 会删 0 个，说"没有需要清理的"。
+    // 第一版把"给数字"那条无条件套在两个场景上，于是 empty 场景误报 FAIL——那是断言写错，不是产品错；
+    // 反过来 delete 场景（有 1 个待删）也被套上了"空计划"那句，同样误报。
+    if (STATE === 'empty') {
       check('计划为空时确认框如实说"没有需要清理的"', /没有需要清理的测试环境/.test(modalText),
         (modalText.match(/没有需要清理的测试环境/) ?? ['(没找到)'])[0])
+    } else {
+      check('确认框说清了会删几个（按当前计划删除 N 个）', /按当前计划删除 \d+ 个测试环境/.test(modalText),
+        (modalText.match(/按当前计划删除 \d+ 个测试环境/) ?? ['(没找到)'])[0])
     }
     check('确认框给了取消与确认两个出口', /取消/.test(modalText) && /清理过期/.test(modalText))
 
@@ -174,6 +178,30 @@ async function main() {
       check('取消之后没有执行清理（没有"已删除 N 个"那行）', !/已删除 \d+ 个测试环境/.test(after),
         (after.match(/已删除[^\n]{0,20}/) ?? ['(无)'])[0])
       shots.push(await capture(tab, join(OUT, 'after-cancel-' + THEME + '.png'), { fullPage: false }))
+    } else if (STATE === 'delete') {
+      // 场景三（task-93，Lead 裁决）：**真的删掉一个一次性目录**。
+      //
+      // 为什么必须单独验：task-92 的等价场景证明的是"确认按钮接上了执行路径"，
+      // 而**"目录真的没了"在真机上从未被验证过**——单测覆盖的是"结果如实呈现"，不是"盘上真的删了"。
+      // 本仓库的老教训：代理 ≠ 事实，这两件事必须分开验。
+      //
+      // 这次**允许删**：删的是探针自己造的一次性目录（del-<时间戳>-dpmc），不是取证构造物。
+      const clickedConfirm = await evaluate(tab, clickByText('清理过期', 'modal'))
+      check('点得到确认框里的「清理过期」', clickedConfirm === true, String(clickedConfirm))
+      const closed = await waitFor(tab, '(' + MODAL_TEXT + ') === ""', 30_000)
+      check('点确认之后确认框关掉了', closed === true)
+      // 回执：应当是"已清理 1 个测试环境"（完成态，与计划区措辞可区分）。
+      const settled = await waitFor(tab, '/已清理 \\d+ 个测试环境/.test(' + PANEL_TEXT + ')', 30_000)
+      const after = await evaluate(tab, PANEL_TEXT)
+      const receipt = (after.match(/已清理 \d+ 个测试环境/) ?? ['(没有回执)'])[0]
+      check('回执说出了删除数（已清理 N 个测试环境）', settled === true, receipt)
+      // 关键：**回执里的数字必须与实际消失数一致**（不许说删了 2 个而只没了 1 个）。
+      const vanished = after.match(/已清理 (\d+) 个测试环境/)
+      check('回执数字是 1（本次只该删一个）', vanished !== null && vanished[1] === '1', receipt)
+      const scrolled = await evaluate(tab, SCROLL_TO_TRIAL)
+      check('回执所在的那一段滚进了视口', typeof scrolled === 'string' && Number(scrolled) > 0, String(scrolled))
+      await sleep(400)
+      shots.push(await capture(tab, join(OUT, 'after-delete-' + THEME + '.png'), { fullPage: false }))
     } else {
       // 场景二（task-92）：**点确认** → 断言执行路径真的被触发，且没删任何东西。
       //
@@ -193,18 +221,20 @@ async function main() {
       // 注意：不能只断言"面板里有『没有需要清理的测试环境』"——**那句话在点之前就在了**
       // （计划区在空计划时说的就是它）。那样断言恒真，又是自证式测试（§7.4）。
       // 所以判据是**出现次数**：计划区一处 + 结果行一处 = 点完变成 2 处。
-      const countBefore = (await evaluate(tab, PANEL_TEXT)).split('没有需要清理的测试环境').length - 1
-      const settled = await waitFor(tab, '(' + PANEL_TEXT + ').split("没有需要清理的测试环境").length - 1 > ' + String(countBefore), 30_000)
+      // 判据换成**结果行那句完成态措辞**（task-93 之后它与计划区不再同句）：
+      // 点前面板里**没有**"已清理 N 个"，点后出现——这个判据天然不恒真。
+      const countBefore = (await evaluate(tab, PANEL_TEXT)).split('已清理 0 个测试环境').length - 1
+      const settled = await waitFor(tab, '(' + PANEL_TEXT + ').split("已清理 0 个测试环境").length - 1 > ' + String(countBefore), 30_000)
       const after = await evaluate(tab, PANEL_TEXT)
-      const countAfter = after.split('没有需要清理的测试环境').length - 1
-      check('执行路径真的被触发（结果行让那句话多出一处）', settled === true,
+      const countAfter = after.split('已清理 0 个测试环境').length - 1
+      check('执行路径真的被触发（结果行出现完成态回执）', settled === true,
         '点前 ' + String(countBefore) + ' 处 → 点后 ' + String(countAfter) + ' 处')
       // 第三个证据（最硬）：op 请求真的发出去了——记账在客户端侧，与文案无关。
       const opCalls = await evaluate(tab, '(function(){return JSON.stringify(window.__t92ops||[])})()')
       check('清理 op 请求真的发出去了（fetch 记录里有 trialCleanup）', /trialCleanup/.test(opCalls),
         String(opCalls).slice(0, 160))
-      check('没有目录被删（计划为空时清理是空操作）', !/已删除 \d+ 个测试环境/.test(after),
-        (after.match(/已删除[^\n]{0,20}/) ?? ['(无)'])[0])
+      check('没有目录被删（计划为空时清理是空操作）', /已清理 0 个测试环境/.test(after),
+        (after.match(/已清理 \d+ 个测试环境/) ?? ['(没有回执)'])[0])
       // 截图前把测试环境那段滚进视口：回执就在那一节里，不滚的话截图上什么都看不到
       // （断言过、图里没有 = 假证据；trial-plan-evidence.mjs 踩过同一个坑）。
       const scrolled = await evaluate(tab, SCROLL_TO_TRIAL)

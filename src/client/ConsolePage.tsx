@@ -1775,10 +1775,16 @@ function TrialEnvironments({
   const failed = error !== undefined || errorKey !== undefined
   // 上一次操作的结果：成功也必须说出来（清理 0 个与清理 2 个是两件不同的事），
   // 失败走失败行——绝不把失败渲染成"完成"（task-14/18 的护栏）。
+  //
+  // 结果行**一律**用完成态措辞（"已清理 N 个"），**0 个也走这条**（task-93）：
+  // 空计划时它原来跟计划区是**同一句话**（都是 cleanupNone），用户点了一次不可逆操作
+  // 却看不出"这一下到底执行了没有"。现在两处措辞并列且可区分：
+  //   · 计划区（执行前）："没有需要清理的测试环境"；
+  //   · 结果行（执行后）："已清理 0 个测试环境"——"已"字就是"点过了"的证据。
   const actionText = action === undefined
     ? undefined
     : action.kind === 'cleanup' && action.ok
-      ? action.removed.length === 0 ? t('trial.cleanupNone') : t('trial.cleanupDone', { count: action.removed.length })
+      ? t('trial.cleanupDone', { count: action.removed.length })
       : action.output
   return (
     <fieldset className={css.group}>

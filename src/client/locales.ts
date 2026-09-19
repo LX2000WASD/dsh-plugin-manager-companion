@@ -233,7 +233,12 @@ export const zh = {
   // 计划**读不到**（旧宿主/载荷不全）时用这条：它是"不知道会删几个"，不是"没有需要清理的"。
   // 两者混起来就是替宿主下结论（§12.3.3）——而且这里下错的结论会让人以为按下去没事。
   'trial.cleanupUnknown': '读不到清理计划，无法确认会删几个',
-  'trial.cleanupDone': '已删除 {count} 个测试环境',
+  // 结果行（执行后）。**必须与计划区那句可区分**（task-93）：
+  // 计划区说的是"计划"，结果行说的是"执行结果"。原来空计划时两处是**同一句话**
+  // （都是 cleanupNone），用户点了一次不可逆操作却看不出"这一下到底执行了没有"。
+  // 现在用一套并列的完成态措辞，**0 个也走这条**（"已清理 0 个"本身就是"执行过了"的证据）；
+  // 计划区那句（cleanupNone）只在"执行前"出现。
+  'trial.cleanupDone': '已清理 {count} 个测试环境',
   'trial.planTitle': '下次清理',
   'trial.planRemove': '会删这 {count} 个',
   'trial.planKeep': '会留这 {count} 个',
@@ -673,7 +678,7 @@ export const en: Record<CompanionLocaleKey, string> = {
   'trial.cleanupDesc': 'Deletes {count} trial environments per the current plan; a running one is not deleted',
   'trial.cleanupNone': 'Nothing to clean up',
   'trial.cleanupUnknown': 'The cleanup plan is unreadable; the number to delete cannot be confirmed',
-  'trial.cleanupDone': 'Deleted {count} trial environments',
+  'trial.cleanupDone': 'Cleaned up {count} trial environments',
   'trial.planTitle': 'Next cleanup',
   'trial.planRemove': 'Will delete these {count}',
   'trial.planKeep': 'Will keep these {count}',

@@ -471,12 +471,21 @@ describe('试装设置页（task-52）：披露来自 host、未知如实、warn
       }
     }
     const two = await run({ ok: true, output: '删了 2 个', removed: ['a-dpmc', 'b-dpmc'] })
-    assert.ok(two.includes('已删除 2 个测试环境'), '删了几个要说数字')
+    assert.ok(two.includes('已清理 2 个测试环境'), '删了几个要说数字')
     const none = await run({ ok: true, output: '无事可做', removed: [] })
-    assert.ok(none.includes('没有需要清理的测试环境'), '什么都没删也要说')
+    // task-93：结果行**一律**用完成态措辞，0 个也走这条。
+    // 原来 0 个走的是 cleanupNone（"没有需要清理的测试环境"）——与**计划区**那句一模一样，
+    // 用户点了一次不可逆操作却看不出"这一下到底执行了没有"。
+    assert.ok(none.includes('已清理 0 个测试环境'), '什么都没删也要说，且要说成"已清理 0 个"')
+    // 判据要**限定在结果行**上：那句话本身在别处是合法的（计划区与确认框说的都是"计划"，
+    // 空计划时它们就是 cleanupNone）。只有**结果行**不许用它。
+    // 结果行是 role="status" 的 notice 段落（其余几处是 hint / Modal）。
+    const notice = (none.match(/<p class="[^"]*notice[^"]*" role="status">([^<]*)<\/p>/) ?? [])[1] ?? ''
+    assert.ok(!notice.includes('没有需要清理的测试环境'),
+      '结果行不得与计划区同句（那是"执行前"的说法）：' + notice)
     const failed = await run({ ok: false, code: 'locked', output: '删不掉：正在运行' })
     assert.ok(failed.includes('删不掉：正在运行'), '失败要说原因')
-    assert.ok(!failed.includes('已删除 0 个测试环境'), '失败不得渲染成完成')
+    assert.ok(!failed.includes('已清理 0 个测试环境'), '失败不得渲染成完成')
   })
 
   it('市场页安装结果：warn 放行的成功路径必须说出「未通过」', async () => {
