@@ -334,6 +334,36 @@ export function canaryVerdict(
 }
 
 /**
+ * 这一次升级结果**能不能**回滚（task-97）。
+ *
+ * 两个条件同时成立才行：
+ *   · **刚完成过一次升级**（`done` / `unverified`）——
+ *     `rolled-back` 是"没有升级"、`failed` 是"没完成"，两者都**没有可回滚的东西**；
+ *   · **知道升级前的版本**（`fromVersion` 非空）——拿不到就**不显示入口**：
+ *     回滚会把环境装成那个版本，**猜不得**（§12.10：不许用推断代替事实）。
+ *
+ * 为什么放在这个纯决策模块（而不是组件文件里）：这样它可被单测**直接**钉住，
+ * 而不是只能靠渲染结果反推。界面与测试引用同一个函数，不各写一份（写两份必然漂移）。
+ *
+ * @param action - 升级结果（可能没有）。
+ * @returns 可以回滚时 true。
+ */
+/** 可回滚的升级结果：outcome 是 done/unverified，且**确实知道**升级前的版本。 */
+export interface RollbackCandidate {
+  readonly outcome: string
+  readonly fromVersion: string
+}
+
+export function canRollback(action: {
+  readonly outcome: string
+  readonly fromVersion: string | null
+} | undefined): action is RollbackCandidate {
+  if (action === undefined) return false
+  if (action.outcome !== 'done' && action.outcome !== 'unverified') return false
+  return typeof action.fromVersion === 'string' && action.fromVersion.length > 0
+}
+
+/**
  * 一次升级/回滚结果里"盘上事实"是否真的对上了。
  *
  * 回滚用的是 host 的 clean（它按盘上事实核对过）；升级用的是 ok。

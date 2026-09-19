@@ -256,19 +256,29 @@ function SoftwareUnitCard({ t, unit, useUpgrade, busy, actions }: {
 
         判据用 rowKindOf（与插件页同一个出口），不另写一份可见性判断。
       */}
+      {/*
+        升级行与结果块**分开判**（真机取证抓到的第二个缺陷）：
+        
+        升级成功后控制器会立刻重查版本事实，于是这个单元**当场变成 up-to-date**；
+        第一版把结果块也塞在"不是 hidden"那一支里，结果块（连同刚长出来的回滚入口）**当场消失**——
+        用户刚升完级、正要看结果，屏幕上的结果块没了。
+        
+        为什么这样分才对：
+          · 升级行说的是"**现在**这个单元能不能升"（up-to-date 就该只说一句已经是最新）；
+          · 结果块说的是"**刚才**那一次动作的结果"（它是历史，与当前状态无关，必须留着）。
+        官方插件页天然没这个问题：那里的 UpgradeRow 与 UpgradeResult 是两个平级渲染，
+        只有行会被对账撤掉、结果块留着——这一页的卡片是我自己 map 的，得自己分开。
+      */}
       {rowKindOf(unit) === 'hidden'
         ? <p className={css.hint}>{t('about.unitUpToDate')}</p>
-        : (
-          <>
-            <UpgradeRow t={t} unit={unit} checked view="page" busy={busy} actions={actions} />
-            <UpgradeResult
-              t={t}
-              action={action}
-              rollback={rollback}
-              onDismiss={() => { actions.dismissUpgradeNotice() }}
-            />
-          </>
-        )}
+        : <UpgradeRow t={t} unit={unit} checked view="page" busy={busy} actions={actions} />}
+      <UpgradeResult
+        t={t}
+        action={action}
+        rollback={rollback}
+        onRollback={(target, version, spec) => { actions.rollbackPackage(target, version, spec) }}
+        onDismiss={() => { actions.dismissUpgradeNotice() }}
+      />
     </div>
   )
 }

@@ -1526,6 +1526,13 @@ export interface UpgradeActionResultState {
   readonly canaryActivated?: boolean
   readonly restartRequired: boolean
   readonly diskFacts: readonly string[]
+  /**
+   * 本次升级用的 spec（host 的官方 add 收到的那个）。
+   *
+   * 为什么结果态要带它：回滚入口就长在这个块里，而回滚需要它来判断"原来是不是本地来源"。
+   * 缺了它，回滚会把 link: 装的包换成 registry 版本——那不是回滚，是换来源。
+   */
+  readonly spec?: string
 }
 
 /** 一次回滚的结果。 */
@@ -1861,6 +1868,10 @@ export class UpgradeController {
           ...result.canary?.activated === undefined ? {} : { canaryActivated: result.canary.activated },
           restartRequired: result.restartRequired,
           diskFacts: result.diskFacts,
+          // 本次用的 spec：回滚要用它判断"原来是不是本地来源"（引擎的 rollbackUpgrade 读它，
+          // 是本地来源就装回那个来源，而不是装 registry 上的版本）。不带上它，
+          // 回滚会把一个 link:/file: 装的包换成 registry 版本——那不是回滚，是换来源。
+          ...result.spec.length === 0 ? {} : { spec: result.spec },
         }
       })
     } catch (error) {

@@ -20,7 +20,7 @@
  */
 
 import { useEffect, useMemo, useState } from 'react'
-import { Button, Tag, Tooltip, type TagTone } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, Modal, Tag, Tooltip, type TagTone } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { SnapshotSelectorHook, TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
 import { NS } from './locales.ts'
 import { PmSelect } from './pmSelect.tsx'
@@ -29,7 +29,7 @@ import type {
   UpgradeActionResultState, UpgradeFace, UpgradeRollbackResultState, UpgradeState,
 } from './shared.ts'
 import type { UpgradeUnitView } from './wire.ts'
-import { changesLine, defaultTag, rowKindOf, sameAsCurrent, sourceFacts, versionForTag, versionPair } from '../upgradeView.ts'
+import { canRollback, changesLine, defaultTag, rowKindOf, sameAsCurrent, sourceFacts, versionForTag, versionPair } from '../upgradeView.ts'
 import css from './OfficialSlots.module.css'
 
 /** 本文件里 t 的键域（本插件字典）。 */
@@ -373,17 +373,26 @@ const CANARY_KEY = {
  * 金丝雀那一行单独给（passed / failed / not-run / absent 四态各自可辨），
  * 因为"没验证"与"验证失败"混起来就等于把风险藏了。
  *
- * @param props - 字典座位、升级结果与回滚结果、处置回调。
+ * **回滚入口就在这个块里**（task-97 的 Lead 裁决）：回滚的语义是"刚升完发现问题"，
+ * 天然跟在一次升级之后；做成卡片上常驻的按钮，用户按下去会面临"回到哪个版本"的不确定。
+ * 所以入口只在这一块出现，且必须**二次确认**。
+ *
+ * @param props - 字典座位、升级结果与回滚结果、回滚动作与处置回调。
  * @returns 结果块；没有结果时 null。
  */
 export function UpgradeResult({
-  t, action, rollback, onDismiss,
+  t, action, rollback, onRollback, onDismiss,
 }: {
   readonly t: T
   readonly action: UpgradeActionResultState | undefined
   readonly rollback: UpgradeRollbackResultState | undefined
+  /** 触发回滚（二次确认之后才调）。 */
+  readonly onRollback: (name: string, version: string, spec?: string) => void
   readonly onDismiss: () => void
 }) {
+  // 所有 Hook 必须在任何提前 return **之前**（这个文件里已经踩过一次：条件 return 写在 Hook 前，
+  // 于是"进入即查"的 effect 永远不触发。见 UpgradeRow 里那段注释）。
+  const [confirming, setConfirming] = useState(false)
   if (action === undefined && rollback === undefined) return null
   const tone: TagTone = action === undefined
     ? (rollback?.ok === true ? 'success' : 'danger')
@@ -504,11 +513,58 @@ export function UpgradeResult({
         </>
       )}
       <div className={css.upgradeActions}>
+        {/*
+          回滚入口（task-97 的 Lead 裁决：补在**结果块**上，不补成常驻按钮）。
+          出现的条件**三条同时成立**：
+            · 刚完成过一次升级（outcome 是 done / unverified）——
+              rolled-back 是"没有升级"，failed 是"没完成"，两者都**没有可回滚的东西**；
+            · 我们知道**升级前的版本**（fromVersion 非 null）——
+              拿不到就**不显示入口**：不许猜一个版本号（回滚会把环境装成那个版本）。
+          这条"拿不到就不显示"是本任务的核心护栏，变异验证专门钉它。
+        */}
+        {canRollback(action) ? (
+          <Button variant="outline" size="sm" onClick={() => { setConfirming(true) }}>
+            {t('upgrade.rollback.action', { version: action.fromVersion ?? '' })}
+          </Button>
+        ) : null}
         <Button variant="ghost" size="sm" onClick={onDismiss}>{t('upgrade.dismiss')}</Button>
       </div>
+      {/*
+        二次确认：回滚也是"装一个版本"，会改盘上状态——与升级同一档破坏性，
+        所以同样要一个说清"回到哪个版本"的确认面（§12.2：用户即将做的动作的后果）。
+        确认框只在"能回滚"时才可能打开，所以里面的 action.fromVersion 一定非 null。
+      */}
+      <Modal
+        open={confirming && canRollback(action)}
+        onClose={() => { setConfirming(false) }}
+        title={t('upgrade.rollback.confirmTitle')}
+        closeLabel={t('common.close')}
+        footer={(
+          <>
+            <Button variant="ghost" size="md" onClick={() => { setConfirming(false) }}>{t('common.cancel')}</Button>
+            <Button
+              variant="primary"
+              size="md"
+              onClick={() => {
+                setConfirming(false)
+                if (!canRollback(action)) return
+                // spec 只用于"原来就是本地来源时装回那个来源"（引擎的正解）；这里原样带过去。
+                onRollback(action.name, action.fromVersion, action.spec)
+              }}
+            >
+              {t('upgrade.rollback.action', { version: action?.fromVersion ?? '' })}
+            </Button>
+          </>
+        )}
+      >
+        <p className={css.warn}>
+          {t('upgrade.rollback.confirmBody', { name: action?.name ?? '', version: action?.fromVersion ?? '' })}
+        </p>
+      </Modal>
     </div>
   )
 }
+
 
 /**
  * 造一个绑定到某个包名的注册项组件。
@@ -543,6 +599,7 @@ export function createUpgradeRowComponent(name: string) {
             t={t}
             action={action}
             rollback={rollback}
+            onRollback={(target, version, spec) => { actions.rollbackPackage(target, version, spec) }}
             onDismiss={() => { actions.dismissUpgradeNotice() }}
           />
         )}

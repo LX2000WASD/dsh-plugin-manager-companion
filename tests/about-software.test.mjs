@@ -14,10 +14,14 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
+import { readFileSync } from 'node:fs'
 import { applyWithMocks, bootBundle, makeT, propsFor, registration, React, stubFetch, stubPrimitives, until } from './client-harness.mjs'
 import { violationsOf } from './copy-rules.mjs'
 
 const require_ = createRequire(import.meta.url)
+
+/** 纯决策层（回滚判据等）：可直接 import dist，不需要 DOM。 */
+const view = await import('../dist/upgradeView.js')
 const { renderToStaticMarkup } = require_('react-dom/server')
 
 /** 本插件自己的包名（③ 那一类）。 */
@@ -228,6 +232,16 @@ async function canaryLine(canary, resultOverride = {}) {
     stub.restore()
   }
 }
+/**
+ * 回滚入口的显示判据（与界面用的是**同一个**纯函数，不另立一套）。
+ *
+ * 从 dist 里取：canRollback 是 UpgradeRow.tsx 导出的纯函数，与界面共用同一份判据——
+ * 测试另写一份就会漂移，而漂移的护栏比没有护栏更糟。
+ *
+ * @param action - 升级结果（可能没有）。
+ * @returns 可回滚时 true。
+ */
+const canRollback = (action) => view.canRollback(action)
 describe('「关于 → 软件升级」子页（task-96）', () => {
   it('注册项同时注入关于面与升级面（hooks 两个都在）', () => {
     const { face } = boot()
@@ -443,6 +457,170 @@ describe('「关于 → 软件升级」子页（task-96）', () => {
     assert.ok(!/验证通过|已验证/.test(lines['not-run']), '"没验证"那一态**不许**声称通过：' + lines['not-run'])
     assert.match(lines['passed'], /通过/, '通过那一态要说通过：' + lines['passed'])
     assert.match(lines['failed'], /没通过|未通过/, '失败那一态要说没通过：' + lines['failed'])
+  })
+  it('升级成功后单元变成"已是最新"，但**结果块与回滚入口必须留着**', async () => {
+    // 真机取证抓到的缺陷（task-97）：升级成功后控制器立刻重查版本事实，
+    // 于是那个单元**当场变成 up-to-date**；第一版把结果块也塞在"不是 hidden"那一支里，
+    // 结果块（连同刚长出来的回滚入口）**当场消失**——用户刚升完级要看结果，屏幕上是空的。
+    //
+    // 分界：升级行说"现在能不能升"（up-to-date 就说一句已是最新），
+    // 结果块说"刚才那次动作的结果"（历史，与当前状态无关，必须留着）。
+    const { entry, face, t } = boot()
+    const name = '@deepseek-ai/dsh-experimental-auto-review'
+    const stub = stubFetch({
+      about: () => ({ ok: true, value: undefined }),
+      // 关键：升级后重查**返回 up-to-date**（真机就是这个序列）。
+      upgradeCheck: () => ({
+        ok: true,
+        value: {
+          environment: 'probe', checked: true, lastCheckAt: '2026-09-19T10:00:00.000Z', notes: [],
+          units: [unit({ state: 'up-to-date', targetVersion: null, targetTag: null, tags: null })],
+        },
+      }),
+      upgrade: () => ({ ok: true, value: 'job-1' }),
+      job: () => ({
+        ok: true,
+        value: {
+          done: true,
+          result: {
+            ok: true, name, fromVersion: '0.1.6-alpha.1', toVersion: '0.1.6-alpha.2', spec: '^0.1.6-alpha.1',
+            canary: { ran: true, conclusion: 'passed' }, diskFacts: [], output: '',
+          },
+        },
+      }),
+    })
+    try {
+      face.loadUpgrades(false)
+      await until(() => face.hooks.upgrade.getSnapshot().check !== undefined, '检查落状态')
+      face.upgradePackage(name, '0.1.6-alpha.2')
+      await until(() => face.hooks.upgrade.getSnapshot().action !== undefined, '结果落状态')
+      const html = render(entry, face, t)
+      assert.ok(html.includes('已经是最新版本'), '当前状态要说"已是最新"：' + html.slice(0, 600))
+      assert.ok(html.includes('最近一次升级'), '**结果块必须留着**（它是历史，与当前状态无关）')
+      assert.ok(html.includes('回滚到 0.1.6-alpha.1'), '**回滚入口也必须留着**：' + html.slice(-1200))
+    } finally {
+      stub.restore()
+    }
+  })
+  it('隐藏的子页必须真的不可见：.panel 的 display 不许压掉 hidden 属性（源码级）', () => {
+    // 真机取证抓到的缺陷（task-97）：`.panel { display: flex }` 会把 HTML 的 `hidden` 压掉
+    // （hidden 的默认样式 display:none 被任何显式 display 声明覆盖），
+    // 后果是**两个子页同时可见**——切到「软件升级」时「DSH 信息」还留在上面。
+    //
+    // 为什么必须源码级断言：SSR 读的是 innerText，而 **hidden 的子树 innerText 照样读得到**，
+    // 所以"那一段不可见"这件事跨不过渲染（DESIGN §12.10 的推论）。
+    const css = readFileSync(new URL('../src/client/AboutPage.module.css', import.meta.url), 'utf8')
+    const panel = css.slice(css.indexOf('.panel {'), css.indexOf('.group {'))
+    assert.match(panel, /display:\s*flex/, '前提：.panel 确实声明了 display（否则这条判据空转）')
+    assert.match(css, /\.panel\[hidden\]\s*\{[^}]*display:\s*none/, '改了 display 就必须显式把 [hidden] 钉回 none：' + panel)
+  })
+  it('回滚入口：只在"刚完成一次升级"时出现，且必须知道**升级前的版本**', () => {
+    // task-97 的 Lead 裁决：入口长在**结果块**里（不做常驻按钮——回滚的语义是"刚升完发现问题"）。
+    // 判据用纯函数 canRollback（与界面**同一个**函数），不靠渲染文本反推（§12.10 的①/②）。
+    assert.equal(canRollback(undefined), false, '没有结果时不该有入口')
+    assert.equal(canRollback({ outcome: 'done', fromVersion: '0.2.1' }), true, '升级完成 → 可回滚')
+    assert.equal(canRollback({ outcome: 'unverified', fromVersion: '0.2.1' }), true, '升级了但没验证 → 也可回滚')
+    // 下面两种**没有可回滚的东西**：
+    assert.equal(canRollback({ outcome: 'failed', fromVersion: '0.2.1' }), false, '没完成 → 没有可回滚的东西')
+    assert.equal(canRollback({ outcome: 'rolled-back', fromVersion: '0.2.1' }), false,
+      '试装拦下（没有升级）→ 没有可回滚的东西')
+    // 这条是本任务的核心护栏：拿不到升级前的版本就**不显示入口**——不许猜一个版本号。
+    assert.equal(canRollback({ outcome: 'done', fromVersion: null }), false,
+      '拿不到 fromVersion 时**不许**显示入口（回滚会把环境装成那个版本，猜不得）')
+    assert.equal(canRollback({ outcome: 'done', fromVersion: '' }), false, '空串同样不算拿到了版本')
+  })
+
+  it('回滚入口渲染：结果块里有「回滚到 {version}」，且**必须二次确认**', async () => {
+    const { entry, face, t } = boot()
+    const name = '@deepseek-ai/dsh-experimental-auto-review'
+    const stub = stubFetch({
+      about: () => ({ ok: true, value: undefined }),
+      upgradeCheck: () => ({
+        ok: true,
+        value: { environment: 'probe', checked: true, lastCheckAt: '2026-09-19T10:00:00.000Z', notes: [], units: [unit()] },
+      }),
+      upgrade: () => ({ ok: true, value: 'job-1' }),
+      job: () => ({
+        ok: true,
+        value: {
+          done: true,
+          result: {
+            ok: true, name, fromVersion: '0.2.1', toVersion: '0.2.9', spec: '^0.2.1',
+            canary: { ran: true, conclusion: 'passed' }, diskFacts: [], output: '',
+          },
+        },
+      }),
+    })
+    try {
+      face.loadUpgrades(false)
+      await until(() => face.hooks.upgrade.getSnapshot().check !== undefined, '检查落状态')
+      face.upgradePackage(name, '0.2.9')
+      await until(() => face.hooks.upgrade.getSnapshot().action !== undefined, '结果落状态')
+      const html = render(entry, face, t)
+      assert.ok(html.includes('回滚到 0.2.1'), '要给回滚入口且写明回到哪个版本：' + html.slice(-1200))
+      // 二次确认面：官方 Modal 桩即便 open=false 也渲染 children，所以判据是"确认框的标题与正文在"。
+      assert.ok(html.includes('回滚这次升级'), '要有确认框（回滚也是装一个版本，会改盘上状态）')
+      assert.ok(html.includes('也就是升级前的版本'), '确认框要说清回到哪个版本')
+      // "必须二次确认"的直接证据：初始 open 必须是 false——不许点一下就执行。
+      assert.match(html, /data-stub="Modal"[^>]*data-open="false"/, '确认框初始必须是关着的')
+    } finally {
+      stub.restore()
+    }
+  })
+
+  it('回滚入口的**接线**：点入口只开确认框，点确认才真的回滚（源码级）', () => {
+    // 为什么这条必须是源码级断言（DESIGN §12.10 的推论）：
+    //   "点入口是否直接执行了回滚"这件事**跨不过渲染**——官方 Modal 桩即便 open=false 也渲染 children，
+    //   所以"去掉二次确认"这个变异在 SSR 产物上**看不出差别**（变异验证实测：那条是绿的）。
+    //   而它恰恰是本任务最重要的护栏（Lead 点名"必须二次确认"）。
+    // 所以钉接线本身：入口按钮只能 setConfirming(true)，**不许**直接调 onRollback；
+    // 只有确认按钮才调 onRollback。
+    const source = readFileSync(new URL('../src/client/UpgradeRow.tsx', import.meta.url), 'utf8')
+    const entry = source.slice(source.indexOf('{canRollback(action) ? ('), source.indexOf('二次确认：回滚也是'))
+    assert.ok(entry.length > 0, '取不到回滚入口那段源码（判据会空转）')
+    assert.match(entry, /setConfirming\(true\)/, '入口按钮必须只打开确认框：' + entry)
+    assert.ok(!/onRollback\(/.test(entry), '入口按钮**不许**直接回滚（那就是没有二次确认）：' + entry)
+    // 反向：确认按钮必须真的执行回滚（否则这个入口点了没反应）。
+    const confirm = source.slice(source.indexOf('title={t(\'upgrade.rollback.confirmTitle\')}'))
+    assert.match(confirm, /onRollback\(action\.name, action\.fromVersion, action\.spec\)/, '确认按钮要执行回滚')
+  })
+  it('回滚入口**不常驻**：没升过级时卡片上没有回滚按钮', async () => {
+    const { html } = await checkAndRender([unit()])
+    assert.ok(!/回滚到/.test(html), '没升过级就不该有回滚入口：' + html.slice(0, 600))
+  })
+
+  it('回滚入口**不出现**在失败结果上（没有可回滚的东西）', async () => {
+    const { entry, face, t } = boot()
+    const name = '@deepseek-ai/dsh-experimental-auto-review'
+    const stub = stubFetch({
+      about: () => ({ ok: true, value: undefined }),
+      upgradeCheck: () => ({
+        ok: true,
+        value: { environment: 'probe', checked: true, lastCheckAt: '2026-09-19T10:00:00.000Z', notes: [], units: [unit()] },
+      }),
+      upgrade: () => ({ ok: true, value: 'job-1' }),
+      job: () => ({
+        ok: true,
+        value: {
+          done: true,
+          result: {
+            ok: false, code: 'install-failed', name, fromVersion: '0.2.1', toVersion: '0.2.9',
+            spec: '^0.2.1', canary: { ran: true, conclusion: 'passed' }, diskFacts: [], output: '',
+          },
+        },
+      }),
+    })
+    try {
+      face.loadUpgrades(false)
+      await until(() => face.hooks.upgrade.getSnapshot().check !== undefined, '检查落状态')
+      face.upgradePackage(name, '0.2.9')
+      await until(() => face.hooks.upgrade.getSnapshot().action !== undefined, '结果落状态')
+      const html = render(entry, face, t)
+      assert.ok(html.includes('升级没有完成'), '失败态要如实说：' + html.slice(-1000))
+      assert.ok(!/回滚到/.test(html), '失败态**没有可回滚的东西**，不该给回滚入口：' + html.slice(-1000))
+    } finally {
+      stub.restore()
+    }
   })
   it('文案：software 相关的新键过 §12（短文本不带句号、不口语化、无内部代号）', () => {
     const { applied } = boot()

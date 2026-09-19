@@ -507,6 +507,10 @@ export const zh = {
   'upgrade.rollback.dirty': '盘上仍有残留，需要按下面的事实处理',
   'upgrade.rollback.unknown': '盘上核对结果读不出来',
   'upgrade.rollback.action': '回滚到 {version}',
+  // 回滚入口（task-97）：只在升级结果块里出现，且必须二次确认。
+  // 短文本不带句号（§12.8）；确认框正文要说清"回到哪个版本"（§12.2 的后果告知）。
+  'upgrade.rollback.confirmTitle': '回滚这次升级',
+  'upgrade.rollback.confirmBody': '会把 {name} 换回 {version}，也就是升级前的版本',
   'upgrade.dismiss': '知道了',
 
   'official.title': '插件管理器伴生',
@@ -978,6 +982,8 @@ export const en: Record<CompanionLocaleKey, string> = {
   'upgrade.rollback.dirty': 'Residue remains on disk; handle it using the facts below',
   'upgrade.rollback.unknown': 'The disk check could not be read',
   'upgrade.rollback.action': 'Roll back to {version}',
+  'upgrade.rollback.confirmTitle': 'Roll back this upgrade',
+  'upgrade.rollback.confirmBody': 'This replaces {name} with {version}, the version before the upgrade',
   'upgrade.dismiss': 'Got it',
 
   'official.title': 'Plugin manager companion',

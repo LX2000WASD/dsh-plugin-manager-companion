@@ -731,12 +731,9 @@ describe('UI 文案标准（DESIGN §12）', () => {
       // cleanupDesc 复活，并新增 cleanupUnknown（计划读不到时那句"无法确认会删几个"）。
       // ── 市场页：标签超额时的折叠提示 ────────────────────────────────────────
       { key: k('market', 'moreTags'), why: '市场卡片标签超上限时的"还有 N 个"；MarketplacePage 目前全量渲染 tagsOf(item)' },
-      // ── 升级：task-96（关于 → 软件升级）已接上五档 ──────────────────────────
-      // task-96 落了这一页：loadFailed / checkedAt / neverChecked / checking / notes
-      // 五档全部复活（总览条 + 说明区），所以它们已从这张表里删掉。
-      // 只剩回滚按钮那一档：本页复用 UpgradeResult（有结果块）但**没有触发回滚的入口**——
-      // 与插件页同一个状态。要不要在这一页给回滚入口，等 Lead 定。
-      { key: k('upgrade', 'rollback.action'), why: '回滚按钮：两处都只有结果块，没有触发回滚的入口（task-96 沿用插件页的现状）' },
+      // ── 升级：这一族已经没有死键了 ────────────────────────────────────────
+      // task-96 落了「关于 → 软件升级」页（loadFailed / checkedAt / neverChecked / checking / notes）；
+      // task-97 补了**回滚入口**（长在升级结果块里、带二次确认）——rollback.action 随之复活。
     ]
     const known = new Set(KNOWN_DEAD.map(item => item.key))
     const unexpected = dead.filter(key => !known.has(key))

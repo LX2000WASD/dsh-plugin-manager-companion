@@ -37,6 +37,19 @@
   border-bottom-color: var(--dsw-alias-label-primary);
 }
 
+/*
+  .panel 用 display:flex 会把 HTML 的 hidden 属性**压掉**——hidden 的默认样式是
+  display:none，而任何显式的 display 声明都优先于它。后果是**两个子页同时可见**
+  （真机实测：切到「软件升级」时「DSH 信息」的内容还留在上面，两个面板叠在一起）。
+  这条是 task-97 真机取证时从截图里看到的，单测没暴露它——SSR 断言读的是 innerText，
+  而 hidden 的子树 innerText 照样读得到。
+  修法：显式把 [hidden] 的 display 钉回 none（ConsolePage 的 .panel 没有改 display，
+  所以它天然没这个问题）。
+*/
+.panel[hidden] {
+  display: none;
+}
+
 .panel {
   display: flex;
   flex-direction: column;
