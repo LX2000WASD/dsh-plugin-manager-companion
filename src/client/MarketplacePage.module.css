@@ -138,7 +138,10 @@
 
 .cardActions {
   display: flex;
+  align-items: center;
   justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 /* 触底哨兵：零高度、不占位，只给 IntersectionObserver 一个可观察的位置。 */

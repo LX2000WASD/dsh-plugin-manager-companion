@@ -239,6 +239,12 @@ export function applyWithMocks(exported, settings = {}) {
   const injected = []
   const dicts = []
   const effects = []
+  /**
+   * 传给 apply 的 ctx 本体。
+   *
+   * 先建对象再调用 apply（而不是字面量直接当参数）：产物里出现了 `ctx.inject(...)` 的用法，
+   * 而那个作用域桩件要把**同一份 ctx** 回调出去（服务可见性靠注入声明，真机同理）。
+   */
   const scopeSnapshot = {
     status: settings.status ?? 'ready',
     value: settings.value,
@@ -249,41 +255,53 @@ export function applyWithMocks(exported, settings = {}) {
     mode: 'host',
     namespace: NS,
   }
-  exported.apply({
-    effect(fn) { effects.push(fn); const dispose = fn(); return typeof dispose === 'function' ? dispose : () => {} },
-    on() { return () => {} },
-    get() { return undefined },
-    logger: { info() {}, warn() {}, error() {} },
-    locale: {
-      register(ns, d) { dicts.push({ ns, d }); return () => {} },
-      bind: (ns) => (key, params) => tFromDicts(dicts, ns, key, params, false),
-      subscribe: () => () => {},
-      getSnapshot: () => ({ revision: 0 }),
+  const ctx = {}
+  ctx.effect = (fn) => { effects.push(fn); const dispose = fn(); return typeof dispose === 'function' ? dispose : () => {} }
+  ctx.on = () => () => {}
+  ctx.get = () => undefined
+  ctx.logger = { info() {}, warn() {}, error() {} }
+  ctx.locale = {
+    register(ns, d) { dicts.push({ ns, d }); return () => {} },
+    bind: (ns) => (key, params) => tFromDicts(dicts, ns, key, params, false),
+    subscribe: () => () => {},
+    getSnapshot: () => ({ revision: 0 }),
+  }
+  ctx.slots = {
+    inject(name, fn) { injected.push(name); const reg = fn(); return typeof reg === 'function' ? reg : () => {} },
+    register(options, component) { slotRegistrations.push({ options, component }); return () => {} },
+    entries: () => [],
+    getVersion: () => 0,
+    subscribe: () => () => {},
+  }
+  ctx.remote = { pluginManager: {}, pluginInventory: {}, $on: () => () => {}, $mount: async () => () => {} }
+  // 官方配置通道：客户端经它读写本插件的 settings 命名空间（不碰配置文件）。
+  // 桩件按**客户端** SettingsScope 契约：getSnapshot / subscribe / mutate / set / unset。
+  ctx.settingsScope = {
+    bind() {
+      const listeners = new Set()
+      return {
+        getSnapshot: () => scopeSnapshot,
+        subscribe(fn) { listeners.add(fn); return () => { listeners.delete(fn) } },
+        mutate: async () => {},
+        set: async () => {},
+        unset: async () => {},
+      }
     },
-    slots: {
-      inject(name, fn) { injected.push(name); const reg = fn(); return typeof reg === 'function' ? reg : () => {} },
-      register(options, component) { slotRegistrations.push({ options, component }); return () => {} },
-      entries: () => [],
-      getVersion: () => 0,
-      subscribe: () => () => {},
-    },
-    remote: { pluginManager: {}, pluginInventory: {}, $on: () => () => {}, $mount: async () => () => {} },
-    // 官方配置通道：客户端经它读写本插件的 settings 命名空间（不碰配置文件）。
-    // 桩件按**客户端** SettingsScope 契约：getSnapshot / subscribe / mutate / set / unset。
-    settingsScope: {
-      bind() {
-        const listeners = new Set()
-        return {
-          getSnapshot: () => scopeSnapshot,
-          subscribe(fn) { listeners.add(fn); return () => { listeners.delete(fn) } },
-          mutate: async () => {},
-          set: async () => {},
-          unset: async () => {},
-        }
-      },
-      describe: () => ({ subscribe: () => () => {}, getSnapshot: () => ({ descriptors: [] }) }),
-    },
-  })
+    describe: () => ({ subscribe: () => () => {}, getSnapshot: () => ({ descriptors: [] }) }),
+  }
+  /**
+   * `ctx.inject` 的作用域桩件（与真机同形：声明服务后回调拿到作用域内的 ctx）。
+   *
+   * 桩件里的服务一直在，所以直接回调——但**回调拿到的必须是同一份 ctx**，
+   * 否则产物在作用域里读到的东西与根 ctx 不一致（真机上那正是服务可见性的机制）。
+   */
+  ctx.inject = (names, callback) => {
+    const list = typeof names === 'string' ? [names] : [...names]
+    injected.push('inject:' + list.join(','))
+    callback(ctx)
+    return () => {}
+  }
+  exported.apply(ctx)
   return { slotRegistrations, injected, dicts, effects, scopeSnapshot }
 }
 

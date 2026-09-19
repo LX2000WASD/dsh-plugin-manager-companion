@@ -68,7 +68,8 @@ function boot(options = {}) {
   const registrations = []
   const dicts = new Map()
   const noop = () => () => {}
-  exported.apply({
+  /** 传给 apply 的 ctx 本体（`ctx.inject` 的作用域桩件要把同一份 ctx 回调出去）。 */
+  const ctx = {
     effect(fn) { const dispose = fn(); return typeof dispose === 'function' ? dispose : () => {} },
     on: noop,
     get() { return undefined },
@@ -101,7 +102,10 @@ function boot(options = {}) {
       },
       describe: () => ({ subscribe: () => () => {}, getSnapshot: () => ({ descriptors: [] }) }),
     },
-  })
+  }
+  // ctx.inject 的作用域桩件：与真机同形（声明服务后回调拿到作用域内的 ctx，这里就是同一份）。
+  ctx.inject = (names, callback) => { callback(ctx); return () => {} }
+  exported.apply(ctx)
   const entry = registrations.find(item => item.options.id === CONSOLE_ID)
   assert.ok(entry !== undefined, '控制台注册项不存在：' + registrations.map(r => String(r.options.id)).join(','))
   currentEntry = entry

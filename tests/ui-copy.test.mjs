@@ -530,6 +530,28 @@ function isShortCopy(value) {
  */
 const PERIOD_KEPT_EXPLICIT = ['health.scoreHint']
 
+/**
+ * §12.8「边界」的第三类：**引用的官方原文**（"不动——那是别人说的话"）。
+ *
+ * 为什么单列一张表而不是并进 PERIOD_KEPT_EXPLICIT：两者被放行的**理由不同**，
+ * 断言方式也必须不同。scoreHint 是"我们的长说明被机械判据误判"，
+ * 这一类的判据则是"它必须与官方那句逐字一致"——改写它就不再是引用，
+ * 也就不再享有这条豁免（见下面的用例）。
+ *
+ * 每项写清：键名、官方原文、出处（官方源码路径 + 行号）、为什么它是引用。
+ */
+const PERIOD_KEPT_OFFICIAL_QUOTE = [
+  {
+    key: 'upgrade.effect',
+    zh: '已安装，下次启动后加载。',
+    en: 'Installed; it loads at the next start.',
+    // 官方 ui-plugin-manager 的 installDoneRestart（zh:131 / en:293）。DESIGN §5.5 明文要求
+    // 「生效时机沿用官方口径（"已安装，下次启动后加载。"），不自造」——所以它是引用，不是我们的短提示。
+    source: 'deepseek-harness/packages/client/ui-plugin-manager/src/client/locales.ts:131（installDoneRestart）',
+    because: 'DESIGN §5.5 要求生效时机沿用官方口径；§12.8「边界」把引用的官方原文列为不动的一类',
+  },
+]
+
 const PERIOD_KEPT = [
   'env.removeDesc',        // 两句话：句号是分隔符，删了会粘成一句
   'env.restoreWarnDesc',   // 一句长说明（56 字 / 160 字符）
@@ -938,10 +960,12 @@ describe('UI 文案标准（DESIGN §12）', () => {
     for (const lang of ['zh', 'en']) {
       for (const [key, value] of Object.entries(dict[lang])) {
         if (typeof value !== 'string') continue
-        // 只跳过 §12.8「边界」**点名**的那一条（health.scoreHint：长度像短句，但标准明文要求保留）。
+        // 只跳过 §12.8「边界」**点名**的例外（health.scoreHint：长度像短句，但标准明文要求保留）
+        // 与**引用的官方原文**（upgrade.effect：DESIGN §5.5 要求沿用官方口径，改写它就不再是引用）。
         // 其余保留项（长文本/多句）不跳过——它们本来就该被机械判据放行；一旦被人改短，
         // 这条护栏就会当场红，而不是靠一份豁免清单兜着。
         if (PERIOD_KEPT_EXPLICIT.includes(key)) continue
+        if (PERIOD_KEPT_OFFICIAL_QUOTE.some(item => item.key === key)) continue
         if (!isShortCopy(value)) continue
         if (!/[。.]$/.test(value)) continue
         hits.push(lang + ' ' + key + ' :: ' + JSON.stringify(value))
@@ -1019,7 +1043,20 @@ describe('UI 文案标准（DESIGN §12）', () => {
     assert.match(score, /；/, 'health.scoreHint 靠分号承载长说明，这是 §12.8 保留它的理由')
     assert.ok(/。$/.test(score), 'health.scoreHint 必须保留句号（§12.8 边界点名）')
     assert.ok(PERIOD_KEPT.includes('health.scoreHint'), 'health.scoreHint 必须在显式例外清单里，否则上面的跳过就是隐式的')
-    // ③ 反例面：真实条目必须被拦下（`未发现任何环境。` 是用户实际看到的形态）
+    // ③ §12.8「边界」第三类：**引用的官方原文**——放行的前提是"它确实还是官方那句"。
+    //    改写它就不再是引用，也就不再享有这条豁免，所以这里逐条钉住字面量与出处。
+    for (const item of PERIOD_KEPT_OFFICIAL_QUOTE) {
+      assert.ok(typeof item.source === 'string' && item.source.trim() !== '',
+        item.key + ' 没写出处（§12.4：注明它来自哪里）')
+      assert.ok(typeof item.because === 'string' && item.because.trim() !== '',
+        item.key + ' 没写为什么它是引用')
+      assert.equal(dict.zh[item.key], item.zh, item.key + '（zh）已不是官方原文了——改写后这条豁免不再成立')
+      assert.equal(dict.en[item.key], item.en, item.key + '（en）已不是官方原文了')
+      // 它必须真的是"机械判据会误伤"的形态，否则这条豁免没有存在的必要（防它变成万能挡箭牌）。
+      assert.ok(isShortCopy(item.zh) && /。$/.test(item.zh),
+        item.key + ' 已不再是被机械判据误伤的短句，请重新裁定这条豁免')
+    }
+    // ④ 反例面：真实条目必须被拦下（`未发现任何环境。` 是用户实际看到的形态）
     assert.ok(isShortCopy('未发现任何环境。'), '反例没被认成短文本，P1 会空转')
     assert.ok(isShortCopy('No environments found.'), '英文反例没被认成短文本')
     // ④ 边界：加长/加句/加换行都应让它不再是「短文本」

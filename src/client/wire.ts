@@ -990,3 +990,259 @@ export function normalizeConfig(raw: unknown): NormalizedConfig | undefined {
   }
   return { config, filled }
 }
+
+// ── 升级（op: upgradeCheck / upgrade / upgradeRollback）──────────────────────
+
+/**
+ * 一条 dist-tag 的客户端视图。
+ *
+ * line 与 preferred **原样保留字符串/布尔**，不在这里映射成已知集合：host 新增一档线时，
+ * 界面要能如实显示（未知线一律按"另一条线"提示，宁可多提醒一次也不谎报"同线"）。
+ */
+export interface UpgradeTagView {
+  readonly tag: string
+  readonly version: string
+  readonly line: string
+  readonly preferred: boolean
+}
+
+/**
+ * 一个升级单元的客户端视图。
+ *
+ * state 原样保留：四态由 host 判定（docs/REST-CONTRACT.md），客户端**不自己推断**
+ * （wire.ts 纪律 3：归一不吞发现）。未知状态值由 upgradeView.rowKindOf 归到 unknown，
+ * 界面据此显示"查不到"而不是"已是最新"。
+ */
+export interface UpgradeUnitView {
+  readonly name: string
+  readonly kind: string
+  readonly state: string
+  readonly currentVersion: string | null
+  readonly currentLine: string | null
+  readonly spec?: string
+  readonly targetVersion: string | null
+  readonly targetTag: string | null
+  readonly targetLine: string | null
+  readonly tags: readonly UpgradeTagView[] | null
+  readonly source?: string
+  readonly at?: string
+  readonly reason?: string
+  readonly changesSource?: boolean
+  readonly command?: string
+}
+
+/** 升级检查结果的客户端视图（op: upgradeCheck）。 */
+export interface UpgradeCheckView {
+  readonly environment: string
+  readonly units: readonly UpgradeUnitView[]
+  readonly checked: boolean
+  readonly lastCheckAt: string | null
+  readonly notes: readonly string[]
+}
+
+/**
+ * 归一一条 dist-tag。
+ *
+ * 缺 tag 名或版本时丢弃这条（一个没有版本的 tag 无法作为升级目标）。
+ *
+ * @param raw - `UpgradeUnitReport.tags` 里的一项。
+ * @returns 视图；不可用时 undefined。
+ */
+function upgradeTag(raw: unknown): UpgradeTagView | undefined {
+  const record = asObject(raw)
+  if (record === undefined) return undefined
+  const tag = asText(record['tag'])
+  const version = asText(record['version'])
+  if (tag === undefined || version === undefined) return undefined
+  return { tag, version, line: text(record['line'], 'unknown'), preferred: record['preferred'] === true }
+}
+
+/**
+ * 归一一个升级单元。
+ *
+ * 没有名字的单元直接丢弃（无法寻址的单元不能提供升级入口）；tags 为 null 时保持 null
+ * （那是"拿不到 tag 列表"这个事实本身，不能归一成空数组——空数组会被读成"没有 tag"）。
+ *
+ * @param raw - `UpgradeCheckResult.units` 里的一项。
+ * @returns 视图；不可用时 undefined。
+ */
+function upgradeUnit(raw: unknown): UpgradeUnitView | undefined {
+  const record = asObject(raw)
+  if (record === undefined) return undefined
+  const name = asText(record['name'])
+  if (name === undefined) return undefined
+  const tagsRaw = record['tags']
+  const tags = Array.isArray(tagsRaw)
+    ? tagsRaw.map(upgradeTag).filter((tag): tag is UpgradeTagView => tag !== undefined)
+    : null
+  const spec = asText(record['spec'])
+  const source = asText(record['source'])
+  const at = asText(record['at'])
+  const reason = asText(record['reason'])
+  const command = asText(record['command'])
+  return {
+    name,
+    kind: text(record['kind'], 'unknown'),
+    state: text(record['state'], 'unknown'),
+    currentVersion: asText(record['currentVersion']) ?? null,
+    currentLine: asText(record['currentLine']) ?? null,
+    ...spec === undefined ? {} : { spec },
+    targetVersion: asText(record['targetVersion']) ?? null,
+    targetTag: asText(record['targetTag']) ?? null,
+    targetLine: asText(record['targetLine']) ?? null,
+    tags,
+    ...source === undefined ? {} : { source },
+    ...at === undefined ? {} : { at },
+    ...reason === undefined ? {} : { reason },
+    ...record['changesSource'] === true ? { changesSource: true } : {},
+    ...command === undefined ? {} : { command },
+  }
+}
+
+/**
+ * 归一一次升级检查结果。
+ *
+ * 载荷不是对象时返回 undefined：控制器据此如实报"失败"，**绝不**把它画成"没有可升级的包"
+ * （那是把故障说成结论）。units 缺失时给空数组——"宿主说了一个单元都没有"与"读不出来"
+ * 在契约里是两回事，前者合法。
+ *
+ * @param raw - upgradeCheck op 的结果。
+ * @returns 视图；载荷不可用时 undefined。
+ */
+export function normalizeUpgradeCheck(raw: unknown): UpgradeCheckView | undefined {
+  const record = asObject(raw)
+  if (record === undefined) return undefined
+  const lastCheckAt = asText(record['lastCheckAt'])
+  return {
+    environment: text(record['environment']),
+    units: asArray(record['units'])
+      .map(upgradeUnit)
+      .filter((unit): unit is UpgradeUnitView => unit !== undefined),
+    checked: record['checked'] === true,
+    lastCheckAt: lastCheckAt ?? null,
+    notes: texts(record['notes']),
+  }
+}
+
+/**
+ * 一次升级的金丝雀（试装）结论的客户端视图。
+ *
+ * ran 与 conclusion **都保留**：ran===false 时 conclusion 缺省，界面必须能从 ran 看出
+ * "这次没验证"（DESIGN §5.5：没验证不等于通过）。
+ */
+export interface UpgradeCanaryView {
+  readonly ran: boolean
+  readonly conclusion?: string
+  readonly depth?: string
+  readonly escalated: boolean
+  readonly elapsedMs?: number
+  readonly output?: string
+  readonly skippedReason?: string
+  readonly cleanup: string
+  readonly activated?: boolean
+  readonly bundles?: readonly string[]
+}
+
+/**
+ * 归一一次金丝雀报告。
+ *
+ * @param raw - `UpgradeActionResult.canary`。
+ * @returns 视图；载荷不是对象时 undefined（"宿主没给金丝雀事实"，界面据此不宣称任何结论）。
+ */
+function upgradeCanary(raw: unknown): UpgradeCanaryView | undefined {
+  const record = asObject(raw)
+  if (record === undefined) return undefined
+  const conclusion = asText(record['conclusion'])
+  const depth = asText(record['depth'])
+  const output = asText(record['output'])
+  const skippedReason = asText(record['skippedReason'])
+  const elapsed = record['elapsedMs']
+  const activation = asObject(record['activation'])
+  return {
+    ran: record['ran'] === true,
+    ...conclusion === undefined ? {} : { conclusion },
+    ...depth === undefined ? {} : { depth },
+    escalated: record['escalated'] === true,
+    ...typeof elapsed === 'number' && Number.isFinite(elapsed) ? { elapsedMs: elapsed } : {},
+    ...output === undefined ? {} : { output },
+    ...skippedReason === undefined ? {} : { skippedReason },
+    cleanup: text(record['cleanup']),
+    ...activation === undefined ? {} : { activated: activation['activated'] === true },
+    ...activation === undefined ? {} : { bundles: texts(activation['bundles']) },
+  }
+}
+
+/** 一次升级结果的客户端视图（op: upgrade）。 */
+export interface UpgradeActionView extends EnvironmentResult {
+  readonly name: string
+  readonly fromVersion: string | null
+  readonly toVersion: string
+  readonly spec: string
+  readonly canary?: UpgradeCanaryView
+  readonly diskFacts: readonly string[]
+  readonly restartRequired: boolean
+}
+
+/**
+ * 归一一次升级结果。
+ *
+ * 沿用环境操作结果的归一口径：载荷不可用时按失败处理（ok=false），绝不当作成功。
+ * canary 缺失时**不补**一个"没跑"——"宿主没给这个字段"与"金丝雀没跑"是两件事，
+ * 前者界面不许宣称任何验证结论。
+ *
+ * @param raw - upgrade op 的结果。
+ * @returns 视图。
+ */
+export function normalizeUpgradeAction(raw: unknown): UpgradeActionView {
+  const record = asObject(raw)
+  const base = normalizeEnvironmentResult(raw)
+  if (record === undefined) {
+    return { ...base, name: '', fromVersion: null, toVersion: '', spec: '', diskFacts: [], restartRequired: false }
+  }
+  const canary = upgradeCanary(record['canary'])
+  return {
+    ...base,
+    name: text(record['name']),
+    fromVersion: asText(record['fromVersion']) ?? null,
+    toVersion: text(record['toVersion']),
+    spec: text(record['spec']),
+    ...canary === undefined ? {} : { canary },
+    diskFacts: texts(record['diskFacts']),
+    restartRequired: record['restartRequired'] === true,
+  }
+}
+
+/** 一次回滚结果的客户端视图（op: upgradeRollback）。 */
+export interface UpgradeRollbackView extends EnvironmentResult {
+  readonly name: string
+  readonly fromVersion: string | null
+  readonly toVersion: string
+  readonly diskFacts: readonly string[]
+  /** 盘上核对是否一致；读不出来时 undefined（**不是** false——"读不出来"不是"不干净"）。 */
+  readonly clean: boolean | undefined
+}
+
+/**
+ * 归一一次回滚结果。
+ *
+ * clean 读不出来时给 undefined 而不是 false：false 是一个结论（"有残留"），
+ * 不能拿它顶替"读不到"（DESIGN §12.3.3）。
+ *
+ * @param raw - upgradeRollback op 的结果。
+ * @returns 视图。
+ */
+export function normalizeUpgradeRollback(raw: unknown): UpgradeRollbackView {
+  const record = asObject(raw)
+  const base = normalizeEnvironmentResult(raw)
+  if (record === undefined) {
+    return { ...base, name: '', fromVersion: null, toVersion: '', diskFacts: [], clean: undefined }
+  }
+  return {
+    ...base,
+    name: text(record['name']),
+    fromVersion: asText(record['fromVersion']) ?? null,
+    toVersion: text(record['toVersion']),
+    diskFacts: texts(record['diskFacts']),
+    clean: typeof record['clean'] === 'boolean' ? record['clean'] : undefined,
+  }
+}

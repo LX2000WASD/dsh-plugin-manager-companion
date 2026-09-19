@@ -36,16 +36,23 @@ import { NS } from './locales.ts'
 import { PmSelect } from './pmSelect.tsx'
 import {
   KIND_LABEL, MARKET_LABEL, formatRelative,
-  type CompanionSlotProps, type MarketplaceFace, type MarketplaceState,
+  type CompanionSlotProps, type MarketplaceConsoleFace, type MarketplaceState, type UpgradeState,
 } from './shared.ts'
 import type { TrialOutcomeView } from './wire.ts'
+import { marketUpgradeTarget } from '../upgradeView.ts'
 import css from './MarketplacePage.module.css'
 
 /** 本文件里 t 的键域（本插件字典）。 */
 type T = TranslateNS<typeof NS>
 
-/** 市场页的注册项 props。 */
-export type MarketplacePageProps = CompanionSlotProps<'settings.section', MarketplaceFace>
+/**
+ * 市场页的注册项 props。
+ *
+ * 注入面 = 市场自己的面 + 升级面：已装条目的卡片上那个「升级到 x.y.z」用的是**同一份**
+ * 升级检查结果与同一个升级动作（零新机制），所以两个面在装配处合成一份（index.ts），
+ * 这里按合成后的形状声明。
+ */
+export type MarketplacePageProps = CompanionSlotProps<'settings.section', MarketplaceConsoleFace>
 
 /** 类型筛选器的全部选项（上游 index 的 kind 字段）。 */
 const KINDS: readonly MarketItemKind[] = ['cordis-plugin', 'skill', 'agent-preset', 'unknown']
@@ -254,8 +261,8 @@ function TrialResult({ t, trial }: { readonly t: T; readonly trial: TrialOutcome
  * @returns 市场页。
  */
 export function MarketplacePage({
-  t, useMarketplace, loadMarketplace, setMarketQuery, setMarketCategory, setMarketKind,
-  installMarketItem, dismissInstallNotice,
+  t, useMarketplace, useUpgrade, loadMarketplace, setMarketQuery, setMarketCategory, setMarketKind,
+  installMarketItem, dismissInstallNotice, ensureUpgrades, upgradePackage,
 }: MarketplacePageProps) {
   const result = useMarketplace((state: MarketplaceState) => state.result)
   const loading = useMarketplace((state: MarketplaceState) => state.loading)
@@ -283,6 +290,20 @@ export function MarketplacePage({
 
   // 落地即读索引（缓存优先）；用户点刷新才绕过缓存。
   useEffect(() => { if (result === undefined) loadMarketplace(false) }, [loadMarketplace, result])
+  // 进入即查（DESIGN §5.5）：卡片上的「升级到 x.y.z」用的就是这一份检查结果。
+  // 去重在控制器里（ensureUpgrades）——市场页会被反复挂载。
+  useEffect(() => { ensureUpgrades() }, [ensureUpgrades])
+  // 升级中/最近一次结果：卡片据此禁用入口，不重复触发同一个包。
+  const upgrading = useUpgrade((state: UpgradeState) => state.busy)
+  // 检查结果里"这个市场条目对应哪个升级单元"：先按 npm 包名，再按仓库名末段。
+  // 与 host 的已装判定同源（marketplace.ts 的 flagInstalled 也是这两条通道），
+  // 不在这里另立一套匹配规则。
+  const upgradeUnits = useUpgrade((state: UpgradeState) => state.check?.units)
+  const unitForItem = useMemo(() => {
+    const byName = new Map((upgradeUnits ?? []).map(unit => [unit.name, unit]))
+    return (item: { readonly name: string; readonly packageName?: string }) =>
+      byName.get(item.packageName ?? '') ?? byName.get(item.name)
+  }, [upgradeUnits])
   useEffect(() => { if (rolledBack) setToast({ text: t('market.rolledBack'), seq: Date.now() }) }, [rolledBack, t])
 
   const toolbar = marketToolbarModel(sort, descending, category)
@@ -537,6 +558,30 @@ export function MarketplacePage({
                   </p>
                 )}
                 <div className={css.cardActions}>
+                  {/*
+                    已装条目的「升级到 x.y.z」（零新机制）：判据用同一个 updateAvailable，
+                    动作走**官方插件页升级行那条通道**（同一份检查结果、同一个 upgrade op），
+                    所以这里不新开一条安装路径。未安装/无更新时不出现。
+                  */}
+                  {(() => {
+                    const target = marketUpgradeTarget(item, updateAvailable)
+                    if (target === undefined) return null
+                    const unit = unitForItem(item)
+                    const busy = upgrading === unit?.name
+                    return (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={busy || unit === undefined}
+                        onClick={() => {
+                          if (unit === undefined) return
+                          upgradePackage(unit.name, target, unit.spec)
+                        }}
+                      >
+                        {busy ? t('upgrade.running') : t('market.upgradeTo', { version: target })}
+                      </Button>
+                    )
+                  })()}
                   <Button
                     variant="primary"
                     size="sm"

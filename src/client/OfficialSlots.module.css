@@ -14,3 +14,93 @@
   color: var(--dsw-alias-label-primary);
 }
 
+/* 升级行：与官方详情页的 section 同量级的独立一块（官方 chrome 画标题与图标）。 */
+.upgrade {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 0.5px solid var(--dsw-alias-border-l2);
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-layer-2);
+}
+
+.upgradeHead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.upgradeTitle {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.upgradeVersions {
+  font-family: var(--dsw-font-markdown-code-font-family);
+  font-size: 12px;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.upgradeField {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.upgradeNote {
+  margin: 0;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+/* 失败/警告色的说明行："查不到"必须看得见（不是一句中性灰话）。 */
+.upgradeWarn {
+  margin: 0;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-state-warning-primary, var(--dsw-alias-label-secondary));
+}
+
+.upgradeActions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.upgradeFacts {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+/* 结论原文 / 详细输出：等宽 + 可滚动，不撑破官方详情页的列宽。 */
+.upgradeOutput {
+  margin: 0;
+  padding: 8px 10px;
+  max-height: 220px;
+  overflow: auto;
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-1);
+  font-family: var(--dsw-font-markdown-code-font-family);
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.upgradeCommand {
+  display: block;
+  font-family: var(--dsw-font-markdown-code-font-family);
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-secondary);
+  word-break: break-all;
+}

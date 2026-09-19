@@ -39,9 +39,11 @@ import {
   normalizeBackup, normalizeBackupDiff, normalizeCapabilities, normalizeConfig,
   normalizeEnvironmentResult, normalizeEnvironments, normalizeGatedInstall, normalizeKindList,
   normalizeMarketplace, normalizeReport, normalizeTrialCleanup, normalizeTrialDisclosure,
-  normalizeTrialEnvironments,
+  normalizeTrialEnvironments, normalizeUpgradeAction, normalizeUpgradeCheck, normalizeUpgradeRollback,
   type ClientConfig, type TrialDisclosureView, type TrialEnvironmentsView, type TrialOutcomeView,
+  type UpgradeCheckView,
 } from './wire.ts'
+import { canaryVerdict, upgradeOutcome, type UpgradeOutcomeKind } from '../upgradeView.ts'
 
 /**
  * 官方 settings 服务上本插件的命名空间。
@@ -1467,6 +1469,308 @@ export class TrialController {
         draft.action = { kind, ok: false, removed: [], output: error instanceof Error ? error.message : String(error) }
       })
     }
+  }
+}
+
+
+// ── 升级（档三）：检查缓存 + 官方插件页的升级行 + 一次升级的结果 ──────────────
+
+/**
+ * 升级那一块的状态。
+ *
+ * 三块事实各自独立，**不合并**：
+ *   · check：最近一次 upgradeCheck 的结果（四态就在这里）；
+ *   · busy：正在跑的包名（升级是长操作，界面据此禁用入口）；
+ *   · action：最近一次升级/回滚的结果 —— 它必须活到用户处置为止，
+ *     不能被任何一次刷新抹掉（task-18 的真机 P1：读操作清掉写操作的结果，失败被渲染成完成）。
+ */
+export interface UpgradeState {
+  /** 检查结果；undefined = 还没查过（界面据此显示"还没检查"，不是"已是最新"）。 */
+  check: UpgradeCheckView | undefined
+  loading: boolean
+  /** 读检查结果自己写下的失败（只有它能被下一次成功的读取清掉）。 */
+  error: string | undefined
+  /** 客户端自己判定的失败（载荷残缺）；文案归字典。 */
+  errorKey?: CompanionLocaleKey
+  /** 正在升级的包名。 */
+  busy: string | undefined
+  /** 最近一次升级的结果（成功也留，直到用户处置或下一次升级开始）。 */
+  action: UpgradeActionResultState | undefined
+  /** 最近一次回滚的结果。 */
+  rollback: UpgradeRollbackResultState | undefined
+}
+
+/** 一次升级的结果（结构化：界面按 outcome 选文案，不把整句拼进状态）。 */
+export interface UpgradeActionResultState {
+  /** 诚实分类：done / rolled-back / failed / unverified（见 upgradeView.upgradeOutcome）。 */
+  readonly outcome: UpgradeOutcomeKind
+  readonly name: string
+  readonly fromVersion: string | null
+  readonly toVersion: string
+  readonly ok: boolean
+  readonly output: string
+  readonly code?: string
+  /** 金丝雀的读法：passed / failed / not-run / absent（没验证 ≠ 验证失败 ≠ 通过）。 */
+  readonly canary: 'passed' | 'failed' | 'not-run' | 'absent'
+  /** 没跑金丝雀的原因（ran===false 时才有）。 */
+  readonly canaryNote?: string
+  /**
+   * 金丝雀的**完整结论原文**（含根因链）。
+   *
+   * 为什么必须带出来：顶层的 output 是"结论与后果"那一层，而用户追责要看的是
+   * 根因链（例如 duplicate loader entry id）。丢掉它，界面只能说"没通过"，
+   * 用户拿不到任何可查的东西——task-78/80 的验收明确要求根因链可见。
+   */
+  readonly canaryOutput?: string
+  /** 金丝雀的激活证据：候选有没有真的进测试环境的层栈。 */
+  readonly canaryActivated?: boolean
+  readonly restartRequired: boolean
+  readonly diskFacts: readonly string[]
+}
+
+/** 一次回滚的结果。 */
+export interface UpgradeRollbackResultState {
+  readonly name: string
+  readonly ok: boolean
+  readonly output: string
+  readonly code?: string
+  readonly fromVersion: string | null
+  readonly toVersion: string
+  /** 盘上核对是否一致；undefined = 读不出来（不是"不干净"）。 */
+  readonly clean: boolean | undefined
+  readonly diskFacts: readonly string[]
+}
+
+/** 升级动作的注入面（官方插件页的升级行与市场页卡片共用同一份）。 */
+export interface UpgradeFace {
+  hooks: { upgrade: SnapshotStore<UpgradeState> }
+  /**
+   * 进入即查：**同一会话内只发一次**（TTL / 开关 / 负缓存判定都在 host 侧，客户端不重复实现）。
+   *
+   * 为什么需要这个去重口："进入即查"的触发点在**渲染期**（官方插件页/市场页挂载时的 effect），
+   * 而这两个面会被反复挂载。没有去重就会变成"每开一次页面出一趟网"，
+   * 而 TTL 的语义是"距上次成功检查超过间隔才查"——去重的依据在 host，触发次数得由客户端收住。
+   */
+  ensureUpgrades(): void
+  /** 手动检查（无视开关、TTL 与负缓存）；refresh=true 是用户点的重试。 */
+  loadUpgrades(refresh: boolean): void
+  /** 升级一个包到指定版本（长操作，走 job）。 */
+  upgradePackage(name: string, version: string, spec?: string): void
+  /** 回滚一个包到指定版本。 */
+  rollbackPackage(name: string, version: string, spec?: string): void
+  /** 处置（清掉）最近一次升级结果。 */
+  dismissUpgradeNotice(): void
+}
+
+/**
+ * 市场页的注入面：市场自己的面 + 升级面。
+ *
+ * 为什么写成一个显式接口（而不是 `MarketplaceFace & UpgradeFace`）：两边的 hooks 记录
+ * 用交叉类型表达时，官方 `PropsHooks` 的映射类型在交叉上**推导不出** useMarketplace /
+ * useUpgrade 两个成员（实测编译报"Property 'useMarketplace' is missing"）。
+ * 一个显式的 hooks 记录把两件事说清楚，也省掉一处会被读错的类型体操。
+ */
+export interface MarketplaceConsoleFace {
+  hooks: {
+    marketplace: SnapshotStore<MarketplaceState>
+    upgrade: SnapshotStore<UpgradeState>
+  }
+  loadMarketplace(refresh: boolean): void
+  setMarketQuery(query: string): void
+  setMarketCategory(category: string): void
+  setMarketKind(kind: MarketItemKind | ''): void
+  installMarketItem(item: MarketItemView): void
+  dismissInstallNotice(): void
+  ensureUpgrades(): void
+  loadUpgrades(refresh: boolean): void
+  upgradePackage(name: string, version: string, spec?: string): void
+  rollbackPackage(name: string, version: string, spec?: string): void
+  dismissUpgradeNotice(): void
+}
+
+/**
+ * 升级控制器。
+ *
+ * 两条纪律与其它控制器一致，另加一条本块特有的：
+ *   · **不做乐观更新**：升级结果只由 job 的落定结果写入（REST-CONTRACT 明确禁止）；
+ *   · **失败不吞**：载荷残缺记 errorKey，host 报错记 error，两者都不写进 action；
+ *   · **升级成功后立刻重查**（版本事实过期了），但重查**不许**清掉刚写下的结果
+ *     —— 顺序必须是"先落结果、再刷新"（task-18 的 P1 就是这个顺序）。
+ */
+export class UpgradeController {
+  private readonly store: SnapshotStore<UpgradeState>
+  /** "读检查结果"写下的失败；只有它能被下一次成功的读取清掉（见 ReadFailureLedger）。 */
+  private readonly readFailure = new ReadFailureLedger()
+  /** 进入即查是否已经发过（一次会话一次；见 ensureLoaded）。 */
+  private kicked = false
+
+  constructor() {
+    this.store = createSnapshotStore<UpgradeState>({
+      check: undefined, loading: false, error: undefined, busy: undefined, action: undefined, rollback: undefined,
+    })
+  }
+
+  /** 供注册项使用的注入面。 */
+  inject(): UpgradeFace {
+    return {
+      hooks: { upgrade: this.store },
+      ensureUpgrades: () => { void this.ensureLoaded() },
+      loadUpgrades: (refresh) => { void this.load(refresh) },
+      upgradePackage: (name, version, spec) => { void this.upgrade(name, version, spec) },
+      rollbackPackage: (name, version, spec) => { void this.rollback(name, version, spec) },
+      dismissUpgradeNotice: () => {
+        this.store.update((draft) => { draft.action = undefined; draft.rollback = undefined })
+      },
+    }
+  }
+
+  /** 当前快照（index.ts 的注册对账要读它）。 */
+  snapshot(): UpgradeState {
+    return this.store.getSnapshot()
+  }
+
+  /**
+   * 进入即查的**去重口**：一次会话只发一次（见 {@link UpgradeFace.ensureUpgrades}）。
+   *
+   * 已经查过（成功或失败）就不再发；手动检查与台账变化走 {@link load}，绕过这个闸门。
+   */
+  async ensureLoaded(): Promise<void> {
+    if (this.kicked) return
+    this.kicked = true
+    await this.load(false)
+  }
+
+  /**
+   * 读一次升级检查结果。
+   *
+   * 只动 loading / 自己写下的读失败：action 描述的是"上一次操作"，刷新无权替它宣布结果。
+   *
+   * @param refresh - 手动检查（无视开关、TTL 与负缓存）。
+   */
+  async load(refresh: boolean): Promise<void> {
+    this.store.update((draft) => { draft.loading = true })
+    try {
+      const result = normalizeUpgradeCheck(await callOp<unknown>('upgradeCheck', { refresh }))
+      if (result === undefined) {
+        this.store.update((draft) => {
+          draft.loading = false
+          draft.errorKey = this.readFailure.record('error.incompletePayload')
+        })
+        return
+      }
+      this.store.update((draft) => {
+        draft.check = result
+        draft.loading = false
+        this.readFailure.clearOwn(draft)
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.store.update((draft) => {
+        draft.loading = false
+        draft.error = this.readFailure.record(message)
+      })
+    }
+  }
+
+  /**
+   * 升级一个包（长操作：走 job + 轮询）。
+   *
+   * 结果落定后**先写 action，再重查**——顺序反过来，重查会清掉刚写下的失败。
+   *
+   * @param name - 包名。
+   * @param version - 目标版本。
+   * @param spec - 当前来源（host 据此判断"升级会改变来源"与回滚目标）。
+   */
+  async upgrade(name: string, version: string, spec?: string): Promise<void> {
+    this.store.update((draft) => {
+      draft.busy = name
+      draft.action = undefined
+      draft.rollback = undefined
+      draft.error = undefined
+      draft.errorKey = undefined
+    })
+    try {
+      const raw = await runJob<unknown>('upgrade', {
+        name, version, ...spec === undefined ? {} : { spec },
+      })
+      const result = normalizeUpgradeAction(raw)
+      this.store.update((draft) => {
+        draft.busy = undefined
+        draft.action = {
+          outcome: upgradeOutcome(result),
+          name: result.name === '' ? name : result.name,
+          fromVersion: result.fromVersion,
+          toVersion: result.toVersion === '' ? version : result.toVersion,
+          ok: result.ok,
+          output: result.output,
+          ...result.code === undefined ? {} : { code: result.code },
+          canary: canaryVerdict(result.canary),
+          ...result.canary?.skippedReason === undefined ? {} : { canaryNote: result.canary.skippedReason },
+          ...result.canary?.output === undefined ? {} : { canaryOutput: result.canary.output },
+          ...result.canary?.activated === undefined ? {} : { canaryActivated: result.canary.activated },
+          restartRequired: result.restartRequired,
+          diskFacts: result.diskFacts,
+        }
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.store.update((draft) => {
+        draft.busy = undefined
+        // 传输层/轮询失败也是失败：写进 action 的 outcome=failed，而不是只留一句 error
+        // —— 否则界面会出现"什么都没说"的状态，与"成功"无从区分。
+        draft.action = {
+          outcome: 'failed', name, fromVersion: null, toVersion: version, ok: false,
+          output: message, canary: 'absent', restartRequired: false, diskFacts: [],
+        }
+      })
+    }
+    // 版本事实过期了：重查一次（**在结果落定之后**）。
+    await this.load(true)
+  }
+
+  /**
+   * 回滚一个包到指定版本。
+   *
+   * @param name - 包名。
+   * @param version - 回滚目标版本。
+   * @param spec - 原来源（本地来源时回滚装回那个来源）。
+   */
+  async rollback(name: string, version: string, spec?: string): Promise<void> {
+    this.store.update((draft) => {
+      draft.busy = name
+      draft.rollback = undefined
+      draft.error = undefined
+      draft.errorKey = undefined
+    })
+    try {
+      const raw = await runJob<unknown>('upgradeRollback', {
+        name, version, ...spec === undefined ? {} : { spec },
+      })
+      const result = normalizeUpgradeRollback(raw)
+      this.store.update((draft) => {
+        draft.busy = undefined
+        draft.rollback = {
+          name: result.name === '' ? name : result.name,
+          ok: result.ok,
+          output: result.output,
+          ...result.code === undefined ? {} : { code: result.code },
+          fromVersion: result.fromVersion,
+          toVersion: result.toVersion === '' ? version : result.toVersion,
+          clean: result.clean,
+          diskFacts: result.diskFacts,
+        }
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.store.update((draft) => {
+        draft.busy = undefined
+        draft.rollback = {
+          name, ok: false, output: message, fromVersion: null, toVersion: version,
+          clean: undefined, diskFacts: [],
+        }
+      })
+    }
+    await this.load(true)
   }
 }
 

@@ -338,3 +338,50 @@ job 的失败只体现在后续 `job` op 的轮询结果里，把"少给一个�
 所以金丝雀必须先走官方 `remove` 再 `add`，否则它永远进不了层栈、旧代码照样启动成功（假通过）。
 `activation.activated === false` 时结论一律 `cannot-trial`。
 
+### 客户端侧的落点与对账（task-74 已落地，界面实现以此为准）
+
+上面那张表是"放哪"；这一段是"怎么接"——**已实现并被 tests/upgrade-ui.test.mjs 钉住**。
+
+| 落点 | 实现 | 为什么不能换 |
+|---|---|---|
+| 主落点 | `plugins.bundle.config`，**key = 包名**，每个 key 一个注册项 | 官方插件页只有三个槽位；卸载按钮与启用开关在 `DetailTop` 的 actions 里没有槽位 |
+| 市场页 | 卡片上的「升级到 x.y.z」（`market.upgradeTo`） | 零新机制：复用 `updateAvailable` 判据与同一个 `upgrade` op |
+| 禁止 | **DOM 注入** | 官方 chrome 不属于我们；注入会在官方改版时静默失效 |
+
+**注册集合的实时对账**（DESIGN §5.5）——三条纪律，每条都有对应断言：
+
+1. **目标集合** = 已装 ∧（还没查过 ∨ 这一态要显示）。`registeredNames()` 是唯一出口：
+   · `up-to-date` → **不注册**，那个 key 的 disposer 被释放，官方 config-ledger 重算，那一节**当场消失**；
+   · `unknown` / `not-upgradable` / `update-available` → 注册；
+   · **还没查过** → 也要注册：检查正是由这一行挂载时的 effect 触发的（"进入即查"），
+     先要求"查过才注册"会变成先有鸡还是先有蛋，而且"没查"这一态也必须能被看见。
+2. **多退少补**：每次对账都对比集合，撤掉的多余 key 立刻调它自己的 disposer。
+   **不留孤儿 key**：否则将来同名包重装会带着旧数据冒出来。
+3. **源**：升级状态每次发布 + 官方 `plugin-manager/changed` / `connection/reset`。
+   台账读不到时**不清空**已注册的行（"读不到已装集合"不等于"什么都没装"），
+   退回用检查结果里的单元名——那份事实同样来自宿主读盘。
+
+**本插件自己的包名（`dsh-plugin-manager-companion`）不参与升级行对账**：它自己的页面已被
+配置面那条 `plugins.bundle.config` 注册占用，同一 key 同优先级再注册会被官方 `register` 抛
+`already has an entry`。自我升级按 DESIGN §5.5 走「关于 → 软件升级」的批量视图（另一个任务）。
+
+**不要用官方台账的 `installed` 过滤注册集合**：那个字段的语义是"在 profile 的 dependencies 里"
+（`listBundles`：`const installed = dependencies.includes(name)`），而**安装方提供的层**恰恰是
+"在层栈里、不在 dependencies 里"——按它过滤会把 `not-upgradable` 整个漏掉，而那是四态之一。
+取全部名字，让四态决定要不要注册；多余的 key 是惰性的（官方只为它真正渲染的包派发 key）。
+
+**一次升级结果的诚实分类**（`upgradeView.upgradeOutcome`，界面按它选文案与色调）：
+
+| outcome | 判据 | 界面必须说 |
+|---|---|---|
+| `done` | `ok === true` 且金丝雀跑了且通过 | 已升级 + 生效时机 |
+| `unverified` | `ok === true` 但 `canary.ran === false` | **升级了，但没验证**（不是通过，也不是失败） |
+| `rolled-back` | `ok === false` 且 `code === 'canary-not-passed'` | **没有升级**：真实环境没被动过 |
+| `failed` | 其余失败（含传输层失败） | 没有完成（带盘上事实与官方退出码） |
+
+金丝雀那一行单独渲染（`passed` / `failed` / `not-run` / `absent`）——
+**"没验证"与"验证失败"必须是两句不同的话**，混起来就等于把风险藏了。
+根因链在 `canary.output` 里（顶层 `output` 是结论层），必须一起带出来供用户追责。
+
+**未验证（`canary.ran === false`）在成功路径上也要说出来**——那一档最容易被读成"通过"。
+
