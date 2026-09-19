@@ -915,6 +915,41 @@ describe('diagnostics · 扫描器输入过滤（打包碎片不是依赖）', (
     assert.ok(unfiltered.some(issue => issue.subjects[1] === 'truly-required-dep'))
   })
 })
+
+describe('diagnostics · 文案不留未渲染的 Markdown（task-55）', () => {
+  it('每条发现的 title / detail / fix.summary / operation 里都不许出现 **', async () => {
+    // Web 卡片与 CLI 都是纯文本渲染：**x** 会原样显示成字面星号（copy-review-2 §3.6 陷阱 1）。
+    // 这条钉在**产出的每一条发现**上（而不是逐个字符串断言）：以后新增文案自动受约束。
+    const config = { ...CONFIG, diagnostics: { ...CONFIG.diagnostics, ecosystem: true } }
+    const env = { name: 'broken', dir: brokenDir, current: false, builtin: false, bundles: [], dependencies: [], runs: [], installAnchor }
+    const report = await analyzeEnvironment(makeCtx({ profileContext: {} }), env, config)
+    assert.ok(report.issues.length > 0, '这份报告得有发现才谈得上检查文案')
+    for (const issue of report.issues) {
+      const fields = {
+        title: issue.title,
+        detail: issue.detail,
+        summary: issue.fix === undefined ? undefined : issue.fix.summary,
+        operation: issue.extra === undefined ? undefined : issue.extra.operation,
+      }
+      for (const [field, value] of Object.entries(fields)) {
+        if (typeof value !== 'string') continue
+        assert.ok(!value.includes('**'),
+          issue.code + ' 的 ' + field + ' 里有未渲染的 Markdown 加粗：' + value)
+      }
+    }
+    // skip 的说明同样是用户可见文本
+    for (const item of report.skipped) {
+      assert.ok(!item.reason.includes('**'), item.check + ' 的 reason 里有未渲染的 Markdown 加粗：' + item.reason)
+    }
+  })
+
+  it('变异验证：把星号加回去 → 上面那条断言必须报红', () => {
+    const mutated = { code: 'x', detail: '**整个 profile 起不来**' }
+    assert.throws(() => {
+      assert.ok(!mutated.detail.includes('**'), mutated.code + ' 的 detail 里有未渲染的 Markdown 加粗：' + mutated.detail)
+    }, '把星号加回去后必须报红——否则这条约定没被钉住')
+  })
+})
 describe('diagnostics · 词法扫描器', () => {
   it('注释与字符串里的伪注册、伪 import 都不算数', () => {
     const code = [
