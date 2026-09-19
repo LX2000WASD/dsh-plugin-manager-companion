@@ -668,3 +668,49 @@ describe('修复失败的归因与存续（task-35 P1）', () => {
     } finally { stub.restore() }
   })
 })
+
+describe('环境列表：层栈读不懂时显示「未知」而不是 0（task-42）', () => {
+  /** 造一个 listEnvironments 的载荷。 */
+  const environmentPayload = (extra) => [{
+    name: 'pm-unknown', dir: '/tmp/pm-unknown', current: true, builtin: false,
+    bundles: [], dependencies: ['@deepseek-ai/dsh-base'], runs: [],
+    ...extra,
+  }]
+
+  /** 用 fetch 桩喂列表，再渲染「环境」子页（走 wire 归一，最接近真机路径）。 */
+  async function renderEnvWith(payload, t) {
+    const booted = boot()
+    const stub = stubFetch({ listEnvironments: () => ({ ok: true, value: payload }) })
+    try {
+      booted.face.refreshEnvironments()
+      await until(() => booted.face.hooks.environments.getSnapshot().loading === false, '环境列表落地')
+      return { ...booted, html: renderTab(booted.entry, booted.face, t ?? booted.t, 'env') }
+    } finally { stub.restore() }
+  }
+
+  it('bundlesKnown=false：显示「未知」与可见原因，且不出现 0 个组合包', async () => {
+    const reason = 'package.json 结构读不懂：dsh.profile.bundles 存在但不是字符串数组'
+    const { html } = await renderEnvWith(environmentPayload({ bundlesKnown: false, bundlesUnknownReason: reason }))
+    assert.ok(html.includes('未知'), '组合包那一栏要显示「未知」：' + html.slice(0, 400))
+    assert.ok(!html.includes('0 个组合包'), '读不懂不能画成"0 个组合包"（把不知道说成知道）')
+    assert.ok(html.includes(reason), '原因必须是可见文本，不是只挂 title')
+  })
+
+  it('反向：bundlesKnown 缺省（等价 true）时仍显示真实数字，且不出现「未知」', async () => {
+    const { html } = await renderEnvWith(environmentPayload({ bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'] }))
+    assert.ok(html.includes('2 个组合包'), '确定的事实用真实数字：' + html.slice(0, 400))
+    assert.ok(!html.includes('未知'), '不是未知就不能出现未知')
+  })
+
+  it('只透传已知字段：bundlesKnown 是别的取值时不发明「未知」', async () => {
+    const { html } = await renderEnvWith(environmentPayload({ bundlesKnown: 'yes', bundles: ['@deepseek-ai/dsh-base'] }))
+    assert.ok(html.includes('1 个组合包'), '非 false 一律按已知处理：' + html.slice(0, 400))
+    assert.ok(!html.includes('未知'), '不发明未知')
+  })
+
+  it('只有 reason 没有 bundlesKnown=false 时不显示未知（原因不能单独成立）', async () => {
+    const { html } = await renderEnvWith(environmentPayload({ bundlesUnknownReason: '一些原因', bundles: ['@deepseek-ai/dsh-base'] }))
+    assert.ok(html.includes('1 个组合包'), '按已知显示：' + html.slice(0, 400))
+    assert.ok(!html.includes('未知'), '没有 false 就不该出现未知')
+  })
+})

@@ -325,6 +325,14 @@ export function normalizeEnvironments(raw: unknown): EnvironmentInfo[] | undefin
       current: flag(record['current'], false),
       builtin: flag(record['builtin'], false),
       bundles: texts(record['bundles']),
+      // 层栈是不是确定的：只认明确的 false，缺字段（等价 true）与任何其它取值都不发明"未知"
+      // ——口径与层归属那次一致：只透传引擎给出的已知事实。
+      ...(record['bundlesKnown'] === false ? { bundlesKnown: false } : {}),
+      // 原因只在确实读不懂时带，且必须是非空字符串（空串等于没有原因）。
+      ...(record['bundlesKnown'] === false && typeof record['bundlesUnknownReason'] === 'string'
+        && record['bundlesUnknownReason'] !== ''
+        ? { bundlesUnknownReason: record['bundlesUnknownReason'] as string }
+        : {}),
       dependencies: texts(record['dependencies']),
       runs: asArray(record['runs'])
         .map(entry => run(entry))

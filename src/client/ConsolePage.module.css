@@ -432,6 +432,19 @@
   align-items: flex-start;
 }
 
+/* 层栈读不懂时：标签 + 可见的原因（不挂在 title 上）。 */
+
+.envUnknown {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.envUnknownReason {
+  font-size: 12px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
 /* 选中模板的层栈：官方包名，原样显示，不做文案化。 */
 
 .templateBundles {

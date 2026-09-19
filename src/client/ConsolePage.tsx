@@ -830,7 +830,20 @@ function EnvironmentsPanel({ t, useEnvironments, actions }: EnvironmentsPanelPro
               </div>
               <div className={css.envMeta}>
                 <code className={css.envDir}>{environment.dir}</code>
-                <span>{t('env.bundles', { count: environment.bundles.length })}</span>
+                {/*
+                  组合包这一栏必须区分"确实是 0 个"与"这份 manifest 读不懂"：后者显示 0 个
+                  就是把"我不知道"说成"这个环境没有层栈"（与"跳过层显示 0"同一类误读）。
+                */}
+                {environment.bundlesKnown === false ? (
+                  <span className={css.envUnknown}>
+                    <Tag tone="warning">{t('env.bundlesUnknown')}</Tag>
+                    {environment.bundlesUnknownReason === undefined
+                      ? null
+                      : <span className={css.envUnknownReason}>{environment.bundlesUnknownReason}</span>}
+                  </span>
+                ) : (
+                  <span>{t('env.bundles', { count: environment.bundles.length })}</span>
+                )}
                 <span>{t('env.dependencies', { count: environment.dependencies.length })}</span>
                 {environment.runs.map(run => (
                   <span key={run.pid} className={css.envRun}>
