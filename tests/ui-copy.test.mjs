@@ -715,22 +715,29 @@ describe('UI 文案标准（DESIGN §12）', () => {
     // 于是上面的 dead 判据永远看不到它们（判据是按字面量包含找引用的）。
     // 所以统一用 join 拼出来：表在，但字面量不在。
     const k = (...parts) => parts.join('.')
+    // 每条都必须能回答"**谁会用它**"，而且要具体到界面位置——"别人会处理"不算答案
+    // （Lead 复核 task-88 时点名：归属要写成键名旁边的注释，别只写"别人"）。
+    // 判定口径：用 `git log -S "t('键')"` 查它**有没有过调用点**——
+    //   · 从未有过 = 脚手架（界面还没做到那一步）；
+    //   · 有过但现在没了 = 被取代（该删，不该留）。
+    // 下面这些**全部是"从未有过"**（实测），也就是说它们是**没接完的界面**，不是历史包袱。
     const KNOWN_DEAD = [
-      { key: k('trial', 'cleanupTitle'), why: '试装清理组的脚手架键，task-89（envManager 文案）一并处理' },
-      { key: k('trial', 'cleanupDesc'), why: '同上' },
-      { key: k('trial', 'planTitle'), why: '同上' },
-      { key: k('trial', 'planRemove'), why: '同上' },
-      { key: k('trial', 'planKeep'), why: '同上' },
-      { key: k('trial', 'planRow'), why: '同上' },
-      { key: k('market', 'moreTags'), why: '市场页的脚手架键，属 market-dev 的地盘' },
-      { key: k('upgrade', 'noTarget'), why: 'task-74 留下的脚手架键；R1/R2 改版后不再需要"无可升目标"这句' },
-      { key: k('upgrade', 'result.output'), why: '被 upgrade.result.commandOutput（R5 的标识行）取代' },
-      { key: k('upgrade', 'loadFailed'), why: 'task-77（关于 → 软件升级）会用到：检查失败的提示' },
-      { key: k('upgrade', 'checkedAt'), why: 'task-77 会用到：上次检查时间' },
-      { key: k('upgrade', 'neverChecked'), why: 'task-77 会用到：从未成功检查过' },
-      { key: k('upgrade', 'checking'), why: 'task-77 会用到：检查中…' },
-      { key: k('upgrade', 'notes'), why: 'task-77 会用到：检查说明' },
-      { key: k('upgrade', 'rollback.action'), why: 'task-77 会用到：回滚到 x.y.z 的按钮' },
+      // ── 试装清理：宿主已经返回"清理计划"，客户端还没画（实测 types.ts:698 的 plan.remove/keep 有 name+reason）──
+      { key: k('trial', 'cleanupTitle'), why: '清理对话框标题；ConsolePage 的清理区当前只有按钮（trial.cleanup），没弹确认框' },
+      { key: k('trial', 'cleanupDesc'), why: '同上：清理前该说清"会删哪些、留哪些"' },
+      { key: k('trial', 'planTitle'), why: '试装环境报告的 plan 段（types.ts:698）；客户端目前只渲染 environments 列表' },
+      { key: k('trial', 'planRemove'), why: '同上：plan.remove 的名字列表（宿主已给，客户端未画）' },
+      { key: k('trial', 'planKeep'), why: '同上：plan.keep 的名字列表' },
+      { key: k('trial', 'planRow'), why: '同上：plan 每一项的「名字：原因」' },
+      // ── 市场页：标签超额时的折叠提示 ────────────────────────────────────────
+      { key: k('market', 'moreTags'), why: '市场卡片标签超上限时的"还有 N 个"；MarketplacePage 目前全量渲染 tagsOf(item)' },
+      // ── 升级：task-77（关于 → 软件升级）要用的那几档状态 ────────────────────
+      { key: k('upgrade', 'loadFailed'), why: 'task-77 的检查失败提示（task-87 的插件页用共享的 errorKey 通道，不走这个键）' },
+      { key: k('upgrade', 'checkedAt'), why: 'task-77：上次检查时间（插件页的版本事实行已自带"来自 registry（刚刚）"）' },
+      { key: k('upgrade', 'neverChecked'), why: 'task-77：从未成功检查过' },
+      { key: k('upgrade', 'checking'), why: 'task-77：检查中…（插件页用的是按钮禁用态，没写这句）' },
+      { key: k('upgrade', 'notes'), why: 'task-77：检查说明（check.notes 目前无处渲染）' },
+      { key: k('upgrade', 'rollback.action'), why: 'task-77：回滚按钮（插件页只有结果块，没有触发回滚的入口）' },
     ]
     const known = new Set(KNOWN_DEAD.map(item => item.key))
     const unexpected = dead.filter(key => !known.has(key))
@@ -1254,7 +1261,7 @@ describe('UI 文案标准（DESIGN §12）', () => {
     assert.deepEqual(hits, [], '升级成功的输出命中了 §12.9：' + hits.join(', ') + String.fromCharCode(10) + output)
     // R5 的反向断言：那条原始日志真的被贴出来了，所以"标识必须在"这件事是被测到的，不是空转。
     assert.match(output, /Progress: resolved 2/, '这条用例没走到"贴原始日志"那条路：' + output)
-    assert.match(output, /命令输出（pnpm，升级命令）：/, 'R5：原始日志必须带标识：' + output)
+    assert.match(output, /命令输出（来自升级命令）：/, 'R5：原始日志必须带标识：' + output)
   })
   it('P1：客户端字典（zh + en）的短文本一律不以句号结尾', () => {
     const dict = dictionaries()

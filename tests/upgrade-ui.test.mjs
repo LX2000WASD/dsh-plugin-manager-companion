@@ -825,7 +825,7 @@ describe('真机实测抓到的两个缺陷：回归闸（单测曾经全绿而�
           '升级后：',
           '  依赖声明：probe-plugin = 0.3.0',
           '',
-          '官方输出：',
+          '命令输出（来自升级命令）：',
           '  Progress: resolved 1, reused 0, downloaded 1',
         ].join('\n'),
         name: 'probe-plugin', fromVersion: '0.2.1', toVersion: '0.3.0', spec: 'probe-plugin@0.3.0',
@@ -847,7 +847,8 @@ describe('真机实测抓到的两个缺陷：回归闸（单测曾经全绿而�
       // 但原文里与列表重复的那一行（升级后的依赖声明）不该再出现一次。
       const hits = (html.match(/依赖声明：probe-plugin = 0\.3\.0/g) ?? []).length
       assert.equal(hits, 1, '升级后的依赖声明只能出现一次（结构化列表那份）：' + html)
-      // 表头（"官方输出："）本身是被剥掉的分隔标记，不重复显示；那一段的**内容**必须留着。
+      // 表头本身是被剥掉的分隔标记（客户端用它切分），界面上由字典的标识行承担；
+      // 那一段的**内容**必须留着（失败时它是唯一线索）。
       assert.match(html, /Progress: resolved 1/, '官方通道的尾部输出要保留（失败时它是唯一线索）')
     } finally { stub.restore() }
   })
@@ -951,6 +952,28 @@ describe('结果块渲染：四档各自可辨（失败态不得渲染成完成�
     } finally { stub.restore() }
   })
 
+
+  it('R5 跨模块契约：host 拼的那条表头必须能被客户端切出来（切不出就整块不渲染）', () => {
+    // 这条是**真机实测抓到的缺陷的回归闸**（task-88 引入）：
+    // task-88 把 host 侧的表头从 '官方输出：' 改成了带命令说明的新表头，
+    // 但没同步改客户端 officialTail 里的 marker → indexOf 恒为 -1 →
+    // **客户端那块"命令输出 + 原始日志"静默不渲染**，而当时所有单测全绿
+    // （没有用例覆盖"客户端真的切出了那一段"）。用户看到的后果是：R5 要求的那段日志没了。
+    //
+    // 判据：从两侧源码里各取一次那条表头，断言它们**逐字相等**。
+    // 为什么不驱动渲染：这条要钉的是"两个模块的常量还一致"，比渲染断言更靠前、更便宜，
+    // 而且能在"客户端根本没渲染那块"时也报警（渲染断言在那种情况下会静默通过——
+    // 因为"没有那块"和"那块为空"在 HTML 上长得一样）。
+    const clientSource = readFileSync('src/client/UpgradeRow.tsx', 'utf8')
+    const hostSource = readFileSync('src/upgrade.ts', 'utf8')
+    const clientMarker = clientSource.match(/const COMMAND_OUTPUT_MARKER = '([^']+)'/)?.[1]
+    const hostMarker = hostSource.match(/lines\.push\('', '([^']+输出[^']*)：'/) ?.[1]
+    assert.ok(clientMarker !== undefined, '客户端没有 COMMAND_OUTPUT_MARKER（切分判据没了？）')
+    assert.ok(hostMarker !== undefined, 'host 侧找不到那条表头（R5 的标识行没了？）')
+    assert.equal(clientMarker, hostMarker + '：',
+      'host 与客户端的表头不一致：host 写 ' + JSON.stringify(hostMarker) + '，客户端找 ' + JSON.stringify(clientMarker)
+      + ' —— 客户端那块日志会静默不渲染（真机实测过）')
+  })
   it('升级没完成：写"没有完成"，不画成成功', async () => {
     const handle = boot({ bundles: [{ name: 'probe-plugin', installed: true }] })
     const stub = stubFetch(upgradeStub({

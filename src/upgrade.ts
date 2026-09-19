@@ -1190,8 +1190,12 @@ export async function upgradePackage(input: UpgradeActionInput): Promise<Upgrade
     ...after.map((line) => '  ' + line),
   ]
   // R5（DESIGN §12.9）：原始日志必须有标识。原来只写「官方输出：」——读者不知道那是**哪条命令**的
-  // 输出，中英混杂的一堆进度行会被当成我们的说明。现在点明工具与通道。
-  if (tail.length > 0) lines.push('', '命令输出（pnpm，升级命令）：', ...tail.map((line) => '  ' + line))
+  // 输出，中英混杂的一堆进度行会被当成我们的说明。现在点明它来自哪条命令。
+  //
+  // 措辞里不带工具名（pnpm）：那对用户是内部工具名（Lead 复核 task-88 时点名）。
+  // 这条表头同时是**客户端切分原文的判据**（见 UpgradeRow.officialTail 的 marker）——
+  // 改它必须同步改那边，否则客户端那一块会静默不渲染（真机实测踩过）。
+  if (tail.length > 0) lines.push('', '命令输出（来自升级命令）：', ...tail.map((line) => '  ' + line))
   // 升级成功后该包的版本事实就旧了：让它下次检查重新取（不靠"猜"来更新界面）。
   invalidateTagsCache(name)
   return {

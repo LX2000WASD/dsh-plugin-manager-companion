@@ -313,24 +313,34 @@ function reasonTree(note: string): readonly { readonly text: string; readonly de
 }
 
 /**
- * 从 host 拼好的结论原文里取出**官方通道的尾部输出**（结构化事实之外的那一段）。
+ * host 侧那条"命令输出"表头的**字面量**（切分原文的判据）。
  *
- * 为什么需要它：结论原文（host 侧 src/upgrade.ts 拼的）里已经含有一份盘上事实，
- * 而界面另有一份**结构化**的盘上事实列表——两份说的是同一件事，整段贴出来就是重复。
- * 但原文尾部那段"官方输出："是结构化列表里**没有**的东西（官方通道到底说了什么），
+ * 为什么抽成常量并写这么长一段注释：这个表头是**跨模块契约**——host 侧拼、客户端切。
+ * task-88 把 host 侧从 '官方输出：' 改成带命令说明的新表头时**没同步改这里**，
+ * 于是 `indexOf` 恒为 -1、客户端那块"命令输出 + 原始日志"静默不渲染，
+ * 而单测全绿（当时没有用例覆盖"客户端真的切出了那一段"）。真机实测才发现。
+ * 现在两处都引用这个名字，upgrade-ui.test.mjs 也有一条断言钉住"切得出来"。
+ */
+const COMMAND_OUTPUT_MARKER = '命令输出（来自升级命令）：'
+
+/**
+ * 从 host 拼好的结论原文里取出**命令输出那一段**（结构化事实之外的那一段）。
+ *
+ * 为什么需要它：结论原文（host 侧 src/upgrade.ts 拼的）里已经含有一份当前状态，
+ * 而界面另有一份**结构化**的当前状态列表——两份说的是同一件事，整段贴出来就是重复。
+ * 但原文尾部那段命令输出是结构化列表里**没有**的东西（官方通道到底说了什么），
  * 失败时它往往是唯一线索，必须留着。
  *
- * 判据是那段自带的表头（host 侧固定写 '官方输出：'）；找不到时返回 undefined
+ * 判据是那段自带的表头（{@link COMMAND_OUTPUT_MARKER}）；找不到时返回 undefined
  * （宁可什么都不显示，也不把整段重复内容贴上来）。
  *
  * @param output - host 给的结论原文。
- * @returns 官方输出那一段；没有时 undefined。
+ * @returns 命令输出那一段；没有时 undefined。
  */
 function officialTail(output: string): string | undefined {
-  const marker = '官方输出：'
-  const at = output.indexOf(marker)
+  const at = output.indexOf(COMMAND_OUTPUT_MARKER)
   if (at < 0) return undefined
-  const tail = output.slice(at + marker.length).trim()
+  const tail = output.slice(at + COMMAND_OUTPUT_MARKER.length).trim()
   return tail.length === 0 ? undefined : tail
 }
 

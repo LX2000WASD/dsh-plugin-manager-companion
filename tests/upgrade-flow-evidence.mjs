@@ -166,6 +166,13 @@ async function main() {
     check('flow: R3 无内部代号（金丝雀/盘上事实/挂载/快照/层栈/锚点）',
       !/金丝雀|盘上事实|挂载|快照|层栈|锚点/.test(after))
     check('flow: R6 历史记录交代时间性（最近一次升级）', /最近一次升级/.test(after))
+    // R5 的**客户端那一半**：host 拼的表头必须被客户端切出来，否则那一块静默不渲染
+    // （task-88 引入过这个缺陷：改了 host 表头没同步客户端 marker，单测全绿而真机上日志块消失）。
+    // 判据：真机上那条标识行与它下面的原始输出**都在**。
+    check('flow: R5 标识行在（命令输出…）', /命令输出/.test(after))
+    check('flow: R5 原始日志真的渲染出来了（不是静默消失）',
+      /Progress: resolved|Lockfile passes|Packages: \+|reused \d+, downloaded|Done in \d/.test(after),
+      (after.match(/命令输出[^\n]{0,40}/) ?? ['(没找到标识行)'])[0])
     check('flow: R2 原因里没有冒号套冒号',
       !after.split(String.fromCharCode(10)).some(line => (line.match(/：/g) ?? []).length >= 2))
     // §12.9 的取证主角：升级结果块本身。浅色/深色各一张，文件名带主题。
