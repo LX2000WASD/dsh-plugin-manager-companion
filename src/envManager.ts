@@ -917,6 +917,14 @@ export interface LaunchOutcome {
   readonly terminal?: string
   /** 后台模式捕获官方输出到的日志路径（里面有官方打印的带 token 地址）。 */
   readonly logPath?: string
+  /**
+   * 为什么最终是这个启动方式（降级原因）。
+   *
+   * 独立复验 N-03：`wt` 缺失 → 降级后台时，成功与失败两条文案都只说「启动方式：后台」，
+   * 用户不知道**为什么**不是终端窗口。这是「用户即将做的动作的后果」类信息（DESIGN §12.2
+   * 的保留清单），必须下发。
+   */
+  readonly reason?: string
 }
 
 /** startEnvironment 的选项。 */
@@ -1057,7 +1065,9 @@ function startedMessage(
   name: string, port: number, status: number, spec: LaunchSpec, outcome: LaunchOutcome,
 ): string {
   const lines = ['已启动 ' + name
-    + '（启动方式：' + (outcome.mode === 'terminal' ? '终端窗口 ' + (outcome.terminal ?? '') : '后台') + '）'
+    + '（启动方式：' + (outcome.mode === 'terminal' ? '终端窗口 ' + (outcome.terminal ?? '') : '后台')
+    + (outcome.reason === undefined ? '' : '；' + outcome.reason)
+    + '）'
     + '　官方 HTTP 已应答：GET / -> ' + String(status)]
   const authenticated = outcome.logPath === undefined ? null : authenticatedUrlFromLog(outcome.logPath)
   if (authenticated !== null) {
@@ -1090,13 +1100,17 @@ function startTimeoutMessage(
   name: string, port: number, spec: LaunchSpec, outcome: LaunchOutcome, options: StartEnvironmentOptions,
 ): string {
   const lines = [name + ' 已启动，但 ' + String(options.readyTimeoutMs ?? START_READY_TIMEOUT_MS)
-    + 'ms 内端口 ' + String(port) + ' 没有给出官方 web 应答（GET / 需要返回 200/303/401；404 不算就绪）。']
+    + 'ms 内端口 ' + String(port) + ' 没有给出官方 web 应答（GET / 需要返回 200/303/401；404 不算就绪）。'
+    + (outcome.reason === undefined ? '' : '\n启动方式：' + (outcome.mode === 'terminal' ? '终端窗口' : '后台') + '（' + outcome.reason + '）')]
   if (outcome.logPath === undefined) {
     lines.push('请看刚打开的终端窗口里 dsh 的输出。')
   } else {
     const tail = tailOfLog(outcome.logPath, 20)
     lines.push('日志：' + outcome.logPath)
-    lines.push(tail.length === 0 ? '（日志还是空的）' : tail.join('\n'))
+    // 独立复验 N-04：系统本地化文本按控制台代码页写入，按 utf8 读会出替换字符；
+    // 那就如实标注，别让乱码冒充可读信息。
+    if (tail.undecodable) lines.push('（尾部包含按控制台代码页写入的系统文本，无法按 UTF-8 解码，下面以替换字符显示）')
+    lines.push(tail.lines.length === 0 ? '（日志还是空的）' : tail.lines.join('\n'))
   }
   lines.push('命令：' + spec.display)
   return lines.join('\n')
@@ -1264,23 +1278,41 @@ function authenticatedUrlFromLog(logPath: string): string | null {
 /**
  * 读日志尾部若干行，给失败文案用。
  *
- * 单行截断、总量截断：启动日志里可能有很长的堆栈，REST 响应不该被它撑爆。
+ * 三件事：
+ *  1. 单行截断（启动日志里可能有很长的堆栈，REST 响应不该被它撑爆）；
+ *  2. token 脱敏（token 只允许出现在那份 0600 日志与 startEnvironment 的成功返回里）；
+ *  3. **编码如实**（独立复验 N-04）：Node 自己写的是 UTF-8，但 cmd/powershell 的本地化报错按
+ *     控制台代码页写入，按 utf8 读会得到替换字符。这里去掉控制字符，并把「是否含无法解码
+ *     片段」交给调用方标注 —— 不让乱码冒充可读信息。
  *
  * @param logPath - 日志文件。
  * @param lines - 取最后多少行。
- * @returns 尾部行；读不到时空数组。
+ * @returns 尾部行与「是否含无法解码的片段」；读不到时为空。
  */
-function tailOfLog(logPath: string, lines: number): string[] {
+function tailOfLog(logPath: string, lines: number): { lines: string[]; undecodable: boolean } {
   try {
     const text = readFileSync(logPath, 'utf8')
-    return text.split(/\r?\n/).filter((line) => line.trim().length > 0).slice(-lines)
-      .map((line) => (line.length > 500 ? line.slice(0, 500) + '…' : line))
-      // token 只允许出现在那份 0600 日志与 startEnvironment 的成功返回里：
-      // 失败文案里的日志尾巴必须脱敏。
-      .map((line) => line.replace(/token=[A-Za-z0-9_-]+/g, 'token=***'))
+    const picked = text.split(/\r?\n/).filter((line) => line.trim().length > 0).slice(-lines)
+      .map((line) => sanitizeLogLine(line))
+    return { lines: picked, undecodable: picked.some((line) => line.includes(DECODE_REPLACEMENT)) }
   } catch {
-    return []
+    return { lines: [], undecodable: false }
   }
+}
+
+/** UTF-8 解码失败的替换字符（cmd/powershell 按控制台代码页写下的本地化文本会变成它）。 */
+const DECODE_REPLACEMENT = '\uFFFD'
+
+/**
+ * 清理一行日志：去掉不该进用户文案的控制字符、截断超长行、token 脱敏。
+ *
+ * @param line - 日志原文一行。
+ * @returns 可安全展示的一行。
+ */
+function sanitizeLogLine(line: string): string {
+  const cleaned = line.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '')
+  const capped = cleaned.length > 500 ? cleaned.slice(0, 500) + '…' : cleaned
+  return capped.replace(/token=[A-Za-z0-9_-]+/g, 'token=***')
 }
 
 /**
@@ -1384,11 +1416,11 @@ async function spawnBackground(spec: LaunchSpec, note?: string): Promise<LaunchO
     mkdirSync(dirname(logPath), { recursive: true, mode: 0o700 })
     const fd = openSync(logPath, 'a', 0o600)
     try {
-      // shell 只对 Windows 的 .cmd shim 打开（W-07）：Node 自己用 ComSpec 执行批处理，
-      // 参数仍逐项传入；首选路径（execPath + bin.js）保持无 shell。
-      const { failure: spawnFailure } = await spawnDetached(spec.command, spec.args, {
+      // Windows 的 .cmd shim 显式经 cmd.exe 执行（W-07 / N-01）：不再用 shell:true ——
+      // 那会触发 Node DEP0190（args 只拼接、不转义），参数先过白名单校验。
+      const invocation = spec.shell ? windowsShimInvocation(spec) : { command: spec.command, args: spec.args }
+      const { failure: spawnFailure } = await spawnDetached(invocation.command, invocation.args, {
         stdio: ['ignore', fd, fd],
-        ...spec.shell ? { shell: true } : {},
       })
       failure = spawnFailure
     } finally {
@@ -1403,7 +1435,37 @@ async function spawnBackground(spec: LaunchSpec, note?: string): Promise<LaunchO
   return {
     ok: true, mode: 'background', logPath,
     detail: '已在后台启动' + (note === undefined ? '' : '（' + note + '）'),
+    ...note === undefined ? {} : { reason: note },
   }
+}
+
+/**
+ * 经 cmd.exe 执行 .cmd/.bat 时，参数里允许出现的字符（保守白名单）。
+ *
+ * 独立复验 N-01：原来用 spawn(..., { shell: true }) 会触发 Node **DEP0190**（args 只拼接、
+ * 不转义），含空格的参数没有引号保护；真机实测 `dsh2.cmd` 收到的是
+ * `[--patch C:\Program Files\x.yml --port 3599]` 这样被拆开的 argv。
+ * 现在改成显式 `cmd.exe /d /s /c <cmd> <args...>`（不再声明 shell，因此不再有那条警告），
+ * 并在拼之前**校验**每个参数：不满足白名单就大声失败，而不是交给 cmd 静默拆错。
+ * 这条回退路径的真实参数只有 `--profile <合法名>` / `--port <数字>` / `--no-open`；
+ * 将来若有人传含空格或元字符的 extraArgs，会在这里拿到明确报错（而不是被悄悄转错）。
+ */
+const CMD_SAFE_ARG = /^[A-Za-z0-9_@%+=:,./\\-]+$/
+
+/**
+ * .cmd/.bat shim 的启动形态（显式 cmd、argv 直传、参数先校验）。
+ *
+ * @param spec - 启动描述（shell 为 true 时才有意义）。
+ * @returns 命令与参数。
+ * @throws 参数含 cmd 不安全字符时（绝不静默交给 cmd 拆错）。
+ */
+export function windowsShimInvocation(spec: LaunchSpec): { command: string; args: readonly string[] } {
+  const tokens = [spec.command, ...spec.args]
+  const unsafe = tokens.filter((token) => !CMD_SAFE_ARG.test(token))
+  if (unsafe.length > 0) {
+    throw new Error('Windows 下经 cmd 启动时参数含不安全字符（会被 cmd 重新拆词）：' + unsafe.join(', '))
+  }
+  return { command: process.env.ComSpec ?? 'cmd.exe', args: ['/d', '/s', '/c', ...tokens] }
 }
 
 /**
@@ -1419,9 +1481,12 @@ async function spawnBackground(spec: LaunchSpec, note?: string): Promise<LaunchO
  * @returns 要执行的命令与参数（argv 形态）。
  */
 export function windowsTerminalInvocation(spec: LaunchSpec): { command: string; args: readonly string[] } {
-  const program = spec.shell ? 'cmd.exe' : spec.command
-  const args = spec.shell ? ['/d', '/s', '/c', spec.command, ...spec.args] : [...spec.args]
-  return { command: 'wt', args: ['-d', spec.dir, program, ...args] }
+  if (spec.shell) {
+    // .cmd shim：经 cmd 执行，走同一份参数校验（与后台模式同源）。
+    const shim = windowsShimInvocation(spec)
+    return { command: 'wt', args: ['-d', spec.dir, shim.command, ...shim.args] }
+  }
+  return { command: 'wt', args: ['-d', spec.dir, spec.command, ...spec.args] }
 }
 
 /**

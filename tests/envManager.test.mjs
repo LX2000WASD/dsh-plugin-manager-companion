@@ -725,3 +725,72 @@ test('backupRestore：先差异、后按官方通道重装、锁下补回 bundle
   assert.equal(noAnchor.code, 'no-profile-context')
   assert.equal(calls.length, callsBefore, '拿不到 installAnchor 时不得调用官方通道')
 })
+
+test('N-03: 降级到后台时必须说明理由（成功与超时两条文案都带）', async () => {
+  makeEnv('whybg', { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'] })
+  const reason = '没有可用终端，已降级为后台启动'
+  const launches = []
+  let clock = 0
+  const ok = await env.startEnvironment('whybg', {
+    mode: 'terminal', port: 4750, readyTimeoutMs: 300,
+    launch: async (spec) => {
+      launches.push(spec.mode)
+      return spec.mode === 'terminal'
+        ? { ok: true, mode: 'terminal', terminal: 'wt', detail: 'terminal' }
+        : { ok: true, mode: 'background', detail: '已在后台启动（' + reason + '）', reason }
+    },
+    probe: async () => (launches.length >= 2 ? 401 : null),
+    sleep: async () => {}, now: () => (clock += 100),
+  })
+  assert.equal(ok.ok, true, ok.output)
+  assert.match(ok.output, new RegExp(reason), '成功文案必须说明为什么不是终端窗口')
+  assert.match(ok.output, /启动方式：后台/)
+
+  let clock2 = 0
+  const failed = await env.startEnvironment('whybg', {
+    mode: 'terminal', port: 4751, readyTimeoutMs: 200,
+    launch: async (spec) => (spec.mode === 'terminal'
+      ? { ok: true, mode: 'terminal', terminal: 'wt', detail: 'terminal' }
+      : { ok: true, mode: 'background', detail: '已在后台启动（' + reason + '）', reason }),
+    probe: async () => null,
+    sleep: async () => {}, now: () => (clock2 += 100),
+  })
+  assert.equal(failed.code, 'timeout')
+  assert.match(failed.output, new RegExp(reason))
+})
+
+test('N-01: .cmd shim 用显式 cmd + 参数白名单，不再 shell:true 拼接', () => {
+  const spec = {
+    profile: 'demo', port: 3599, mode: 'background', command: 'dsh.cmd',
+    args: ['--profile', 'demo', '--port', '3599', '--no-open'], entry: null, shell: true,
+    dir: 'C:\\Users\\me\\.dsh\\profiles\\demo', display: 'dsh.cmd --profile demo --port 3599 --no-open',
+  }
+  const invocation = env.windowsShimInvocation(spec)
+  assert.equal(invocation.command, process.env.ComSpec ?? 'cmd.exe', '显式 cmd，不是 shell:true')
+  assert.deepEqual([...invocation.args], ['/d', '/s', '/c', 'dsh.cmd', '--profile', 'demo', '--port', '3599', '--no-open'])
+  const hostile = { ...spec, args: [...spec.args, '--patch', 'C:\\Program Files\\x.yml'] }
+  assert.throws(() => env.windowsShimInvocation(hostile), /不安全字符/)
+  assert.throws(() => env.windowsTerminalInvocation(hostile), /不安全字符/)
+})
+
+test('N-04: 日志尾巴的乱码如实标注，不冒充可读信息', async () => {
+  makeEnv('encoding', { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'] })
+  const logDir = join(PROFILES, 'encoding', '.plugin-manager', 'logs')
+  mkdirSync(logDir, { recursive: true })
+  const logPath = join(logDir, 'start-gbk.log')
+  writeFileSync(logPath, Buffer.concat([
+    Buffer.from([0xCF, 0xB5, 0xCD, 0xB3, 0xD5, 0xD2, 0xB2, 0xBB, 0xB5, 0xBD, 0xD6, 0xB8, 0xB6, 0xA8, 0xB5, 0xC4, 0xC2, 0xB7, 0xBE, 0xB6, 0xA1, 0xA3]),
+    Buffer.from('\n\u0007dsh web: http://127.0.0.1:4700/?token=abc-DEF_123\n'),
+  ]))
+  let clock = 0
+  const result = await env.startEnvironment('encoding', {
+    mode: 'background', port: 4760, readyTimeoutMs: 400,
+    launch: async () => ({ ok: true, mode: 'background', logPath }),
+    probe: async () => 404, sleep: async () => {}, now: () => (clock += 200),
+  })
+  assert.equal(result.code, 'timeout')
+  assert.match(result.output, /无法按 UTF-8 解码/, '必须如实标注系统文本的编码问题')
+  assert.doesNotMatch(result.output, /\u0007/, '控制字符不得进用户文案')
+  assert.doesNotMatch(result.output, /abc-DEF_123/, 'token 仍然必须脱敏')
+  assert.match(result.output, /token=\*\*\*/)
+})

@@ -146,11 +146,22 @@ test('W-08: Windows 终端窗口用 argv 形态（wt），不再把裸拼接的�
   assert.equal(invocation.args.includes(spec.display), false, '不得把裸拼接的 display 当成一条命令')
   assert.equal(invocation.args[2], 'C:\\Program Files\\nodejs\\node.exe', '含空格的路径必须是独立的一段')
 
-  // .cmd shim：交给 cmd.exe，但同样是 argv 形态（不是一条字符串）
-  const shim = env.windowsTerminalInvocation({ ...spec, command: 'dsh.cmd', shell: true })
+  // .cmd shim：交给 cmd.exe，但同样是 argv 形态（不是一条字符串）。
+  // 注意（N-01 之后）：经 cmd 的参数必须先过白名单 —— 含空格的路径会被**明确拒绝**，
+  // 而不是像旧行为那样被 cmd 静默拆成两个 argv。所以这里用合法参数集。
+  const shimSpec = {
+    ...spec, command: 'dsh.cmd', shell: true,
+    args: ['--profile', 'demo', '--port', '3590', '--no-open'],
+  }
+  const shim = env.windowsTerminalInvocation(shimSpec)
   assert.equal(shim.args[2], 'cmd.exe')
-  assert.deepEqual(shim.args.slice(3, 6), ['/d', '/s', '/c'])
+  assert.deepEqual(shim.args.slice(3, 6), ['/d', '/s', '/c'], '显式 cmd /d /s /c，不是 shell:true 拼接')
   assert.equal(shim.args[6], 'dsh.cmd')
+  // 含空格参数：终端路径同样拒绝（审计 N-01 实测的 C:\\Program Files\\x.yml 场景）
+  assert.throws(
+    () => env.windowsTerminalInvocation({ ...shimSpec, args: [...shimSpec.args, '--patch', 'C:\\Program Files\\x.yml'] }),
+    /不安全字符/,
+  )
 })
 
 test('W-09: 终端窗口没起来时回退后台重试，并如实说明（不是 30s 后报「已启动」）', async () => {
