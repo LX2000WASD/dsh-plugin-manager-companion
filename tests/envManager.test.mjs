@@ -847,6 +847,154 @@ test('W-04/W-05: 读取器不再把失败折叠成空表，且没有 -match 预�
 })
 
 // ── task-50 试装引擎（第一段：命名 / 指纹 / 三态判定 / 结论映射）──────────────
+// ── task-50 第二段：快照物化 / 删除纪律 / 清理计划 ──────────────────────────
+test('四步编排：基线坏不赖候选包 / 候选坏给根因 / 无法试装不算通过（结论带构建指纹）', async () => {
+  makeEnv('trial-src', { bundles: ['@deepseek-ai/dsh-base'] })
+  const build = env.buildIdentity()
+  const mounted = async () => ({ verdict: { kind: 'mounted' }, elapsedMs: 1, stderr: '', exitCode: 1, build })
+  const failed = async () => ({ verdict: { kind: 'failed', reason: 'boom', chain: ['Error: boom'] }, elapsedMs: 1, stderr: 'x', exitCode: 1, build })
+  const runnerOk = async () => ({ exitCode: 0, output: 'ok', truncated: false, logPath: '/dev/null' })
+  const runnerFail = async () => ({ exitCode: 1, output: 'ERR_PNPM_NO_OFFLINE_TARBALL 冷包', truncated: false, logPath: '/dev/null' })
+  const base = { installAnchor: '/anchor/package.json', depth: 'shallow', runCommand: runnerOk }
+
+  // ① 基线坏：不许赖候选包，且不该继续装
+  const broken = await env.runTrialInstall('@fake/pkg', 'trial-src', { ...base, verify: failed })
+  assert.equal(broken.conclusion, 'baseline-broken')
+  assert.match(broken.output, /不是 @fake\/pkg 的问题/)
+  assert.equal(broken.baseline.kind, 'failed')
+  assert.equal(broken.candidate, null, '基线坏就不应该继续走到装候选包')
+
+  // ② 候选坏：基线好、装完坏 → 给根因链
+  let calls = 0
+  const secondCallFails = async () => (++calls === 1 ? mounted() : failed())
+  const candidate = await env.runTrialInstall('@fake/pkg', 'trial-src', { ...base, verify: secondCallFails })
+  assert.equal(candidate.conclusion, 'candidate-broken')
+  assert.match(candidate.output, /候选包导致挂载失败/)
+  assert.match(candidate.output, /Error: boom/)
+
+  // ③ 无法试装：禁用联网 + 冷包 → 明确失败，且不算通过
+  calls = 0
+  const cannot = await env.runTrialInstall('@fake/pkg', 'trial-src', {
+    ...base, verify: mounted, allowNetwork: false, runCommand: runnerFail,
+  })
+  assert.equal(cannot.conclusion, 'cannot-trial')
+  assert.match(cannot.output, /已禁用联网/)
+  assert.match(cannot.output, /不等于通过/)
+
+  // ④ 通过：结论要钉在具体构建上（CODE-POLICY §7.8）
+  calls = 0
+  const passed = await env.runTrialInstall('@fake/pkg', 'trial-src', { ...base, verify: mounted })
+  assert.equal(passed.conclusion, 'passed')
+  assert.match(passed.output, /构建：/)
+  assert.match(String(passed.build.artifactMd5), /^[0-9a-f]{32}$/, '产物 md5 必须带上')
+  assert.match(String(passed.build.artifactMtime), /^\d{4}-\d{2}-\d{2}T/, '产物 mtime 必须带上')
+  assert.match(passed.output, new RegExp('源环境指纹：' + passed.sourceFingerprint.hash.slice(0, 8)))
+})
+
+test('快照深度自动判定复用同一套事实：锚点能解析=浅，profile 自装=全', () => {
+  const dir = makeEnv('depth-src', { bundles: ['@fake/anchor-bundle'] })
+  // 锚点里能解析到 → 浅快照够用
+  const anchorRoot = join(HOME, 'anchor')
+  mkdirSync(join(anchorRoot, 'node_modules', '@fake', 'anchor-bundle'), { recursive: true })
+  writeFileSync(join(anchorRoot, 'package.json'), '{"name":"anchor"}')
+  writeFileSync(join(anchorRoot, 'node_modules', '@fake', 'anchor-bundle', 'package.json'), '{"name":"@fake/anchor-bundle"}')
+  const anchor = join(anchorRoot, 'package.json')
+  assert.equal(env.snapshotDepthFor(dir, ['@fake/anchor-bundle'], anchor), 'shallow')
+  // profile 自己装了这一层（node_modules 里有）→ 必须全量
+  mkdirSync(join(dir, 'node_modules', '@fake', 'anchor-bundle'), { recursive: true })
+  writeFileSync(join(dir, 'node_modules', '@fake', 'anchor-bundle', 'package.json'), '{"name":"@fake/anchor-bundle"}')
+  assert.equal(env.snapshotDepthFor(dir, ['@fake/anchor-bundle'], anchor), 'full', 'profile 自装的层浅快照复现不出来')
+  // 拿不到锚点 / 解析不到 → 保守全量
+  assert.equal(env.snapshotDepthFor(dir, ['@fake/nothing-here'], undefined), 'full')
+  assert.equal(env.snapshotDepthFor(dir, ['@fake/nothing-here'], anchor), 'full')
+})
+
+test('浅快照只复制清单文件；全量快照走官方 pnpm 通道（绝不自己调 pnpm）', async () => {
+  const src = makeEnv('snap-src', { bundles: ['@deepseek-ai/dsh-base'] })
+  writeFileSync(join(src, 'cordis.yml'), '# root\n')
+  writeFileSync(join(src, 'pnpm-workspace.yaml'), 'packages:\n  - .\n')
+  const created = await env.createTrialEnvironment('snap-src', { materialize: false })
+  assert.equal(created.ok, true, created.output)
+  const target = env.trialEnvironmentName('snap-src')
+  assert.equal(existsSync(join(PROFILES, target, 'package.json')), true, '测试环境由官方 initProfile 建好')
+
+  const shallow = await env.materializeSnapshot('snap-src', target, { depth: 'shallow' })
+  assert.equal(shallow.depth, 'shallow')
+  assert.equal(shallow.installed, false)
+  assert.ok(shallow.copied.includes('package.json'))
+  assert.equal(existsSync(join(PROFILES, target, 'cordis.yml')), true, '清单文件要复制过去')
+  assert.equal(readFileSync(join(PROFILES, target, 'cordis.yml'), 'utf8'), '# root\n')
+
+  // 全量：必须走官方通道，调用形状是 ['install','--prefer-offline']
+  const calls = []
+  const full = await env.materializeSnapshot('snap-src', target, {
+    depth: 'full', installAnchor: '/anchor/package.json',
+    runCommand: async (context, args) => { calls.push({ profile: context.profile, dir: context.dir, args }); return { exitCode: 0, output: 'ok', truncated: false, logPath: '/dev/null' } },
+  })
+  assert.equal(full.depth, 'full')
+  assert.equal(full.installed, true)
+  assert.deepEqual(calls.map((call) => call.profile), [target], '在测试环境里装，不是真实环境')
+  assert.deepEqual([...calls[0].args], ['install', '--prefer-offline'])
+  // 拿不到官方通道 → 如实失败（不许静默当成功）
+  await assert.rejects(
+    () => env.materializeSnapshot('snap-src', target, { depth: 'full' }),
+    (error) => error.code === 'no-profile-context',
+  )
+})
+
+test('测试环境删除三重纪律：非测试名/未知状态/运行中都不许删', async () => {
+  const dir = makeEnv('trial-strict-dpmc')
+  const notTrial = await env.removeTrialEnvironment('trial-strict', { current: null })
+  assert.equal(notTrial.code, 'invalid-name', '真实环境不能走测试环境删除路径')
+
+  const unknownFacts = await withPlatformAsync('win32', () => env.processFacts({ fresh: true }))
+  const unknown = await env.removeTrialEnvironment('trial-strict-dpmc', { current: null, facts: unknownFacts })
+  assert.equal(unknown.code, 'facts-unavailable', '进程事实不可读时未知状态下绝不动磁盘')
+  assert.equal(existsSync(join(dir, 'package.json')), true)
+
+  const runningFacts = { runs: new Map([['trial-strict-dpmc', [{ pid: 4242, port: null, command: 'x' }]]]), readable: true }
+  const running = await env.removeTrialEnvironment('trial-strict-dpmc', { current: null, facts: runningFacts })
+  assert.equal(running.code, 'running', '运行中先拒，不做隐式停止')
+  assert.equal(existsSync(join(dir, 'package.json')), true)
+
+  const idle = await env.removeTrialEnvironment('trial-strict-dpmc', { current: null, facts: { runs: new Map(), readable: true } })
+  assert.equal(idle.ok, true, idle.output)
+  assert.equal(existsSync(dir), false)
+})
+
+test('清理计划：按保留期删、运行中永不删、关闭自动清理时只列不删', () => {
+  const now = 1_000_000_000_000
+  const day = 86_400_000
+  const candidates = [
+    { name: 'fresh-dpmc', owner: 'fresh', modifiedAt: now - day, running: false },
+    { name: 'old-dpmc', owner: 'old', modifiedAt: now - 20 * day, running: false },
+    { name: 'busy-dpmc', owner: 'busy', modifiedAt: now - 20 * day, running: true },
+    { name: 'orphan-dpmc', owner: 'gone', modifiedAt: now - 30 * day, running: false },
+  ]
+  const plan = env.planTrialCleanup(candidates, { now })
+  assert.deepEqual(plan.remove.map((entry) => entry.name).sort(), ['old-dpmc', 'orphan-dpmc'], '孤儿一样纳入清理')
+  assert.ok(plan.remove.every((entry) => entry.reason.includes('超过保留期')), '删除原因要写清楚')
+  const keepNames = plan.keep.map((entry) => entry.name).sort()
+  assert.deepEqual(keepNames, ['busy-dpmc', 'fresh-dpmc'])
+  assert.match(plan.keep.find((entry) => entry.name === 'busy-dpmc').reason, /正在运行/)
+
+  const disabled = env.planTrialCleanup(candidates, { now, retainDays: null })
+  assert.deepEqual(disabled.remove, [], '关掉自动清理就什么都不删')
+  assert.equal(disabled.keep.length, 4)
+
+  const custom = env.planTrialCleanup(candidates, { now, retainDays: 0 })
+  assert.equal(custom.remove.length, 3, '保留 0 天 = 除了在跑的全删')
+})
+
+test('进程事实不可读时，清理按最保守处理：候选标成运行中（不删）', () => {
+  const facts = { runs: new Map(), readable: false, reason: 'powershell 不可用' }
+  const listed = env.listTrialEnvironments({ facts })
+  assert.equal(listed.factsReadable, false)
+  for (const candidate of listed.candidates) {
+    assert.equal(candidate.running, true, '读不到就不能声称「没在跑」——最保守是当成在跑')
+  }
+})
+
 test('试装环境命名与归属：<真实名>-dpmc，且只认这一个形态', () => {
   assert.equal(env.trialEnvironmentName('web'), 'web-dpmc')
   assert.equal(env.trialEnvironmentName('pm-test'), 'pm-test-dpmc')

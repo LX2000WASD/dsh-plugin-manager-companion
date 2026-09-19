@@ -27,10 +27,12 @@
 import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import {
-  accessSync, closeSync, constants, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync,
+  accessSync, appendFileSync, closeSync, constants, copyFileSync, existsSync, mkdirSync, openSync, readdirSync,
+  readFileSync, renameSync,
   rmSync, statSync,
 } from 'node:fs'
 import { createHash } from 'node:crypto'
+import { fileURLToPath } from 'node:url'
 import { request as httpRequest } from 'node:http'
 import { connect, createServer } from 'node:net'
 import { basename, delimiter, dirname, isAbsolute, join, resolve } from 'node:path'
@@ -2313,6 +2315,648 @@ export function judgeTrialOutcome(
   if (candidate.kind === 'failed') return 'candidate-broken'
   if (candidate.kind === 'undetermined') return 'cannot-trial'
   return 'passed'
+}
+/** 快照深度（§5.2/§5.3）：自动判定，可强制。 */
+export type SnapshotDepth = 'shallow' | 'full'
+
+/**
+ * 自动判定快照深度：层栈是否**全部由安装锚点提供**。
+ *
+ * 判据复用同一套事实（与指纹的 bundlesSource 同源：都是「层从哪里来」），不另起一套：
+ *   · 某一层出现在 <dir>/node_modules 里 → 它是 profile 自己装的（第三方 bundle），
+ *     浅快照（只复制清单）复现不出来 → full；
+ *   · 否则试官方解析 resolveBundleDir：能从安装锚点解析到 → 浅快照够用 → shallow。
+ * 拿不到锚点、或解析失败 → 一律 full（写多不写少）。
+ *
+ * @param dir - 真实环境目录。
+ * @param bundles - 该环境的层栈。
+ * @param installAnchor - 官方安装锚点（package.json 路径）。
+ * @returns 深度。
+ */
+export function snapshotDepthFor(
+  dir: string, bundles: readonly string[], installAnchor?: string,
+): SnapshotDepth {
+  if (installAnchor === undefined || installAnchor.length === 0) return 'full'
+  for (const name of bundles) {
+    if (existsSync(join(dir, 'node_modules', name, 'package.json'))) return 'full'
+    try {
+      resolveBundleDir(OUR_PACKAGE_NAME, name, installAnchor, dir)
+    } catch {
+      return 'full'
+    }
+  }
+  return 'shallow'
+}
+
+/** 快照物化的结果。 */
+export interface SnapshotMaterialization {
+  readonly depth: SnapshotDepth
+  /** 从真实环境复制过来的文件名。 */
+  readonly copied: readonly string[]
+  /** 是否跑了官方 pnpm 通道（full 深度时）。 */
+  readonly installed: boolean
+  /** 面向用户的说明。 */
+  readonly output: string
+}
+
+/** 浅快照复制的文件（§5.2 实测：新建 profile 只有前三个，没有 node_modules）。 */
+const SNAPSHOT_FILES = ['package.json', 'cordis.yml', 'cordis.patch.yml', 'pnpm-workspace.yaml', 'pnpm-lock.yaml'] as const
+
+/** materializeSnapshot 的选项。 */
+export interface MaterializeSnapshotOptions extends CrossEnvironmentOptions {
+  /** 强制深度；省略 = 自动判定。 */
+  readonly depth?: SnapshotDepth
+  /** 层栈来源（官方 listBundles()）；拿不到就用源环境的清单，够自动判定用。 */
+  readonly bundlesOf?: (name: string) => Promise<readonly string[]>
+}
+
+/**
+ * 把真实环境物化成测试环境（§5.4 同步原则：不订阅变化，用时即时物化）。
+ *
+ * 浅快照只复制清单文件；full 深度再走**官方 runPluginCommand** 装依赖（绝不自己调 pnpm 二进制）。
+ * 官方通道不可用或失败时如实抛出 —— 调用方据此报「无法试装」，不许静默当成功。
+ *
+ * @param sourceName - 真实环境名。
+ * @param targetName - 测试环境名（应等于 trialEnvironmentName(sourceName)）。
+ * @param options - 深度、层栈来源与官方通道注入。
+ * @returns 物化结果。
+ */
+export async function materializeSnapshot(
+  sourceName: string, targetName: string, options: MaterializeSnapshotOptions = {},
+): Promise<SnapshotMaterialization> {
+  const sourceDir = environmentDir(sourceName)
+  const targetDir = environmentDir(targetName)
+  if (!existsSync(join(targetDir, 'package.json'))) {
+    throw new EnvironmentError('not-found', '测试环境不存在：' + targetName + '（先 createTrialEnvironment）')
+  }
+  const manifest = readEnvironmentManifest(sourceDir)
+  const bundles = options.bundlesOf === undefined ? manifest.bundles : await options.bundlesOf(sourceName)
+  const anchor = options.installAnchor ?? profileContextOf(options.ctx)?.installAnchor
+  const depth = options.depth ?? snapshotDepthFor(sourceDir, bundles, anchor)
+
+  const copied: string[] = []
+  for (const file of SNAPSHOT_FILES) {
+    const from = join(sourceDir, file)
+    if (!existsSync(from)) continue
+    copyFileSync(from, join(targetDir, file))
+    copied.push(file)
+  }
+
+  if (depth === 'shallow') {
+    return {
+      depth, copied, installed: false,
+      output: '已物化浅快照（' + copied.join(', ') + '）：层栈全部由安装锚点提供，不需要装依赖',
+    }
+  }
+  let runner: PluginCommandRunner
+  let context: PackageOperationContext
+  try {
+    context = operationContext(targetName, targetDir, targetDir, options)
+    runner = await officialRunner(options)
+  } catch (error) {
+    throw new EnvironmentError(
+      error instanceof EnvironmentError ? error.code : 'official-unavailable',
+      '真实快照需要官方 pnpm 通道，但不可用：' + messageOf(error),
+    )
+  }
+  const result = await runPackageOperation(runner, context, ['install', '--prefer-offline'], options)
+  if (result.exitCode !== 0) {
+    throw new EnvironmentError('package-operation-failed',
+      '真实快照的官方安装失败（exitCode=' + String(result.exitCode) + '）：' + result.output.trim().slice(-500))
+  }
+  return {
+    depth, copied, installed: true,
+    output: '已物化真实快照（复制 ' + copied.join(', ') + '；官方 install --prefer-offline 成功）',
+  }
+}
+
+/** createTrialEnvironment 的选项。 */
+export interface CreateTrialEnvironmentOptions {
+  /** 建立后是否立即物化快照（默认 true）。 */
+  readonly materialize?: boolean
+  /** 物化选项。 */
+  readonly snapshot?: MaterializeSnapshotOptions
+}
+
+/**
+ * 建立/复用某个真实环境的测试环境（§5.4：一个真实环境一个测试环境）。
+ *
+ * @param realName - 真实环境名。
+ * @param options - 物化选项。
+ * @returns 结果（output 含快照深度与文件清单）。
+ */
+export async function createTrialEnvironment(
+  realName: string, options: CreateTrialEnvironmentOptions = {},
+): Promise<EnvironmentResult> {
+  const problem = environmentNameProblem(realName)
+  if (problem !== null) return failure('invalid-name', problem)
+  if (isTrialEnvironmentName(realName)) {
+    return failure('invalid-name', realName + ' 本身就是测试环境名，不能再建一层')
+  }
+  const target = trialEnvironmentName(realName)
+  const exists = existsSync(join(environmentDir(target), 'package.json'))
+  const created = exists ? success('测试环境已存在：' + target) : await createEnvironment(target, 'headless')
+  if (!created.ok) return created
+  if (options.materialize === false) return success(created.output + '\n（未物化快照）')
+  try {
+    const snapshot = await materializeSnapshot(realName, target, options.snapshot ?? {})
+    return success(created.output + '\n' + snapshot.output)
+  } catch (error) {
+    return failure(error instanceof EnvironmentError ? error.code : 'io-failed',
+      '测试环境已建立但物化快照失败：' + messageOf(error))
+  }
+}
+/** removeTrialEnvironment 的选项。 */
+export interface RemoveTrialEnvironmentOptions extends CurrentEnvironmentOptions {
+  /** 注入进程事实（测试）；省略时自行读取（fresh）。 */
+  readonly facts?: ProcessFacts
+}
+
+/**
+ * 删除一个测试环境（§5.4：**删除必须安全**）。
+ *
+ * 三重纪律：
+ *  1. 只删形如 <真实名>-dpmc 的环境（裸后缀不算：没有归属的目录不能进删除路径）；
+ *  2. 运行中先拒 —— 不做「先停后删」的隐式动作，停是用户的显式决定；
+ *  3. 进程事实不可读 → 拒绝（**未知状态下绝不动磁盘**，与 stop/remove 同一条纪律）。
+ * 孤儿（真实环境已改名或删除）**可以删**：归属核对的是「名字形态 + 这是我们建的测试环境」，
+ * 不是「真实环境还在」。
+ *
+ * @param name - 测试环境名。
+ * @param options - 当前环境事实与进程事实注入。
+ * @returns 操作结果。
+ */
+export async function removeTrialEnvironment(
+  name: string, options: RemoveTrialEnvironmentOptions = {},
+): Promise<EnvironmentResult> {
+  const problem = environmentNameProblem(name)
+  if (problem !== null) return failure('invalid-name', problem)
+  if (!isTrialEnvironmentName(name)) {
+    return failure('invalid-name', name + ' 不是测试环境名（必须是 <真实环境名>' + TRIAL_ENVIRONMENT_SUFFIX + '）')
+  }
+  const dir = environmentDir(name)
+  if (!existsSync(dir)) return failure('not-found', '测试环境不存在：' + name)
+  const current = resolveCurrent(options)
+  if (sameEnvironment(current, name)) {
+    return failure('current', name + ' 是当前正在运行的环境，不能删除（要删请先停止本进程）')
+  }
+  const facts = options.facts ?? processFacts({ fresh: true })
+  if (!facts.readable) {
+    return failure('facts-unavailable', name + ' 的运行状态未知：进程事实读不到（'
+      + String(facts.reason) + '）。拒绝在未知状态下删除测试环境。')
+  }
+  const busy = runsForName(facts.runs, name)
+  if (busy.length > 0) {
+    return failure('running', name + ' 正在运行（pid ' + busy.map((run) => run.pid).join(', ')
+      + '），请先停止再删除测试环境')
+  }
+  return enqueueMutation(async () => {
+    try {
+      await retryFs(() => rmSync(dir, { recursive: true, force: true }))
+    } catch (error) {
+      return failure('io-failed', '删除测试环境失败 ' + name + '：' + messageOf(error))
+    }
+    resetRunCache()
+    return success('已删除测试环境 ' + name)
+  })
+}
+
+/** 清理候选：全部读盘得来（mtime 取目录自身）。 */
+export interface TrialCleanupCandidate {
+  readonly name: string
+  /** 归属的真实环境名（名字形态推出）。 */
+  readonly owner: string
+  /** 目录 mtime（毫秒）。 */
+  readonly modifiedAt: number
+  readonly running: boolean
+}
+
+/** 默认保留天数（§5.3：默认开 / 14 天，可关可配）。 */
+export const DEFAULT_TRIAL_RETENTION_DAYS = 14
+
+/** planTrialCleanup 的选项。 */
+export interface TrialCleanupPlanOptions {
+  /** 当前时间（毫秒）；注入供测试。 */
+  readonly now?: number
+  /** 保留天数；null 表示用户关掉了自动清理。 */
+  readonly retainDays?: number | null
+}
+
+/** 一份清理计划：删什么、留什么，各自带原因。 */
+export interface TrialCleanupPlan {
+  readonly remove: readonly { readonly name: string; readonly reason: string }[]
+  readonly keep: readonly { readonly name: string; readonly reason: string }[]
+}
+
+/**
+ * 算一份测试环境清理计划（纯函数，便于正反用例测试）。
+ *
+ * 只按「到没到保留期」与「是否在跑」两个事实判；运行中的永远保留（删除安全优先）。
+ * `retainDays: null` = 用户关掉了自动清理：什么都不删，但仍把候选列出来给界面显示。
+ *
+ * @param candidates - 候选（读盘事实）。
+ * @param options - 时间与保留期。
+ * @returns 计划。
+ */
+export function planTrialCleanup(
+  candidates: readonly TrialCleanupCandidate[], options: TrialCleanupPlanOptions = {},
+): TrialCleanupPlan {
+  const now = options.now ?? Date.now()
+  const retainDays = options.retainDays === undefined ? DEFAULT_TRIAL_RETENTION_DAYS : options.retainDays
+  const remove: { name: string; reason: string }[] = []
+  const keep: { name: string; reason: string }[] = []
+  for (const candidate of candidates) {
+    if (candidate.running) {
+      keep.push({ name: candidate.name, reason: '正在运行：不删（先让用户停）' })
+      continue
+    }
+    if (retainDays === null) {
+      keep.push({ name: candidate.name, reason: '自动清理已关闭' })
+      continue
+    }
+    const ageDays = (now - candidate.modifiedAt) / 86_400_000
+    if (ageDays < retainDays) {
+      keep.push({ name: candidate.name, reason: '未到保留期（' + ageDays.toFixed(1) + ' 天 < ' + String(retainDays) + ' 天）' })
+      continue
+    }
+    remove.push({ name: candidate.name, reason: '超过保留期 ' + String(retainDays) + ' 天（' + ageDays.toFixed(1) + ' 天）' })
+  }
+  return { remove, keep }
+}
+
+/**
+ * 列出所有测试环境候选（读盘；进程事实不可读时按「未知」处理 → 全部保留）。
+ *
+ * @param options - 进程事实注入（测试）。
+ * @returns 候选列表与进程事实的可读性。
+ */
+export function listTrialEnvironments(
+  options: { readonly facts?: ProcessFacts } = {},
+): { readonly candidates: readonly TrialCleanupCandidate[]; readonly factsReadable: boolean; readonly reason?: string } {
+  const facts = options.facts ?? processFacts()
+  const candidates: TrialCleanupCandidate[] = []
+  let names: string[]
+  try {
+    names = readdirSync(profilesRoot())
+  } catch {
+    return { candidates, factsReadable: facts.readable, ...facts.reason === undefined ? {} : { reason: facts.reason } }
+  }
+  for (const name of names) {
+    if (!isTrialEnvironmentName(name)) continue
+    const dir = environmentDir(name)
+    let modifiedAt = 0
+    try {
+      modifiedAt = statSync(dir).mtimeMs
+    } catch {
+      continue
+    }
+    candidates.push({
+      name,
+      owner: trialEnvironmentOwner(name) ?? '',
+      modifiedAt,
+      // 事实不可读时不能声称「没在跑」：按最保守处理，标成 running 让清理计划保留它。
+      running: facts.readable ? runsForName(facts.runs, name).length > 0 : true,
+    })
+  }
+  return { candidates, factsReadable: facts.readable, ...facts.reason === undefined ? {} : { reason: facts.reason } }
+}
+
+/**
+ * 执行清理（§5.4：删除动作**记日志**）。
+ *
+ * @param options - 计划选项 + 日志回调。
+ * @returns 结果（删了哪些、留了哪些）。
+ */
+export async function cleanupTrialEnvironments(options: TrialCleanupPlanOptions & {
+  readonly facts?: ProcessFacts
+  readonly log?: (line: string) => void
+} = {}): Promise<EnvironmentResult & { readonly removed: readonly string[] }> {
+  const listed = listTrialEnvironments(options)
+  const plan = planTrialCleanup(listed.candidates, options)
+  const logLine = (line: string): void => {
+    options.log?.(line)
+    try {
+      appendFileSync(join(dshHome(), 'dpmc-trial-cleanup.log'),
+        new Date().toISOString() + ' ' + line + '\n', { mode: 0o600 })
+    } catch {
+      // 日志失败不阻断清理：删除本身已受三重纪律保护。
+    }
+  }
+  const removed: string[] = []
+  const failures: string[] = []
+  for (const entry of plan.remove) {
+    const result = await removeTrialEnvironment(entry.name, { facts: options.facts })
+    if (result.ok) {
+      removed.push(entry.name)
+      logLine('removed ' + entry.name + '：' + entry.reason)
+    } else {
+      failures.push(entry.name + '（' + String(result.code) + '）')
+      logLine('kept ' + entry.name + '：删除被拒（' + String(result.code) + '）')
+    }
+  }
+  const lines = ['测试环境清理：删除 ' + String(removed.length) + ' 个'
+    + (removed.length === 0 ? '' : '（' + removed.join(', ') + '）')
+    + '，保留 ' + String(plan.keep.length + failures.length) + ' 个']
+  if (failures.length > 0) lines.push('删除被拒：' + failures.join('；'))
+  lines.push('保留明细：' + plan.keep.map((entry) => entry.name + '（' + entry.reason + '）').join('；'))
+  return { ok: failures.length === 0, output: lines.join('\n'), removed }
+}
+
+// ── 试装：无头验证与四步编排 ──────────────────────────────────────────────
+
+/**
+ * 构建指纹（CODE-POLICY §7.8 / DEVELOPMENT §87）：真机结论必须钉在一次具体构建上。
+ *
+ * 产物 md5 取本模块被打进的那份文件（安装到用户环境里也能算），git HEAD 只在能读到仓库时带上，
+ * 读不到就 null —— 如实标「不知道这份构建对应哪个 commit」，不编。
+ */
+export interface BuildIdentity {
+  /** 本模块产物的 md5（dist/<file>.js）。 */
+  readonly artifactMd5: string | null
+  /** 产物文件 mtime（ISO）。 */
+  readonly artifactMtime: string | null
+  /** git HEAD；读不到仓库时为 null。 */
+  readonly gitHead: string | null
+}
+
+/**
+ * 算当前构建的指纹。
+ *
+ * @returns 构建指纹。
+ */
+export function buildIdentity(): BuildIdentity {
+  let artifactMd5: string | null = null
+  let artifactMtime: string | null = null
+  let here: string | null = null
+  try {
+    here = fileURLToPath(import.meta.url)
+    artifactMd5 = createHash('md5').update(readFileSync(here)).digest('hex')
+    artifactMtime = new Date(statSync(here).mtimeMs).toISOString()
+  } catch {
+    // 读不到自己的产物（极少见）：如实 null。
+  }
+  let gitHead: string | null = null
+  if (here !== null) {
+    let dir = dirname(here)
+    for (let depth = 0; depth < 6 && gitHead === null; depth += 1) {
+      try {
+        const head = readFileSync(join(dir, '.git', 'HEAD'), 'utf8').trim()
+        const ref = /^ref:\s*(.+)$/.exec(head)
+        gitHead = ref === null
+          ? head.slice(0, 40)
+          : readFileSync(join(dir, '.git', ref[1]!), 'utf8').trim().slice(0, 40)
+      } catch {
+        dir = dirname(dir)
+      }
+    }
+  }
+  return { artifactMd5, artifactMtime, gitHead }
+}
+
+/** 一次无头验证的结果（判定 + 证据）。 */
+export interface BootVerification {
+  readonly verdict: BootVerdict
+  /** 实测耗时（毫秒）。 */
+  readonly elapsedMs: number
+  /** 子进程 stderr 原文（截断到 8KiB，供展示与判定复核）。 */
+  readonly stderr: string
+  /** 退出码；**仅供展示与排查，不参与判定**（§5.2）。 */
+  readonly exitCode: number | null
+  /** 本次验证所在的构建指纹。 */
+  readonly build: BuildIdentity
+}
+
+/** runHeadlessVerification 的选项。 */
+export interface HeadlessVerificationOptions {
+  /** 超时上限；默认 30s。
+   */
+  readonly timeoutMs?: number
+  /** 启动器注入（测试）：返回 {stderr, exitCode}；省略时真起进程。 */
+  readonly run?: (name: string) => Promise<{ readonly stderr: string; readonly exitCode: number | null }>
+}
+
+/**
+ * 无头验证一个环境（§5.2 的形态，不得偏离）。
+ *
+ * 形态：`<dsh> --profile <name>`，**不给任何任务文本**（给了就是真跑一轮 agent，花用户的钱），
+ * stdin=/dev/null，捕获 stderr；判定只读 stderr 特征（退出码不参与）。
+ *
+ * @param name - 环境名。
+ * @param options - 超时与启动器注入。
+ * @returns 验证结果。
+ */
+export async function runHeadlessVerification(
+  name: string, options: HeadlessVerificationOptions = {},
+): Promise<BootVerification> {
+  const build = buildIdentity()
+  const started = Date.now()
+  const run = options.run ?? defaultHeadlessRun(options.timeoutMs ?? 30_000)
+  let stderr = ''
+  let exitCode: number | null = null
+  try {
+    const result = await run(name)
+    stderr = result.stderr
+    exitCode = result.exitCode
+  } catch (error) {
+    return {
+      verdict: { kind: 'undetermined', reason: '启动失败：' + messageOf(error) },
+      elapsedMs: Date.now() - started, stderr: '', exitCode: null, build,
+    }
+  }
+  return { verdict: judgeBootStderr(stderr), elapsedMs: Date.now() - started, stderr: stderr.slice(-8192), exitCode, build }
+}
+
+/**
+ * 默认启动器：真起一个 headless 实例并读它的 stderr。
+ *
+ * @param timeoutMs - 超时上限（超时杀掉 → 无法判定，不许当成功）。
+ * @returns 启动函数。
+ */
+function defaultHeadlessRun(timeoutMs: number) {
+  return async (name: string): Promise<{ readonly stderr: string; readonly exitCode: number | null }> => {
+    const entryPoint = dshEntryPoint()
+    // 只有 --profile：**绝不传任务文本**（§5.2）。
+    const args = [...entryPoint.args, '--profile', name]
+    const invocation = entryPoint.shell
+      ? windowsShimInvocation({ ...emptyLaunchSpec(name), command: entryPoint.command, args, shell: true })
+      : { command: entryPoint.command, args }
+    return await new Promise((done, fail) => {
+      const child = spawn(invocation.command, [...invocation.args], {
+        stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true,
+      })
+      let text = ''
+      let settled = false
+      const timer = setTimeout(() => {
+        if (settled) return
+        settled = true
+        try { child.kill('SIGKILL') } catch { /* 已退出 */ }
+        done({ stderr: text, exitCode: null })
+      }, timeoutMs)
+      child.stderr?.on('data', (chunk: Buffer) => { text += chunk.toString('utf8') })
+      child.once('error', (error) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        fail(error)
+      })
+      child.once('close', (code) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        done({ stderr: text, exitCode: code })
+      })
+    })
+  }
+}
+
+/** 一个只用来满足启动器签名的空壳（defaultHeadlessRun 只用到 name/命令）。 */
+function emptyLaunchSpec(name: string): LaunchSpec {
+  return {
+    profile: name, port: 0, mode: 'background', command: '', args: [], entry: null, shell: false,
+    dir: environmentDir(name), display: '',
+  }
+}
+/** runTrialInstall 的选项。 */
+export interface TrialInstallOptions extends MaterializeSnapshotOptions {
+  /** 官方层栈事实（算指纹用）；只在测当前环境时可用。 */
+  readonly listBundles?: () => Promise<readonly string[]>
+  /** 是否做基线启动（§5.2 四步的②）；默认 true —— 关掉省 ~558ms，但失败时说不清是谁的问题。 */
+  readonly baseline?: boolean
+  /** 是否允许联网拉取候选包（§5.3）；false 时只用本地 store，冷包直接判「无法试装」。 */
+  readonly allowNetwork?: boolean
+  /** 无头验证注入（测试）。 */
+  readonly verify?: (name: string) => Promise<BootVerification>
+  /** 时钟注入（测试）。 */
+  readonly now?: () => number
+}
+
+/** 试装结果：结论 + 证据 + 构建指纹（§7.8 真机结论必须钉在一次具体构建上）。 */
+export interface TrialInstallResult {
+  readonly conclusion: TrialConclusion
+  readonly output: string
+  /** 本次结论对应的构建（产物 md5 + mtime + 能读到时的 git HEAD）。 */
+  readonly build: BuildIdentity
+  /** 试装前的源环境指纹。 */
+  readonly sourceFingerprint: EnvironmentFingerprint
+  /** 试装后再算的源环境指纹（§5.4 第 4 步）。 */
+  readonly sourceFingerprintAfter: EnvironmentFingerprint | null
+  /** 试装期间源环境又变过（结论可能不适用）。 */
+  readonly changedDuringTrial: boolean
+  readonly baseline: BootVerdict | null
+  readonly candidate: BootVerdict | null
+  readonly elapsedMs: number
+}
+
+/**
+ * 受控对照四步（§5.2）：物化快照 → 基线启动 → 装候选包 → 二次启动。
+ *
+ * 缺一步结论就站不住，所以：基线失败一律报 baseline-broken（**不赖候选包**）；
+ * 装不上候选包报 cannot-trial（**不算通过**）；只有基线好、装完也好的才是 passed。
+ * 装候选包走**官方 runPluginCommand**（绝不自己调 pnpm）；allowNetwork=false 时加 --offline，
+ * 冷包失败如实报「无法试装」。
+ *
+ * @param spec - 候选包 spec。
+ * @param realName - 真实环境名（测试环境由它派生）。
+ * @param options - 四步选项与注入。
+ * @returns 结果（含证据与构建指纹）。
+ */
+export async function runTrialInstall(
+  spec: string, realName: string, options: TrialInstallOptions = {},
+): Promise<TrialInstallResult> {
+  const now = options.now ?? Date.now
+  const started = now()
+  const build = buildIdentity()
+  const sourceFingerprint = await environmentFingerprint(realName, {
+    ...options.listBundles === undefined ? {} : { listBundles: options.listBundles },
+  })
+  const target = trialEnvironmentName(realName)
+  const done = (conclusion: TrialConclusion, output: string, extra: Partial<TrialInstallResult> = {}) => ({
+    conclusion, output, build, sourceFingerprint, sourceFingerprintAfter: null,
+    changedDuringTrial: false, baseline: null, candidate: null, elapsedMs: now() - started, ...extra,
+  })
+
+  const verify = options.verify ?? ((name: string) => runHeadlessVerification(name))
+  const materialized = await createTrialEnvironment(realName, { snapshot: options })
+  if (!materialized.ok) {
+    return done('cannot-trial', '无法试装：测试环境没有物化成功（' + String(materialized.code) + '）。\n'
+      + materialized.output + '\n这**不等于通过**。')
+  }
+
+  let baseline: BootVerdict | null = null
+  if (options.baseline !== false) {
+    const verified = await verify(target)
+    baseline = verified.verdict
+    if (verified.verdict.kind !== 'mounted') {
+      const detail = verified.verdict.kind === 'failed'
+        ? '根因：' + verified.verdict.reason + '\n' + verified.verdict.chain.join('\n')
+        : '判不出来：' + verified.verdict.reason
+      return done('baseline-broken',
+        '快照基线本身就起不来 —— 这不是 ' + spec + ' 的问题，试装无法判断它。\n'
+        + detail + '\n（这条发现应当升级成一条诊断：真实环境 ' + realName + ' 的当前状态有问题。）\n'
+        + '构建：' + describeBuild(build), { baseline })
+    }
+  }
+
+  let runner: PluginCommandRunner
+  let context: PackageOperationContext
+  try {
+    context = operationContext(target, environmentDir(target), environmentDir(target), options)
+    runner = await officialRunner(options)
+  } catch (error) {
+    return done('cannot-trial', '无法试装：官方 pnpm 通道不可用（' + messageOf(error) + '）。这**不等于通过**。',
+      { baseline })
+  }
+  const installArgs = options.allowNetwork === false ? ['add', '--offline', spec] : ['add', spec]
+  const installed = await runPackageOperation(runner, context, installArgs, options)
+  if (installed.exitCode !== 0) {
+    const reason = options.allowNetwork === false
+      ? '已禁用联网，且本地 store 里没有这个包'
+      : '官方安装失败（exitCode=' + String(installed.exitCode) + '）'
+    return done('cannot-trial', '无法试装：' + reason + '。\n'
+      + installed.output.trim().slice(-800) + '\n这**不等于通过**。', { baseline })
+  }
+
+  const after = await verify(target)
+  const conclusion = judgeTrialOutcome(baseline, after.verdict)
+  const sourceFingerprintAfter = await environmentFingerprint(realName, {
+    ...options.listBundles === undefined ? {} : { listBundles: options.listBundles },
+  })
+  const changedDuringTrial = !sameFingerprint(sourceFingerprint, sourceFingerprintAfter)
+  const lines = [describeConclusion(conclusion, spec, target)
+    + '\n基线启动：' + (baseline === null ? '未做' : baseline.kind) + '｜候选启动：' + after.verdict.kind
+    + '（验证耗时 ' + String(after.elapsedMs) + 'ms）']
+  if (after.verdict.kind === 'failed') lines.push('根因链：\n' + after.verdict.chain.join('\n'))
+  if (after.verdict.kind === 'undetermined') lines.push('判不出来：' + after.verdict.reason)
+  lines.push('源环境指纹：' + sourceFingerprint.hash + '（试装前）')
+  if (changedDuringTrial) {
+    lines.push('注意：试装期间 ' + realName + ' 的环境又变过（指纹 ' + sourceFingerprintAfter.hash
+      + '），这个结论可能不适用。')
+  }
+  lines.push('构建：' + describeBuild(build))
+  return done(conclusion, lines.join('\n'), {
+    baseline, candidate: after.verdict, sourceFingerprintAfter, changedDuringTrial,
+  })
+}
+
+/** 构建指纹的一句话描述（放进结果里，事后能对上产物）。 */
+function describeBuild(build: BuildIdentity): string {
+  return (build.artifactMd5 === null ? 'md5 不可读' : 'md5=' + build.artifactMd5.slice(0, 12))
+    + (build.artifactMtime === null ? '' : ' mtime=' + build.artifactMtime)
+    + (build.gitHead === null ? '（读不到 git HEAD）' : ' head=' + build.gitHead.slice(0, 12))
+}
+
+/** 三种结论各自的措辞（§5.2：各有措辞、不得混）。 */
+function describeConclusion(conclusion: TrialConclusion, spec: string, target: string): string {
+  switch (conclusion) {
+    case 'passed':
+      return '试装通过：' + spec + ' 装进 ' + target + ' 后仍能正常挂载。'
+    case 'baseline-broken':
+      return '快照基线就起不来：这不是 ' + spec + ' 的问题。'
+    case 'candidate-broken':
+      return '候选包导致挂载失败：' + spec + ' 装进 ' + target + ' 之后树挂不起来。'
+    default:
+      return '无法试装：这次没有得到有效判定（**不等于通过**）。'
+  }
 }
 // ── 备份：导出 / 差异 / 恢复 ──────────────────────────────────────────────
 
