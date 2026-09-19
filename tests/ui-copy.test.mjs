@@ -132,6 +132,22 @@ const FORBIDDEN = [
 ]
 
 /**
+ * 规则5（指路式引导）的**允许项**——永久反例，与 `health.scoreHint` 那条同构。
+ *
+ * 判据（§12.3.2）：只有「目标入口在屏幕上**可见且可点**」的指路才该删。下面这条指向的是
+ * **操作系统里的另一个窗口**（不在本屏、本屏不可点），而且它所在分支（日志缺失）里是**唯一**的信息来源，
+ * 所以必须留——它和「控件就在同屏」的指路句是两类，不能按形态一刀切。
+ * 来源：Lead 2026-09-19 指定永久保留（task-79），理由同上。
+ */
+const GUIDE_ALLOWED = [
+  {
+    file: 'src/envManager.ts',
+    text: '请看刚打开的终端窗口里 dsh 的输出。',
+    because: '目标是另一个窗口、本屏不可点，且是日志缺失分支唯一的信息来源（§12.3.2 判据不满足）',
+  },
+]
+
+/**
  * 规则1 的元素清单（DESIGN §12.4 的校准版）：intro 里出现 ≥3 个**界面上已经渲染的元素名**即失败。
  *
  * 为什么不是「≥3 个顿号」：`满分 100；可自动修复扣 5 分，需确认扣 10 分，只报告扣 20 分。` 同样枚举了三个名字，
@@ -321,6 +337,24 @@ describe('UI 文案标准（DESIGN §12）', () => {
     for (const key of ['config.marketplace.indexUrlHint', 'env.removeDesc', 'kinds.uninstallDesc', 'health.scoreHint']) {
       assert.ok(!rule.re.test(dict.zh[key]), '不该拦下「' + key + '」：' + dict.zh[key])
     }
+  })
+
+  it('规则5 的允许项：本屏不可点的「另一处窗口」不是指路式引导（task-79 永久反例）', () => {
+    const rule = FORBIDDEN.find(item => item.id === 'zh·指路式引导（写操作路径）')
+    assert.ok(rule !== undefined, '指路式引导规则（规则5）不见了')
+    // 清单必须显式且恰好是这些项：删条目、加条目都要回到 §12.3.2 判据重新裁定，
+    // 不能靠动清单让测试变绿（task-79 的变异验证打的就是这一条）。
+    assert.deepEqual(GUIDE_ALLOWED.map(item => item.text), ['请看刚打开的终端窗口里 dsh 的输出。'],
+      '允许项清单被改动：任何增删都要重新裁定，不能靠删条目让护栏变绿')
+    for (const item of GUIDE_ALLOWED) {
+      // ① 允许项必须仍在源文件里：它被删/改写时，这里先红，逼人来重新裁定（而不是悄悄消失）
+      const source = readFileSync(item.file, 'utf8')
+      assert.ok(source.includes(item.text), '允许项已不在 ' + item.file + '：' + item.text)
+      // ② 规则不该误伤它（判据：目标不在本屏、本屏不可点）
+      assert.ok(!rule.re.test(item.text), '允许项被误伤：' + item.text + '（依据：' + item.because + '）')
+    }
+    // ③ 同屏可见的指路必须仍被拦下——否则「允许项」会退化成漏网
+    assert.ok(rule.re.test('点击「开始体检」生成报告。'), '同屏控件的指路句必须仍被拦下')
   })
 
   it('每条禁止项都写明了来源（哪次反馈 / 用户原文 / 日期）', () => {
