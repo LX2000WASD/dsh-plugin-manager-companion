@@ -223,18 +223,18 @@ async function main() {
       // 所以判据是**出现次数**：计划区一处 + 结果行一处 = 点完变成 2 处。
       // 判据换成**结果行那句完成态措辞**（task-93 之后它与计划区不再同句）：
       // 点前面板里**没有**"已清理 N 个"，点后出现——这个判据天然不恒真。
-      const countBefore = (await evaluate(tab, PANEL_TEXT)).split('已清理 0 个测试环境').length - 1
-      const settled = await waitFor(tab, '(' + PANEL_TEXT + ').split("已清理 0 个测试环境").length - 1 > ' + String(countBefore), 30_000)
+      const countBefore = (await evaluate(tab, PANEL_TEXT)).split('没有清理任何测试环境').length - 1
+      const settled = await waitFor(tab, '(' + PANEL_TEXT + ').split("没有清理任何测试环境").length - 1 > ' + String(countBefore), 30_000)
       const after = await evaluate(tab, PANEL_TEXT)
-      const countAfter = after.split('已清理 0 个测试环境').length - 1
+      const countAfter = after.split('没有清理任何测试环境').length - 1
       check('执行路径真的被触发（结果行出现完成态回执）', settled === true,
         '点前 ' + String(countBefore) + ' 处 → 点后 ' + String(countAfter) + ' 处')
       // 第三个证据（最硬）：op 请求真的发出去了——记账在客户端侧，与文案无关。
       const opCalls = await evaluate(tab, '(function(){return JSON.stringify(window.__t92ops||[])})()')
       check('清理 op 请求真的发出去了（fetch 记录里有 trialCleanup）', /trialCleanup/.test(opCalls),
         String(opCalls).slice(0, 160))
-      check('没有目录被删（计划为空时清理是空操作）', /已清理 0 个测试环境/.test(after),
-        (after.match(/已清理 \d+ 个测试环境/) ?? ['(没有回执)'])[0])
+      check('没有目录被删（计划为空时清理是空操作）', /没有清理任何测试环境/.test(after),
+        (after.match(/没有清理任何测试环境/) ?? ['(没有回执)'])[0])
       // 截图前把测试环境那段滚进视口：回执就在那一节里，不滚的话截图上什么都看不到
       // （断言过、图里没有 = 假证据；trial-plan-evidence.mjs 踩过同一个坑）。
       const scrolled = await evaluate(tab, SCROLL_TO_TRIAL)

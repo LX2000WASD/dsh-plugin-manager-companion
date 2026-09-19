@@ -1776,15 +1776,21 @@ function TrialEnvironments({
   // 上一次操作的结果：成功也必须说出来（清理 0 个与清理 2 个是两件不同的事），
   // 失败走失败行——绝不把失败渲染成"完成"（task-14/18 的护栏）。
   //
-  // 结果行**一律**用完成态措辞（"已清理 N 个"），**0 个也走这条**（task-93）：
-  // 空计划时它原来跟计划区是**同一句话**（都是 cleanupNone），用户点了一次不可逆操作
-  // 却看不出"这一下到底执行了没有"。现在两处措辞并列且可区分：
+  // 结果行说的是**执行结果**（与计划区那句必须可区分，task-93）：
   //   · 计划区（执行前）："没有需要清理的测试环境"；
-  //   · 结果行（执行后）："已清理 0 个测试环境"——"已"字就是"点过了"的证据。
+  //   · 结果行（执行后）："没有清理任何测试环境" / "已清理 N 个测试环境"——两者都是完成态，
+  //     同一位置、同一句式（0 那一态不换语法，读者才看得出"同一个字段在变"，task-94）。
+  //
+  // 为什么不把删除的名字列出来（Lead 复核 task-93 时点名要写清，否则后来人会以为是漏了）：
+  //   · 计划区已经**逐个列过**会删谁（含原因），回执再列一遍是同一事实说两遍（§12.9 R4）；
+  //   · 失败时走 action.output（引擎原文），里面本来就带名字与原因；
+  //   · 回执这一行的职责是"这一下执行了没有、删了几个"，名字不是它要回答的问题。
   const actionText = action === undefined
     ? undefined
     : action.kind === 'cleanup' && action.ok
-      ? t('trial.cleanupDone', { count: action.removed.length })
+      ? action.removed.length === 0
+        ? t('trial.cleanupNothing')
+        : t('trial.cleanupDone', { count: action.removed.length })
       : action.output
   return (
     <fieldset className={css.group}>
