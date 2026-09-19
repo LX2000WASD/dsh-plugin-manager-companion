@@ -424,14 +424,18 @@ describe('客户端渲染健壮性（残缺载荷不许变成空白页）', () =
       await until(() => face.hooks.health.getSnapshot().report, '非当前环境的报告落下')
       const away = renderSafely(reg.component, propsFor(face, makeT(dicts)))
       assert.equal(away.error, undefined)
-      assert.ok(away.html.includes('诊断目标：other'), '要说清报告属于谁：' + away.html.slice(0, 400))
-      // 删掉括注的替代载体：这个事实必须由「非当前环境」Tag 渲染出来（task-48 还会加「只读」标记）。
+      // 【task-64 有意反转（不是放松）】这两条曾是"改强"：当时「诊断目标：X」与「修改请到…」是
+      // "报告属于谁""不能改就去哪改"的**仅有载体**，所以断言它们必须在。用户第三轮反馈把这两处判为冗余：
+      //   · 「诊断目标：X」在选择器里已经显示着（删「复述控件值」）；
+      //   · 「修改请到「环境」子页」属"指路"——按修订后的 DESIGN §12.3.2，指路不算可执行出路
+      //     （出路指命令/参数/文件名这类照做就能完成的信息），而目标入口在子页标签里可见可点。
+      // 反转后的断言改成"替代载体必须真的在"：报告头仍写明被诊断环境，子页标签仍在屏幕上。
+      assert.ok(away.html.includes('被诊断环境：'), '要说清报告属于谁（报告头承载，值由报告自己给）：' + away.html.slice(0, 400))
+      assert.ok(!away.html.includes('诊断目标：other'), '「诊断目标：X」已删：选择器里就显示着这个值')
+      // 删掉括注的替代载体：这个事实必须由「非当前环境」Tag 渲染出来（task-48 又加了「只读」标记）。
       assert.ok(away.html.includes('非当前环境'), '非当前环境必须由标记表达：' + away.html.slice(0, 400))
-      // 断言「页面说明了为什么没有修复按钮」，但不钉死某个句子：DESIGN §12 之后的文案标准要求这类说明
-      // 只用一行用户视角的后果（task-12），所以按新句子断言，意图不变。
-      // 前半句「非当前环境只能诊断，不能修改」按 Lead 裁定删掉（状态由上面的「非当前环境」标记表达），
-      // 留下的是**可执行出路**——它必须还在，否则用户只知道不能改、不知道去哪改。
-      assert.ok(away.html.includes('修改请到「环境」子页'), '要给出可执行出路：' + away.html.slice(0, 400))
+      assert.ok(away.html.includes('环境'), '「环境」子页标签要在屏幕上（指路那句话的前提）')
+      assert.ok(!away.html.includes('修改请到「环境」子页'), '指路那句已删（用户原话：他们会自然打开环境页）')
       assert.ok(!away.html.includes('安装 foo'), '非当前环境不得给出会改错环境的按钮')
       assert.ok(away.html.includes('仅报告'), '改为如实标注仅报告')
     } finally { stub.restore() }
@@ -494,7 +498,10 @@ describe('客户端渲染健壮性（残缺载荷不许变成空白页）', () =
       const { html, error } = renderSafely(reg.component, propsFor(face, makeT(dicts)))
       assert.equal(error, undefined)
       assert.ok(html.includes('体检失败：环境 nope 不存在'), html.slice(0, 300))
-      assert.ok(html.includes('诊断目标：nope'), '失败时也要能看出目标是谁')
+      // 【task-64 有意反转】「诊断目标：X」按用户第三轮反馈删掉（选择器里就显示着这个值）。
+      // 目标是谁仍可从失败文案与选择器两处看出来，所以改成断言这两条载体，而不是删掉这条检查。
+      assert.ok(html.includes('环境 nope 不存在'), '失败时也要能看出目标是谁（失败文案承载）')
+      assert.ok(html.includes('nope'), '选择器里也要显示着目标名：' + html.slice(0, 300))
       assert.ok(html.includes('非当前环境'), '失败态也要由标记说清它不是当前环境')
     } finally { stub.restore() }
   })

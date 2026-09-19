@@ -872,3 +872,66 @@ describe('环境列表：进程事实不可读时运行栏显示「未知」而�
     assert.ok(!html.includes('未知'), '不发明未知')
   })
 })
+
+describe('体检页：删除冗余后，替代载体必须真的在（task-64）', () => {
+  const ENVIRONMENTS = [
+    { name: 'pm-now', dir: '/tmp/pm-now', current: true, builtin: false, bundles: [], dependencies: [], runs: [] },
+    { name: 'pm-other', dir: '/tmp/pm-other', current: false, builtin: false, bundles: [], dependencies: [], runs: [] },
+  ]
+
+  /** 目标切到另一个环境，再渲染体检子页。 */
+  async function renderForeign() {
+    const booted = boot()
+    const stub = stubFetch({
+      listEnvironments: () => ({ ok: true, value: ENVIRONMENTS }),
+      diagnose: () => ({ ok: true, value: { jobId: 'job-1' } }),
+      job: () => ({
+        ok: true,
+        value: {
+          done: true,
+          result: {
+            environment: 'pm-other', generatedAt: '2026-09-19T03:00:00.000Z',
+            counts: { dependency: 0, composition: 0, runtime: 0, consistency: 0, ecosystem: 0 },
+            issues: [], skipped: [],
+          },
+        },
+      }),
+    })
+    try {
+      booted.face.refreshEnvironments()
+      await until(() => booted.face.hooks.environments.getSnapshot().loading === false, '环境列表落地')
+      booted.face.setDiagnosticTarget('pm-other')
+      await until(() => booted.face.hooks.health.getSnapshot().report !== undefined, '对另一个环境的报告落地')
+      return renderTab(booted.entry, booted.face, booted.t, 'health')
+    } finally { stub.restore() }
+  }
+
+  it('删「诊断目标：X」→ 选择器里显示着环境名，且那句不在', async () => {
+    const html = await renderForeign()
+    assert.ok(html.includes('pm-other'), '选择器要显示目标名：' + html.slice(0, 400))
+    assert.ok(!html.includes('诊断目标：pm-other'), '「诊断目标：X」已删（复述控件值）')
+  })
+
+  it('删「非当前环境」后缀 → 标记留下、选项标签不再拼「· 当前环境」', async () => {
+    const html = await renderForeign()
+    assert.ok(html.includes('非当前环境'), '载体留在控件旁：' + html.slice(0, 400))
+    assert.ok(!html.includes(' · 当前环境'), '选项标签里不再拼后缀（同一事实只留一处）')
+    // 选项列表在 SSR 里不渲染（菜单是关的），所以"标签怎么拼"用源码级护栏钉住；
+    // 真机由截图承担（同屏可见：标记在、选择器里只有名字）。
+    const source = readFileSync('src/client/ConsolePage.tsx', 'utf8')
+    assert.ok(!source.includes("· ${t('env.current')}"), '选项标签不得再拼「· 当前环境」')
+    assert.match(source, /label: environment\.name/, '选项标签就是环境名')
+  })
+
+  it('删「修改请到「环境」子页」→ 「环境」入口仍可见（指路的替代载体）', async () => {
+    const html = await renderForeign()
+    assert.ok(html.includes('>环境</button>'), '「环境」子页标签必须在屏幕上：' + html.slice(0, 400))
+    assert.ok(!html.includes('修改请到'), '指路那句已删（用户会自然打开环境页）')
+    assert.ok(!html.includes('health.foreignBody'), '不得渲染已删的键')
+  })
+
+  it('报告的归属仍写清楚（报告头承载，不是控件复述）', async () => {
+    const html = await renderForeign()
+    assert.ok(html.includes('被诊断环境：pm-other'), '报告头要说清这份报告属于谁：' + html.slice(0, 500))
+  })
+})

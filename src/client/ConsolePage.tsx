@@ -401,10 +401,11 @@ function HealthPanel({
   const environmentOptions = useMemo(() => {
     const list = environments.map(environment => ({
       id: environment.name,
-      label: environment.current ? `${environment.name} · ${t('env.current')}` : environment.name,
+      // 选项只给名字：「是不是当前环境」由选择器旁的标记承载（用户反馈：控件内部别再拼一遍）。
+      label: environment.name,
     }))
     if (list.length > 0) return list
-    return current === undefined ? [] : [{ id: current, label: `${current} · ${t('env.current')}` }]
+    return current === undefined ? [] : [{ id: current, label: current }]
   }, [environments, current, t])
 
   // 体检页先挂载（它是第一个子页），所以由它来补一次环境列表——只补一次，
@@ -512,14 +513,9 @@ function HealthPanel({
           </>
         ) : null}
       </div>
-      {/* health.targetHint 的渲染点已删（整句去掉；"只读"语义由 task-48 的标记补回）。
-          字典键留给 copy-dev 在 task-47 统一收口，这里不删键。 */}
-      {foreign ? (
-        <div className={css.capabilities} role="status">
-          <span className={css.metaLabel}>{t('health.foreignTitle', { name: target ?? '' })}</span>
-          <p className={css.hint}>{t('health.foreignBody')}</p>
-        </div>
-      ) : null}
+      {/* 这里原本还有两块："诊断目标：{name}"（选择器已经显示着这个值）与
+          "修改请到「环境」子页。"（目标入口在子页标签里可见可点，属于"指路"而不是可执行出路）。
+          两块都按用户第三轮反馈删掉；"不是当前环境 + 只读"由选择器旁的两个标记承载。 */}
       {error === undefined && errorKey === undefined ? null : (
         <p className={css.error} role="status">
           {/*
@@ -549,8 +545,8 @@ function HealthPanel({
               <span className={css.score}>{score}</span>
               <span className={css.scoreMeta}>
                 <span>
+                  {/* 只留"报告属于谁"这一件事；"不是当前环境"由选择器旁的标记承载，同一屏不重复。 */}
                   {t('health.environment', { name: report.environment })}
-                  {report.environment === current ? '' : ` · ${t('health.foreignTag')}`}
                 </span>
                 <span>{t('health.generatedAt', { at: formatRelative(t, report.generatedAt) })}</span>
               </span>

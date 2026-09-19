@@ -68,8 +68,6 @@ export const zh = {
   'health.groupRest': '未归入任何组的 {count} 条',
   'health.target': '诊断目标环境',
   'health.foreignTag': '非当前环境',
-  'health.foreignTitle': '诊断目标：{name}',
-  'health.foreignBody': '修改请到「环境」子页。',
 
   'severity.safe-fix': '可自动修复',
   'severity.confirm-fix': '需确认',
@@ -362,8 +360,6 @@ export const en: Record<CompanionLocaleKey, string> = {
   'health.groupRest': '{count} findings outside any group',
   'health.target': 'Diagnose target',
   'health.foreignTag': 'Not the current environment',
-  'health.foreignTitle': 'Diagnose target: {name}',
-  'health.foreignBody': 'Use the Environments tab to change them.',
 
   'severity.safe-fix': 'Auto-fixable',
   'severity.confirm-fix': 'Needs confirmation',
