@@ -3133,6 +3133,105 @@ export interface TrialInstallResult {
 }
 
 /**
+ * 读测试环境当前的依赖名（读不到时返回空数组——守卫会据此如实报"没有出现候选"）。
+ *
+ * @param target - 测试环境名。
+ * @returns 依赖名列表。
+ */
+function trialDependencies(target: string): readonly string[] {
+  try {
+    const manifest = readProfileManifest(OUR_PACKAGE_NAME, environmentDir(target)) as { dependencies?: Record<string, unknown> }
+    return Object.keys(manifest.dependencies ?? {})
+  } catch {
+    return []
+  }
+}
+
+/**
+ * 从候选 spec 认出**包名**（守卫要在依赖清单里对上号）。
+ *
+ * 三种形态：路径 spec（`link:` / `file:` / 裸相对路径）读目标目录的 package.json；
+ * registry spec（`name` 或 `name@version`，含 scope）取名字部分；读不到就 undefined
+ * （守卫会如实报"没有出现候选"，不猜）。
+ *
+ * @param spec - 候选包 spec。
+ * @returns 包名；认不出来时 undefined。
+ */
+function candidateName(spec: string): string | undefined {
+  const bare = spec.replace(/^(?:link:|file:|workspace:)/, '')
+  const looksLikePath = spec.startsWith('link:') || spec.startsWith('file:') || spec.startsWith('.') || bare.startsWith('/')
+  if (looksLikePath) {
+    const dir = isAbsolute(bare) ? bare : resolve(process.cwd(), bare)
+    try {
+      const manifest = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as { name?: unknown }
+      return typeof manifest.name === 'string' && manifest.name.length > 0 ? manifest.name : undefined
+    } catch {
+      return undefined
+    }
+  }
+  const at = bare.lastIndexOf('@')
+  return at > 0 ? bare.slice(0, at) : bare
+}
+
+/** 试装环境里"候选是否真的进入了组合层栈"的核对结果。 */
+interface TrialActivation {
+  /** 核对通过（候选确实进了层栈，挂载期会加载它）。 */
+  readonly ok: boolean
+  /** 不通过时的可读原因（面向用户）。 */
+  readonly detail: string
+}
+
+/**
+ * 候选装完之后，核对它是否**真的进入了组合层栈**（`dsh.profile.bundles`）。
+ *
+ * 为什么必须有这条守卫（真机缺陷，task-80）：官方 `runProfilePnpm` 的 reconcile 只在
+ * `activateNewBundles !== false` 时执行，且会**跳过 `beforeDeps` 里已有的依赖**
+ * （packages/boot/plugin-manager/src/operations.ts:160 与 :82-93）。测试环境被复用、
+ * 或上一轮回滚留下残留时，候选已在 `dependencies` 里 → 永远进不了层栈 →
+ * 挂载期从不加载它 → 坏候选也会被判 `passed`（假通过）。
+ *
+ * 所以"装上了"不等于"验证到了"：这里以**盘上的层栈事实**为准，没进层栈就不许算通过。
+ *
+ * @param target - 测试环境名。
+ * @param beforeDeps - 装候选包之前的依赖名集合。
+ * @param spec - 候选包 spec（用于在依赖里认出它）。
+ * @returns 核对结果；不通过时带原因。
+ */
+function trialActivation(target: string, beforeDeps: readonly string[], spec: string): TrialActivation {
+  let manifest: { dependencies?: Record<string, unknown>; dsh?: { profile?: { bundles?: readonly string[] } } }
+  try {
+    manifest = readProfileManifest(OUR_PACKAGE_NAME, environmentDir(target)) as typeof manifest
+  } catch (error) {
+    return { ok: false, detail: '读不到测试环境的 package.json（' + messageOf(error) + '）。' }
+  }
+  const bundles = manifest.dsh?.profile?.bundles ?? []
+  const deps = Object.keys(manifest.dependencies ?? {})
+  const added = deps.filter((name) => !beforeDeps.includes(name))
+  const candidate = candidateName(spec)
+  const suspects = added.length > 0
+    ? added
+    : candidate === undefined ? [] : deps.filter((name) => name === candidate)
+  if (suspects.length === 0) {
+    return {
+      ok: false,
+      detail: '装完候选包后，测试环境的 dependencies 里没有出现它（装前 ' + String(beforeDeps.length)
+        + ' 项，装后 ' + String(deps.length) + ' 项）：这次试装没有验证到任何东西。',
+    }
+  }
+  const active = suspects.filter((name) => bundles.includes(name))
+  if (active.length > 0) return { ok: true, detail: '' }
+  const stale = suspects.every((name) => beforeDeps.includes(name))
+  return {
+    ok: false,
+    detail: '候选（' + suspects.join(', ') + '）装进了 node_modules，但**没有进入组合层栈**'
+      + '（dsh.profile.bundles = ' + JSON.stringify(bundles) + '）——挂载期不会加载它。'
+      + (stale
+        ? '原因：它在本轮之前就已经是测试环境的依赖，官方 reconcile 会跳过"既有的"依赖。'
+        : '原因：官方 reconcile 没有把它写进层栈（它可能没有声明 dsh.bundle）。'),
+  }
+}
+
+/**
  * 受控对照四步（§5.2）：物化快照 → 基线启动 → 装候选包 → 二次启动。
  *
  * 缺一步结论就站不住，所以：基线失败一律报 baseline-broken（**不赖候选包**）；
@@ -3230,6 +3329,8 @@ export async function runTrialInstall(
       { baseline })
   }
   const installArgs = options.allowNetwork === false ? ['add', '--offline', spec] : ['add', spec]
+  // 装之前记下依赖清单：reconcile 会跳过"既有的"依赖，这份事实是下面那条守卫的判据。
+  const beforeDeps = trialDependencies(target)
   const installed = await runPackageOperation(runner, context, installArgs, options)
   if (installed.exitCode !== 0) {
     const reason = options.allowNetwork === false
@@ -3237,6 +3338,14 @@ export async function runTrialInstall(
       : '官方安装失败（exitCode=' + String(installed.exitCode) + '）'
     return done('cannot-trial', '无法试装：' + reason + '。\n'
       + installed.output.trim().slice(-800) + '\n这不等于通过。', { baseline })
+  }
+
+  // 兜底守卫（task-80）：装上了不等于验证到了。候选没进层栈 → 这次试装什么都没验证到，
+  // 一律 cannot-trial，**任何情况下都不许 passed**（假通过的整类问题在这里被掐断）。
+  const activation = trialActivation(target, beforeDeps, spec)
+  if (!activation.ok) {
+    return done('cannot-trial', '无法试装：' + activation.detail + '\n这不等于通过。',
+      { baseline, depth, escalated, escalationReason })
   }
 
   const after = await verify(target)

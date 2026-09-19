@@ -38,6 +38,32 @@ function readManifest(name) {
   return JSON.parse(readFileSync(join(PROFILES, name, 'package.json'), 'utf8'))
 }
 
+
+/**
+ * 忠实的"官方安装成功"夹具：真装成功时官方会写 dependencies 并把**声明了 dsh.bundle 的**
+ * 新依赖激活进 dsh.profile.bundles（task-80 的守卫据此判定"是否真的验证到了"）。
+ * 早期桩件只返回 exitCode 0、环境里什么都不改——那种桩件掩盖了假通过，已被守卫拦下。
+ *
+ * @param name - 装进测试环境的包名。
+ * @param {object} [options] - `activate: false` 模拟"装上了但没进层栈"（脏环境/无 bundle 声明）。
+ * @returns 可直接当 runCommand 注入的假运行器。
+ */
+function installRunner(name, { activate = true } = {}) {
+  return async (context) => {
+    const path = join(context.dir, 'package.json')
+    const manifest = JSON.parse(readFileSync(path, 'utf8'))
+    manifest.dependencies = { ...manifest.dependencies, [name]: 'link:/fixture/' + name }
+    if (activate) {
+      const bundles = manifest.dsh?.profile?.bundles ?? []
+      if (!bundles.includes(name)) {
+        manifest.dsh = { ...manifest.dsh, profile: { ...manifest.dsh?.profile, bundles: [...bundles, name] } }
+      }
+    }
+    writeFileSync(path, JSON.stringify(manifest, undefined, 2) + '\n')
+    return { exitCode: 0, output: 'ok', truncated: false, logPath: '/dev/null' }
+  }
+}
+
 /** 在环境里放一个真的能被官方 bundle 解析器认出来的本地 bundle 包。 */
 function addBundleFixture(envName, bundleName, { webserver = false } = {}) {
   const dir = join(PROFILES, envName, 'node_modules', bundleName)
@@ -873,6 +899,46 @@ test('W-04/W-05: 读取器不再把失败折叠成空表，且没有 -match 预�
   assert.match(source, /Get-CimInstance Win32_Process/, '进程表查询本身还在')
 })
 
+
+test('task-80 假通过守卫：候选没进层栈一律 cannot-trial（绝不许 passed）', async () => {
+  const build = env.buildIdentity()
+  const mounted = async () => ({ verdict: { kind: 'mounted' }, elapsedMs: 1, stderr: '', exitCode: 1, build })
+  const base = { installAnchor: '/anchor/package.json', depth: 'shallow', verify: mounted }
+
+  // ① 运行器报成功，但环境里什么都没变（早期桩件的形态）→ 没有验证到任何东西
+  makeEnv('act-a', { bundles: ['@deepseek-ai/dsh-base'] })
+  const nothing = async () => ({ exitCode: 0, output: 'ok', truncated: false, logPath: '/dev/null' })
+  const a = await env.runTrialInstall('@fake/pkg', 'act-a', { ...base, runCommand: nothing })
+  assert.equal(a.conclusion, 'cannot-trial', '装上了但环境没变 → 不算通过')
+  assert.match(a.output, /没有出现它/)
+  assert.match(a.output, /不等于通过/)
+
+  // ② **真机缺陷的原始形态**：候选已在源环境 dependencies 里（升级/重试同一候选）→ 物化把它
+  //    带进测试环境 → 官方 reconcile 跳过"既有的"依赖 → 它进不了层栈。task-78 当时判 passed。
+  const brokenFixture = join(HOME, 'fixtures', 'dsh-probe-broken')
+  mkdirSync(brokenFixture, { recursive: true })
+  writeFileSync(join(brokenFixture, 'package.json'), JSON.stringify({ name: 'dsh-probe-broken', version: '1.0.0' }))
+  makeEnv('act-b', { bundles: ['@deepseek-ai/dsh-base'], dependencies: { 'dsh-probe-broken': 'link:' + brokenFixture } })
+  const keepDirty = async () => ({ exitCode: 0, output: 'ok', truncated: false, logPath: '/dev/null' })
+  const b = await env.runTrialInstall('link:' + brokenFixture, 'act-b', { ...base, runCommand: keepDirty })
+  assert.equal(b.conclusion, 'cannot-trial', '候选没进层栈 → 假通过的原始形态，必须被拦')
+  assert.match(b.output, /没有进入组合层栈/)
+  assert.match(b.output, /reconcile 会跳过/)
+
+  // ③ 装上了且进了层栈 → 允许按启动判定给结论
+  makeEnv('act-c', { bundles: ['@deepseek-ai/dsh-base'] })
+  const c = await env.runTrialInstall('@fake/pkg', 'act-c', { ...base, runCommand: installRunner('@fake/pkg') })
+  assert.equal(c.conclusion, 'passed')
+
+  // ④ 装上了但**没有**进层栈（例如候选不声明 dsh.bundle）→ 同样不许 passed
+  makeEnv('act-d', { bundles: ['@deepseek-ai/dsh-base'] })
+  const noActivate = await env.runTrialInstall('@fake/pkg', 'act-d', {
+    ...base, runCommand: installRunner('@fake/pkg', { activate: false }),
+  })
+  assert.equal(noActivate.conclusion, 'cannot-trial')
+  assert.match(noActivate.output, /没有进入组合层栈/)
+});
+
 // ── task-50 试装引擎（第一段：命名 / 指纹 / 三态判定 / 结论映射）──────────────
 // ── task-50 第二段：快照物化 / 删除纪律 / 清理计划 ──────────────────────────
 test('深度以启动为判据：shallow 明确失败→升级 full；两次都不行才 baseline-broken；undetermined 不升级', async () => {
@@ -881,7 +947,7 @@ test('深度以启动为判据：shallow 明确失败→升级 full；两次都�
   const mounted = { kind: 'mounted' }
   const failed = { kind: 'failed', reason: 'Cannot find package @fake/missing', chain: ['Error: Cannot find package @fake/missing'] }
   const unknown = { kind: 'undetermined', reason: '子进程没有输出任何 stderr 文本' }
-  const runnerOk = async () => ({ exitCode: 0, output: 'ok', truncated: false, logPath: '/dev/null' })
+  const runnerOk = installRunner('@fake/pkg')
   const base = { installAnchor: '/anchor/package.json', runCommand: runnerOk }
 
   // ① shallow 失败 → 升级 full → 成功：结论 passed，且说明实际深度与升级原因
@@ -925,7 +991,7 @@ test('四步编排：基线坏不赖候选包 / 候选坏给根因 / 无法试�
   const build = env.buildIdentity()
   const mounted = async () => ({ verdict: { kind: 'mounted' }, elapsedMs: 1, stderr: '', exitCode: 1, build })
   const failed = async () => ({ verdict: { kind: 'failed', reason: 'boom', chain: ['Error: boom'] }, elapsedMs: 1, stderr: 'x', exitCode: 1, build })
-  const runnerOk = async () => ({ exitCode: 0, output: 'ok', truncated: false, logPath: '/dev/null' })
+  const runnerOk = installRunner('@fake/pkg')
   const runnerFail = async () => ({ exitCode: 1, output: 'ERR_PNPM_NO_OFFLINE_TARBALL 冷包', truncated: false, logPath: '/dev/null' })
   const base = { installAnchor: '/anchor/package.json', depth: 'shallow', runCommand: runnerOk }
 
@@ -1301,7 +1367,7 @@ test('试装文案：不带字面星号、不写空承诺、判不出来不说�
   makeEnv('copy-src', { bundles: ['@deepseek-ai/dsh-base'] })
   const anchor = '/anchor/package.json'
   const build = env.buildIdentity()
-  const runnerOk = async () => ({ exitCode: 0, output: 'ok', truncated: false, logPath: '/dev/null' })
+  const runnerOk = installRunner('@fake/pkg')
   const runnerCold = async () => ({ exitCode: 1, output: 'ERR_PNPM_NO_OFFLINE_TARBALL 冷包', truncated: false, logPath: '/dev/null' })
   const mounted = async () => ({ verdict: { kind: 'mounted' }, elapsedMs: 1, stderr: '', exitCode: 1, build })
   const failed = async () => ({
@@ -1356,7 +1422,7 @@ test('残留删不掉时如实报「无法试装」，绝不静默沿用旧依�
     assert.equal(existsSync(join(locked, 'file.txt')), true, '删不掉就原样留着，不许假装清过')
 
     // 端到端：这一步失败必须是"无法试装"，不是通过
-    const runnerOk = async () => ({ exitCode: 0, output: 'ok', truncated: false, logPath: '/dev/null' })
+    const runnerOk = installRunner('@fake/pkg')
     const trial = await env.runTrialInstall('@fake/pkg', 'stale-src', {
       installAnchor: '/anchor/package.json', runCommand: runnerOk,
       verify: async () => ({ verdict: { kind: 'mounted' }, elapsedMs: 1, stderr: '', exitCode: 1, build: env.buildIdentity() }),
