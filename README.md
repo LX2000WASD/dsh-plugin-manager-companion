@@ -100,6 +100,23 @@ bash tools/e2e-visual.sh      # 真机浏览器：三个页面 + 官方插件页
 约定见 [docs/CODE-POLICY.md](docs/CODE-POLICY.md)（"参考不复制"三分类准入 + 工具红线），
 设计权威见 [docs/DESIGN.md](docs/DESIGN.md)，host↔client 契约见 [docs/REST-CONTRACT.md](docs/REST-CONTRACT.md)。
 
+## 平台支持
+
+本插件的全部门禁都在 Linux 上运行；下面是各平台的**已验证面与已知限制**，按事实写，不含"应该没问题"。
+
+**Linux**：真机验证过——单元测试 + 两条真机 e2e（`tools/e2e-lifecycle.sh`、`tools/e2e-visual.sh`）。
+
+**Windows x64**：宿主 DSH 官方支持 Windows；本插件与平台相关的六条安全修复（内置环境名大小写护栏、进程树终止、带引号命令行识别、`.cmd` 回退入口、终端降级、跨平台测试入口）已在**真 win32 Node**（wine 11.17 + win-x64 Node 24.21.0）上逐条独立复验。以下是**未在真机验证或已知不成立**的面：
+
+- 终端窗口模式依赖 Windows Terminal（`wt`）。没有 wt 的机器会自动降级为**后台启动**，结果里会写明降级原因；需要窗口交互请自行安装 Windows Terminal。
+- 文件权限位（0600/0700）在 Windows 上是空操作：含访问 token 的启动日志只受 profile 目录的 ACL 保护。
+- "停止环境"在 Windows 上是 `taskkill /T /F` **强制结束进程树**，不是优雅停止（结果文案会如实写出这一点）；被强制结束的实例不会执行自己的退出清理。
+- 安装含符号链接的技能/预设仓库需要开发者模式或管理员权限（官方 CI 在 Windows 上也是先开开发者模式再跑）。
+- 两条真机 e2e 与视觉取证工具链（`tools/*.sh`、Chrome/CDP 脚本）在 Windows 上不可运行；Windows 上的门禁入口是 `pnpm test`（`tools/run-tests.mjs`，它在找不到测试文件时会**拒绝报成功**）。
+- 未验证面：ACL / 服务账户 / 无桌面会话；企业策略禁用 PowerShell 时 Windows 的进程事实不可读，此时会如实降级为"未知"，不会猜成"环境没在运行"。
+
+**macOS**：未验证。文件系统默认大小写不敏感，与 Windows 同族的大小写护栏已用同一套判据覆盖，但真机未验。
+
 ## 已知限制
 
 - 只支持 DSH >= 0.1.6-alpha.2；老版本请用旧仓库的 0.6.x
