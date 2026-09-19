@@ -48,10 +48,16 @@ export function CompanionOfficialItem(props: CompanionOfficialProps & ViewProps)
       <ConfigPanel
         t={props.t}
         useConfig={props.useConfig}
+        useTrial={props.useTrial}
         actions={{
           editConfigField: props.editConfigField,
           saveConfig: props.saveConfig,
           discardConfig: props.discardConfig,
+        }}
+        trialActions={{
+          loadTrial: props.loadTrial,
+          removeTrialEnvironment: props.removeTrialEnvironment,
+          cleanupTrialEnvironments: props.cleanupTrialEnvironments,
         }}
       />
     </div>

@@ -34,7 +34,7 @@ import { CompanionOfficialItem } from './OfficialSlots.tsx'
 import { NS, en, zh } from './locales.ts'
 import {
   ConfigController, EnvironmentsController, HealthController, KindsController, MarketplaceController,
-  SETTINGS_NAMESPACE,
+  SETTINGS_NAMESPACE, TrialController,
   type ConsoleFace,
 } from './shared.ts'
 
@@ -60,6 +60,7 @@ export function apply(ctx: ClientContext): void {
   ).inject()
   const marketplaceFace = new MarketplaceController().inject()
   const kindsFace = new KindsController().inject()
+  const trialFace = new TrialController().inject()
 
   // 一个入口、三个子页面，所以只有一份注入面：三个控制器的 hooks 隔间合在一个
   // 对象里（框架据此合成 useHealth / useEnvironments / useConfig 三个选择器）。
@@ -68,6 +69,7 @@ export function apply(ctx: ClientContext): void {
       health: healthFace.hooks.health,
       environments: environmentsFace.hooks.environments,
       config: configFace.hooks.config,
+      trial: trialFace.hooks.trial,
     },
     diagnose: healthFace.diagnose,
     fix: healthFace.fix,
@@ -87,6 +89,9 @@ export function apply(ctx: ClientContext): void {
     editConfigField: configFace.editConfigField,
     saveConfig: configFace.saveConfig,
     discardConfig: configFace.discardConfig,
+    loadTrial: trialFace.loadTrial,
+    removeTrialEnvironment: trialFace.removeTrialEnvironment,
+    cleanupTrialEnvironments: trialFace.cleanupTrialEnvironments,
   })
 
   // 一级入口 1：插件市场（order 16，紧跟官方 plugins=15）。

@@ -31,9 +31,10 @@ import type {
   EnvironmentBackupDiff, EnvironmentInfo, ManifestField,
   EnvironmentResult, GatedInstallResult, InstalledKind, KindListResult, MarketInstallable, MarketItem,
   MarketItemKind, MarketRiskFlag, MarketplaceResult, MarketRiskTier,
+  TrialCleanupResult, TrialEnvironmentReport,
 } from '../types.ts'
 import type { OfficialCapabilities } from '../official.ts'
-import type { CompanionConfig } from '../settings.ts'
+import type { CompanionConfig, TrialConfig, TrialDisclosure } from '../settings.ts'
 
 // ── 基础读取（JSON 无关的窄工具）─────────────────────────────────────────
 
@@ -612,17 +613,240 @@ export function normalizeMarketplace(raw: unknown): MarketplaceResult | undefine
  * @param raw - install op 的结果。
  * @returns 结果；载荷不可用时按失败处理。
  */
-export function normalizeGatedInstall(raw: unknown): GatedInstallResult {
+export function normalizeGatedInstall(raw: unknown): GatedInstallView {
   const record = asObject(raw)
   if (record === undefined) return { ok: false, output: '', gateIssues: [], rolledBack: false }
   const packageName = asText(record['packageName'])
+  const trial = normalizeTrialOutcome(record['trial'])
   return {
     ok: record['ok'] === true,
     output: text(record['output']),
     ...packageName === undefined ? {} : { packageName },
     gateIssues: texts(record['gateIssues']),
     ...record['rolledBack'] === true ? { rolledBack: true } : {},
+    ...trial === undefined ? {} : { trial },
   }
+}
+
+// ── 试装（质量门第二步）：安装结论、告知事实、测试环境 ────────────────────
+
+/**
+ * 一次安装里的试装结论（客户端视图）。
+ *
+ * 枚举值（conclusion / policy / depth / baseline / candidate）**原样保留字符串**，
+ * 不在这里映射成已知集合：宿主新增一档结论时，界面要能如实显示原始值，而不是把它吞掉
+ * 或猜成最接近的一档（本模块纪律 3：归一不吞发现）。文案映射在组件层，未知值回退显示原值。
+ */
+export interface TrialOutcomeView {
+  readonly conclusion: string
+  readonly policy: string
+  readonly policyNote: string
+  readonly output: string
+  readonly elapsedMs: number
+  readonly escalated: boolean
+  readonly depth?: string
+  readonly escalationReason?: string
+  readonly baseline?: string
+  readonly candidate?: string
+}
+
+/** 受质量门保护的安装结果的客户端视图：`trial` 换成上面那个视图。 */
+export type GatedInstallView = Omit<GatedInstallResult, 'trial'> & { readonly trial?: TrialOutcomeView }
+
+/**
+ * 归一一次试装结论。
+ *
+ * @param raw - `GatedInstallResult.trial`。
+ * @returns 结论视图；载荷不是对象或缺 conclusion/policy 时 undefined（"这次没试装"与"读不出来"都不许编造结论）。
+ */
+function normalizeTrialOutcome(raw: unknown): TrialOutcomeView | undefined {
+  const record = asObject(raw)
+  if (record === undefined) return undefined
+  const conclusion = asText(record['conclusion'])
+  const policy = asText(record['policy'])
+  if (conclusion === undefined || policy === undefined) return undefined
+  const elapsed = record['elapsedMs']
+  const depth = asText(record['depth'])
+  const escalationReason = asText(record['escalationReason'])
+  const baseline = asText(record['baseline'])
+  const candidate = asText(record['candidate'])
+  return {
+    conclusion,
+    policy,
+    policyNote: text(record['policyNote']),
+    output: text(record['output']),
+    elapsedMs: typeof elapsed === 'number' && Number.isFinite(elapsed) ? elapsed : 0,
+    escalated: record['escalated'] === true,
+    ...depth === undefined ? {} : { depth },
+    ...escalationReason === undefined ? {} : { escalationReason },
+    ...baseline === undefined ? {} : { baseline },
+    ...candidate === undefined ? {} : { candidate },
+  }
+}
+
+/**
+ * 试装开启前必须让用户看到的事实。
+ *
+ * 数字与口径**必须一起**给出：只有数字没有 measurement 时返回 undefined（宁可不显示，
+ * 也不给一个没有口径的数字——那正是"把不知道说成知道"）。
+ */
+export interface TrialDisclosureView {
+  readonly executesCandidateCode: boolean
+  readonly peakMemoryMiB: number
+  readonly measurement: string
+}
+
+/**
+ * 归一试装告知事实（来自 capabilities op 的 `trialDisclosure`）。
+ *
+ * @param raw - `capabilities.trialDisclosure`。
+ * @returns 告知事实；数字或口径缺失/不可读时 undefined（界面显示"未知"，不硬编码）。
+ */
+export function normalizeTrialDisclosure(raw: unknown): TrialDisclosureView | undefined {
+  const record = asObject(raw)
+  if (record === undefined) return undefined
+  const peak = record['peakMemoryMiB']
+  const measurement = asText(record['measurement'])
+  if (typeof peak !== 'number' || Number.isFinite(peak) === false || measurement === undefined) return undefined
+  return { executesCandidateCode: record['executesCandidateCode'] === true, peakMemoryMiB: peak, measurement }
+}
+
+/**
+ * 一个测试环境（`<真实环境名>-dpmc`）的只读事实。
+ *
+ * 布尔事实用 `undefined` 表示"宿主没给"，而不是 `false`：`false` 是一个结论
+ * （"不在运行"、"归属环境没了"），不能拿它顶替"读不到"（DESIGN §12.3.3）。
+ */
+export interface TrialEnvironmentView {
+  readonly name: string
+  readonly owner: string
+  readonly ownerExists: boolean | undefined
+  readonly dir: string
+  readonly running: boolean | undefined
+  readonly modifiedAt: string
+  readonly ageDays: number | undefined
+  readonly bytes: number | null
+  readonly bytesReason?: string
+  readonly files: number
+  readonly sharedFiles: number
+  readonly snapshotMatchesOwner: boolean | null
+}
+
+/** 试装环境查询结果的客户端视图（`trialEnvironments` op）。 */
+export interface TrialEnvironmentsView {
+  readonly environments: readonly TrialEnvironmentView[]
+  readonly factsReadable: boolean | undefined
+  readonly factsReason?: string
+  readonly totals: {
+    readonly count: number
+    readonly running: number | undefined
+    readonly bytes: number
+    readonly unknownBytes: number
+  }
+  readonly retention: {
+    readonly days: number
+    readonly autoCleanup: boolean
+    readonly maxKept: number
+  } | undefined
+  readonly plan: {
+    readonly remove: readonly { readonly name: string; readonly reason: string }[]
+    readonly keep: readonly { readonly name: string; readonly reason: string }[]
+  } | undefined
+  readonly overCap: boolean | undefined
+  readonly notes: readonly string[]
+}
+
+const optionalFlag = (value: unknown): boolean | undefined => typeof value === 'boolean' ? value : undefined
+
+const optionalNumber = (value: unknown): number | undefined =>
+  typeof value === 'number' && Number.isFinite(value) ? value : undefined
+
+/** 归一一条试装环境。没有名字的条目直接丢弃（无法寻址的条目不能提供删除入口）。 */
+function trialEnvironment(raw: unknown): TrialEnvironmentView | undefined {
+  const record = asObject(raw)
+  if (record === undefined) return undefined
+  const name = asText(record['name'])
+  if (name === undefined) return undefined
+  const matches = record['snapshotMatchesOwner']
+  const bytesReason = asText(record['bytesReason'])
+  return {
+    name,
+    owner: text(record['owner']),
+    ownerExists: optionalFlag(record['ownerExists']),
+    dir: text(record['dir']),
+    running: optionalFlag(record['running']),
+    modifiedAt: text(record['modifiedAt'], ''),
+    ageDays: optionalNumber(record['ageDays']),
+    bytes: typeof record['bytes'] === 'number' && Number.isFinite(record['bytes']) ? record['bytes'] as number : null,
+    ...bytesReason === undefined ? {} : { bytesReason },
+    files: optionalNumber(record['files']) ?? 0,
+    sharedFiles: optionalNumber(record['sharedFiles']) ?? 0,
+    snapshotMatchesOwner: typeof matches === 'boolean' ? matches : null,
+  }
+}
+
+const planEntries = (raw: unknown): readonly { readonly name: string; readonly reason: string }[] =>
+  asArray(raw)
+    .map((entry) => {
+      const record = asObject(entry)
+      const name = record === undefined ? undefined : asText(record['name'])
+      return name === undefined ? undefined : { name, reason: text(record?.['reason']) }
+    })
+    .filter((entry): entry is { name: string; reason: string } => entry !== undefined)
+
+/**
+ * 归一试装环境查询结果。
+ *
+ * @param raw - `trialEnvironments` op 的结果。
+ * @returns 视图；载荷不是对象时 undefined（控制器如实报"失败"，不渲染空列表当"没有测试环境"）。
+ */
+export function normalizeTrialEnvironments(raw: unknown): TrialEnvironmentsView | undefined {
+  const record = asObject(raw)
+  if (record === undefined) return undefined
+  const totals = asObject(record['totals'])
+  const retention = asObject(record['retention'])
+  const plan = asObject(record['plan'])
+  const factsReason = asText(record['factsReason'])
+  const days = retention === undefined ? undefined : optionalNumber(retention['days'])
+  const maxKept = retention === undefined ? undefined : optionalNumber(retention['maxKept'])
+  const autoCleanup = retention === undefined ? undefined : optionalFlag(retention['autoCleanup'])
+  return {
+    environments: asArray(record['environments'])
+      .map(trialEnvironment)
+      .filter((entry): entry is TrialEnvironmentView => entry !== undefined),
+    factsReadable: optionalFlag(record['factsReadable']),
+    ...factsReason === undefined ? {} : { factsReason },
+    totals: {
+      count: (totals === undefined ? undefined : optionalNumber(totals['count'])) ?? 0,
+      running: totals === undefined ? undefined : optionalNumber(totals['running']),
+      bytes: (totals === undefined ? undefined : optionalNumber(totals['bytes'])) ?? 0,
+      unknownBytes: (totals === undefined ? undefined : optionalNumber(totals['unknownBytes'])) ?? 0,
+    },
+    retention: days === undefined || maxKept === undefined || autoCleanup === undefined
+      ? undefined
+      : { days, autoCleanup, maxKept },
+    plan: plan === undefined
+      ? undefined
+      : { remove: planEntries(plan['remove']), keep: planEntries(plan['keep']) },
+    overCap: optionalFlag(record['overCap']),
+    notes: texts(record['notes']),
+  }
+}
+
+/** 一次清理的结果（`trialCleanup` op）：环境操作结果 + 实际删掉的名字。 */
+export interface TrialCleanupView extends EnvironmentResult {
+  readonly removed: readonly string[]
+}
+
+/**
+ * 归一一次试装环境清理的结果。
+ *
+ * @param raw - `trialCleanup` op 的结果。
+ * @returns 结果；载荷不可用时按失败处理（沿用环境操作结果的归一口径）。
+ */
+export function normalizeTrialCleanup(raw: unknown): TrialCleanupView {
+  const record = asObject(raw)
+  return { ...normalizeEnvironmentResult(raw), removed: texts(record === undefined ? undefined : record['removed']) }
 }
 
 // ── 技能与预设 ──────────────────────────────────────────────────────────
@@ -670,15 +894,28 @@ export function normalizeKindList(raw: unknown): KindListResult | undefined {
  * 它是 host 模块（值会拉进 schemastery 与整套 host 代码），客户端只认这份镜像。
  * 这一层只在"官方 settings 文档残缺"时兜底——正式来源仍是官方 settings 服务。
  */
-const CLIENT_DEFAULTS: CompanionConfig = {
+const CLIENT_DEFAULTS: ClientConfig = {
   diagnostics: { dependency: true, composition: true, runtime: true, consistency: true, ecosystem: false },
   qualityGate: { enabled: true, mode: 'block', allowlist: [] },
   marketplace: { enabled: true, cacheTtlMinutes: 1440, timeoutMs: 15_000, indexUrl: '' },
+  // 与 host 侧 DEFAULT_TRIAL_CONFIG 逐字段一致（试装默认关：它会在用户机器上真实装包并执行对方代码）。
+  trial: {
+    enabled: false, depth: 'auto', baseline: true, allowNetwork: true,
+    onFailure: 'block', autoCleanup: true, retentionDays: 14, maxKept: 0,
+  },
 }
+
+/**
+ * 归一后的插件配置。
+ *
+ * 与 host 侧 {@link CompanionConfig} 的唯一差别：`trial` 在 host 类型里是**可选**字段
+ * （见 src/settings.ts 的说明），而归一后它一定存在——客户端不假设宿主给了它。
+ */
+export type ClientConfig = CompanionConfig & { readonly trial: TrialConfig }
 
 /** 归一后的配置与"哪些字段是补出来的"。 */
 export interface NormalizedConfig {
-  readonly config: CompanionConfig
+  readonly config: ClientConfig
   /** 由默认值补上的字段路径（用于如实告诉用户：这不是宿主给的完整配置）。 */
   readonly filled: readonly string[]
 }
@@ -698,7 +935,7 @@ export function normalizeConfig(raw: unknown): NormalizedConfig | undefined {
   const record = asObject(raw)
   if (record === undefined) return undefined
   const filled: string[] = []
-  const group = (name: 'diagnostics' | 'qualityGate' | 'marketplace'): JsonObject => {
+  const group = (name: 'diagnostics' | 'qualityGate' | 'marketplace' | 'trial'): JsonObject => {
     const value = record[name]
     const object = asObject(value)
     if (object === undefined) filled.push(name)
@@ -708,6 +945,7 @@ export function normalizeConfig(raw: unknown): NormalizedConfig | undefined {
   const diagnostics = group('diagnostics')
   const qualityGate = group('qualityGate')
   const marketplace = group('marketplace')
+  const trial = group('trial')
 
   // 记一笔"这个字段宿主没给"，值由各字段自己的归一函数（flag / number / texts）给出。
   // qualified 是用于报账的完整路径，查找用的是它最后一段（字段都取自自己的分组对象）。
@@ -718,7 +956,7 @@ export function normalizeConfig(raw: unknown): NormalizedConfig | undefined {
   }
 
   const defaults = CLIENT_DEFAULTS
-  const config: CompanionConfig = {
+  const config: ClientConfig = {
     diagnostics: {
       dependency: read(diagnostics, 'diagnostics.dependency', flag(diagnostics['dependency'], defaults.diagnostics.dependency)),
       composition: read(diagnostics, 'diagnostics.composition', flag(diagnostics['composition'], defaults.diagnostics.composition)),
@@ -736,6 +974,18 @@ export function normalizeConfig(raw: unknown): NormalizedConfig | undefined {
       cacheTtlMinutes: read(marketplace, 'marketplace.cacheTtlMinutes', number(marketplace['cacheTtlMinutes'], defaults.marketplace.cacheTtlMinutes, 1, 10_080)),
       timeoutMs: read(marketplace, 'marketplace.timeoutMs', number(marketplace['timeoutMs'], defaults.marketplace.timeoutMs, 1_000, 120_000)),
       indexUrl: read(marketplace, 'marketplace.indexUrl', text(marketplace['indexUrl'])),
+    },
+    // 越界的数字一律回落默认值（与 host 的 effectiveTrialConfig 同一口径）：试装会写盘、会起进程，
+    // 一个读到 undefined 的字段不能变成"意外地开启"或"意外地强制浅快照"。
+    trial: {
+      enabled: read(trial, 'trial.enabled', flag(trial['enabled'], defaults.trial.enabled)),
+      depth: read(trial, 'trial.depth', trial['depth'] === 'shallow' || trial['depth'] === 'full' ? trial['depth'] : defaults.trial.depth),
+      baseline: read(trial, 'trial.baseline', flag(trial['baseline'], defaults.trial.baseline)),
+      allowNetwork: read(trial, 'trial.allowNetwork', flag(trial['allowNetwork'], defaults.trial.allowNetwork)),
+      onFailure: read(trial, 'trial.onFailure', trial['onFailure'] === 'warn' ? 'warn' as const : trial['onFailure'] === 'block' ? 'block' as const : defaults.trial.onFailure),
+      autoCleanup: read(trial, 'trial.autoCleanup', flag(trial['autoCleanup'], defaults.trial.autoCleanup)),
+      retentionDays: read(trial, 'trial.retentionDays', number(trial['retentionDays'], defaults.trial.retentionDays, 1, 3_650)),
+      maxKept: read(trial, 'trial.maxKept', number(trial['maxKept'], defaults.trial.maxKept, 0, 1_000)),
     },
   }
   return { config, filled }

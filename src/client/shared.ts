@@ -38,7 +38,9 @@ import { NS, type CompanionLocaleKey } from './locales.ts'
 import {
   normalizeBackup, normalizeBackupDiff, normalizeCapabilities, normalizeConfig,
   normalizeEnvironmentResult, normalizeEnvironments, normalizeGatedInstall, normalizeKindList,
-  normalizeMarketplace, normalizeReport,
+  normalizeMarketplace, normalizeReport, normalizeTrialCleanup, normalizeTrialDisclosure,
+  normalizeTrialEnvironments,
+  type ClientConfig, type TrialDisclosureView, type TrialEnvironmentsView, type TrialOutcomeView,
 } from './wire.ts'
 
 /**
@@ -909,6 +911,11 @@ export interface MarketplaceState {
   /** 质量门发现的问题（安装未通过时保留，供用户追责）。 */
   gateIssues: readonly string[]
   rolledBack: boolean
+  /**
+   * 这次安装的试装结论（质量门第二步）。undefined = 宿主没给这个字段，
+   * 而不是"试装通过"——界面据此区分"没试装"与"试装通过"。
+   */
+  trial: TrialOutcomeView | undefined
 }
 
 /** 市场子页的注入面。 */
@@ -946,7 +953,7 @@ export class MarketplaceController {
   constructor() {
     this.store = createSnapshotStore<MarketplaceState>({
       result: undefined, loading: false, error: undefined, query: '', category: '', kind: '',
-      installing: undefined, installError: undefined, gateIssues: [], rolledBack: false,
+      installing: undefined, installError: undefined, gateIssues: [], rolledBack: false, trial: undefined,
     })
   }
 
@@ -960,7 +967,9 @@ export class MarketplaceController {
       setMarketKind: (kind) => { this.store.update((draft) => { draft.kind = kind }) },
       installMarketItem: (item) => { void this.install(item) },
       dismissInstallNotice: () => {
-        this.store.update((draft) => { draft.installError = undefined; draft.gateIssues = []; draft.rolledBack = false })
+        this.store.update((draft) => {
+          draft.installError = undefined; draft.gateIssues = []; draft.rolledBack = false; draft.trial = undefined
+        })
       },
     }
   }
@@ -1008,6 +1017,7 @@ export class MarketplaceController {
       draft.installError = undefined
       draft.gateIssues = []
       draft.rolledBack = false
+      draft.trial = undefined
     })
     try {
       const result = normalizeGatedInstall(await runJob<unknown>('install', { spec: item.installSpec ?? '' }))
@@ -1015,6 +1025,7 @@ export class MarketplaceController {
         draft.installing = undefined
         draft.gateIssues = result.gateIssues
         draft.rolledBack = result.rolledBack === true
+        draft.trial = result.trial
         if (!result.ok) draft.installError = result.output
       })
       await this.load(true)
@@ -1129,8 +1140,13 @@ export interface ConfigState {
   writable: boolean
   /** 官方已解析的当前值（原样保留：保存时的"前后对比"和写盘路径都以它为准）。 */
   value: CompanionConfig | undefined
-  /** 渲染用草稿：已过 wire 归一（缺字段按客户端默认值补齐）再叠加本地编辑。 */
-  draft: CompanionConfig | undefined
+  /**
+   * 渲染用草稿：已过 wire 归一（缺字段按客户端默认值补齐）再叠加本地编辑。
+   *
+   * 类型是 {@link ClientConfig} 而不是 host 的 CompanionConfig：host 侧 `trial` 是可选字段，
+   * 归一后它一定存在——组件因此不需要（也不许）在读取处替它兜默认值。
+   */
+  draft: ClientConfig | undefined
   /** 宿主给的文档缺字段（draft 里有默认值补出来的部分）——界面要如实说明。 */
   incomplete: boolean
   dirty: boolean
@@ -1287,14 +1303,198 @@ export class ConfigController {
   }
 }
 
+// ── 试装（质量门第二步）：披露事实 + 测试环境的管理面 ──────────────────────
+
+/** 上一次试装环境变更的结果（结构化：界面按 kind 选文案，不把整句拼进状态）。 */
+export interface TrialActionState {
+  readonly kind: 'remove' | 'cleanup'
+  readonly ok: boolean
+  readonly removed: readonly string[]
+  readonly output: string
+  readonly code?: string
+}
+
+/** 「设置」子页里试装那一节的状态。 */
+export interface TrialState {
+  /** 披露事实（capabilities op 的 trialDisclosure）；undefined = 还没读到或读不到。 */
+  disclosure: TrialDisclosureView | undefined
+  /** 披露读不到的原因（宿主消息）。 */
+  disclosureError: string | undefined
+  /** 披露读不到的原因（我们自己的判定，文案归字典）。 */
+  disclosureErrorKey?: CompanionLocaleKey
+  /** 测试环境报告；undefined = 还没读到或读失败（界面据此显示加载中/失败，不显示"没有测试环境"）。 */
+  report: TrialEnvironmentsView | undefined
+  loading: boolean
+  /** 正在执行的动作标签（与官方页一致的 动词+名字 形态）。 */
+  busy: string | undefined
+  /** 读列表自己写下的失败（只有它能被下一次成功的读取清掉）。 */
+  error: string | undefined
+  errorKey?: CompanionLocaleKey
+  /** 上一次变更操作的结果（成功也留，直到用户处置）。 */
+  action: TrialActionState | undefined
+}
+
+/** 试装管理面的注入面。 */
+export interface TrialFace {
+  hooks: { trial: SnapshotStore<TrialState> }
+  loadTrial(): void
+  removeTrialEnvironment(name: string): void
+  cleanupTrialEnvironments(): void
+}
+
+/**
+ * 试装控制器：读披露事实与测试环境列表，执行"删除一个"与"清理过期"。
+ *
+ * 披露事实走 capabilities op 而不是在客户端抄一份数字：数字与口径由 host 给；
+ * 抄一份就会在下次实测后漂移，而漂移的是"用户以为自己承担了什么风险"。
+ */
+export class TrialController {
+  private readonly store: SnapshotStore<TrialState>
+  /** "读列表"写下的失败；只有它能被下一次成功的读取清掉（见 ReadFailureLedger）。 */
+  private readonly readFailure = new ReadFailureLedger()
+
+  constructor() {
+    this.store = createSnapshotStore<TrialState>({
+      disclosure: undefined, disclosureError: undefined, report: undefined,
+      loading: false, busy: undefined, error: undefined, action: undefined,
+    })
+  }
+
+  /** 供注册项使用的注入面。 */
+  inject(): TrialFace {
+    return {
+      hooks: { trial: this.store },
+      loadTrial: () => { void this.load() },
+      removeTrialEnvironment: (name) => { void this.remove(name) },
+      cleanupTrialEnvironments: () => { void this.cleanup() },
+    }
+  }
+
+  /**
+   * 读披露事实 + 测试环境列表。
+   *
+   * 只动 loading / 自己写下的读失败：action 描述的是"上一次操作"，刷新无权替它宣布结果
+   * （task-18 的真机 P1：读操作清掉写操作的结果，失败就被渲染成完成）。披露读不到时也只记原因，
+   * 不让整节变成不可用——用户仍能改配置，只是看不到"会发生什么"。
+   */
+  async load(): Promise<void> {
+    this.store.update((draft) => { draft.loading = true })
+    try {
+      const info = await callOp<{ trialDisclosure?: unknown }>('capabilities', {})
+      const disclosure = normalizeTrialDisclosure(info.trialDisclosure)
+      this.store.update((draft) => {
+        draft.disclosure = disclosure
+        draft.disclosureError = undefined
+        draft.disclosureErrorKey = disclosure === undefined ? 'error.incompletePayload' : undefined
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.store.update((draft) => {
+        draft.disclosure = undefined
+        draft.disclosureError = message
+        draft.disclosureErrorKey = undefined
+      })
+    }
+    try {
+      const report = normalizeTrialEnvironments(await callOp<unknown>('trialEnvironments', {}))
+      if (report === undefined) {
+        this.store.update((draft) => {
+          draft.loading = false
+          draft.errorKey = this.readFailure.record('error.incompletePayload')
+        })
+        return
+      }
+      this.store.update((draft) => {
+        draft.report = report
+        draft.loading = false
+        this.readFailure.clearOwn(draft)
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.store.update((draft) => {
+        draft.loading = false
+        draft.error = this.readFailure.record(message)
+      })
+    }
+  }
+
+  /**
+   * 删除一个测试环境。
+   * @param name - 测试环境名。
+   */
+  async remove(name: string): Promise<void> {
+    await this.act('remove', 'remove ' + name, () => callOp<unknown>('trialRemove', { name }))
+  }
+
+  /** 清理过期的测试环境（走 job：可能跨多个目录）。 */
+  async cleanup(): Promise<void> {
+    await this.act('cleanup', 'cleanup', () => runJob<unknown>('trialCleanup', {}))
+  }
+
+  /**
+   * 跑一个变更类操作：写 busy → 执行 → 落结果 → 刷新列表。
+   *
+   * 结果必须先落定再刷新：反过来会让刚写下的失败被 refresh 抹掉（task-18 的 P1 就是这个顺序）。
+   *
+   * @param kind - 操作种类（界面按它选文案）。
+   * @param label - 忙碌提示用的标签。
+   * @param task - 具体调用（返回值一律过归一，形状不对时如实报失败而不是当成功）。
+   */
+  private async act(kind: 'remove' | 'cleanup', label: string, task: () => Promise<unknown>): Promise<void> {
+    this.store.update((draft) => {
+      draft.busy = label
+      draft.action = undefined
+      draft.error = undefined
+      draft.errorKey = undefined
+    })
+    try {
+      const result = normalizeTrialCleanup(await task())
+      this.store.update((draft) => {
+        draft.busy = undefined
+        draft.action = {
+          kind,
+          ok: result.ok,
+          removed: result.removed,
+          output: result.output,
+          ...result.code === undefined ? {} : { code: result.code },
+        }
+        if (!result.ok) draft.error = result.code ?? result.output
+      })
+      await this.load()
+    } catch (error) {
+      this.store.update((draft) => {
+        draft.busy = undefined
+        draft.action = { kind, ok: false, removed: [], output: error instanceof Error ? error.message : String(error) }
+      })
+    }
+  }
+}
+
+/**
+ * 把字节数格式化成紧凑文本。
+ *
+ * 单位是量纲不是文案，两种语言共用，因此不进字典。
+ *
+ * @param bytes - 字节数。
+ * @returns 形如 12.3 MiB 的文本。
+ */
+export function formatBytes(bytes: number): string {
+  const mib = bytes / (1024 * 1024)
+  if (mib >= 1024) return (mib / 1024).toFixed(1) + ' GiB'
+  if (mib >= 10) return mib.toFixed(0) + ' MiB'
+  return mib.toFixed(1) + ' MiB'
+}
+
 /**
  * 环境控制台注册项的组合注入面：体检、环境、设置三块能力共用一个注册项
  * （一个入口 + 本地子页面，所以只声明一份 face）。
+ *
+ * 试装（质量门第二步）的字段与测试环境管理都在「设置」子页里，所以它的面也挂在这一份上。
  */
-export type ConsoleFace = HealthFace & EnvironmentsFace & ConfigFace
+export type ConsoleFace = HealthFace & EnvironmentsFace & ConfigFace & TrialFace
 
 /** 深拷贝一份配置（CompanionConfig 全是 JSON-safe 值）。 */
-const cloneConfig = (value: CompanionConfig): CompanionConfig => structuredClone(value) as CompanionConfig
+const cloneConfig = (value: ClientConfig): ClientConfig => structuredClone(value) as ClientConfig
 
 /** 读一条嵌套路径的当前值。 */
 function readAtPath(source: unknown, path: readonly string[]): unknown {
@@ -1307,7 +1507,7 @@ function readAtPath(source: unknown, path: readonly string[]): unknown {
 }
 
 /** 在深拷贝上叠加全部暂存编辑。 */
-function applyEdits(value: CompanionConfig, staged: readonly StagedEdit[]): CompanionConfig {
+function applyEdits(value: ClientConfig, staged: readonly StagedEdit[]): ClientConfig {
   const draft = cloneConfig(value) as unknown as Record<string, unknown>
   for (const edit of staged) {
     let node = draft
@@ -1319,7 +1519,7 @@ function applyEdits(value: CompanionConfig, staged: readonly StagedEdit[]): Comp
     const leaf = edit.path[edit.path.length - 1]
     if (leaf !== undefined) node[leaf] = edit.value
   }
-  return draft as unknown as CompanionConfig
+  return draft as unknown as ClientConfig
 }
 
 /**

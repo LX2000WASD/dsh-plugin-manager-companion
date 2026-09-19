@@ -23,6 +23,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Button, Checkbox, IconChevronDownOutline14, IconChevronUpOutline14, IconGlobeOutline14, IconRefreshOutline14,
   IconSearchOutline16, Input, Modal, Tag, Toast, Tooltip,
+  type TagTone,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
 import {
@@ -37,6 +38,7 @@ import {
   KIND_LABEL, MARKET_LABEL, formatRelative,
   type CompanionSlotProps, type MarketplaceFace, type MarketplaceState,
 } from './shared.ts'
+import type { TrialOutcomeView } from './wire.ts'
 import css from './MarketplacePage.module.css'
 
 /** 本文件里 t 的键域（本插件字典）。 */
@@ -122,6 +124,129 @@ const RENDER_BATCH = 120
  */
 const RENDER_MAX = 1_200
 
+/** 试装结论 → 标签色调。未知值走中性：读不懂的结论不能染成"通过"。 */
+const TRIAL_CONCLUSION_TONE: Readonly<Record<string, TagTone>> = {
+  passed: 'success',
+  'baseline-broken': 'danger',
+  'candidate-broken': 'danger',
+  'cannot-trial': 'warning',
+}
+
+/** 试装处置 → 标签色调（warned 是警告而不是失败：这次安装确实完成了）。 */
+const TRIAL_POLICY_TONE: Readonly<Record<string, TagTone>> = {
+  passed: 'neutral',
+  blocked: 'danger',
+  warned: 'warning',
+  skipped: 'neutral',
+}
+
+/**
+ * 试装结论文案：已知值走字典，未知值保留原始 id（wire 层不吞发现，界面也不吞）。
+ *
+ * @param t - 字典座位。
+ * @param value - 结论原始值。
+ * @returns 显示文本。
+ */
+function trialConclusionText(t: T, value: string): string {
+  switch (value) {
+    case 'passed': return t('market.trial.conclusion.passed')
+    case 'baseline-broken': return t('market.trial.conclusion.baseline-broken')
+    case 'candidate-broken': return t('market.trial.conclusion.candidate-broken')
+    case 'cannot-trial': return t('market.trial.conclusion.cannot-trial')
+    default: return t('market.trial.unknownValue', { value })
+  }
+}
+
+/**
+ * 试装处置文案：四档各自可辨（passed / blocked / warned / skipped）。
+ *
+ * @param t - 字典座位。
+ * @param value - 处置原始值。
+ * @returns 显示文本。
+ */
+function trialPolicyText(t: T, value: string): string {
+  switch (value) {
+    case 'passed': return t('market.trial.policy.passed')
+    case 'blocked': return t('market.trial.policy.blocked')
+    case 'warned': return t('market.trial.policy.warned')
+    case 'skipped': return t('market.trial.policy.skipped')
+    default: return t('market.trial.unknownValue', { value })
+  }
+}
+
+/**
+ * 挂载判定文案（基线 / 装入候选包后）。
+ *
+ * @param t - 字典座位。
+ * @param value - 判定形态；undefined 表示这一支没跑到（显示"未知"，不显示"成功"）。
+ * @returns 显示文本。
+ */
+function trialVerdictText(t: T, value: string | undefined): string {
+  switch (value) {
+    case 'mounted': return t('market.trial.verdict.mounted')
+    case 'failed': return t('market.trial.verdict.failed')
+    case 'undetermined': return t('market.trial.verdict.undetermined')
+    case undefined: return t('env.unknown')
+    default: return t('market.trial.unknownValue', { value })
+  }
+}
+
+/**
+ * 快照深度文案。
+ *
+ * @param t - 字典座位。
+ * @param value - 深度原始值；undefined 表示没物化快照。
+ * @returns 显示文本。
+ */
+function trialDepthText(t: T, value: string | undefined): string {
+  switch (value) {
+    case 'shallow': return t('market.trial.depthValue.shallow')
+    case 'full': return t('market.trial.depthValue.full')
+    case undefined: return t('env.unknown')
+    default: return t('market.trial.unknownValue', { value })
+  }
+}
+
+/**
+ * 渲染一次安装里的试装结论。
+ *
+ * 四条路径必须各自可辨（这是本块的验收口径）：
+ *   · blocked：结论与"已阻止安装并回滚"一起出现，失败原因不是一句泛化错误；
+ *   · warned 且安装成功：成功路径也要说"未通过、按警告放行"——放行不等于通过；
+ *   · skipped：说明这次按设置或豁免名单没执行试装，不静默；
+ *   · cannot-trial：说清"没有完成验证"，与"验证失败"是两件事。
+ *
+ * @param props - 字典座位与试装结论。
+ * @returns 试装结论块。
+ */
+function TrialResult({ t, trial }: { readonly t: T; readonly trial: TrialOutcomeView }) {
+  return (
+    <div className={css.notice} role="status">
+      <div className={css.cardHead}>
+        <span className={css.metaLabel}>{t('market.trial')}</span>
+        <Tag tone={TRIAL_CONCLUSION_TONE[trial.conclusion] ?? 'quiet'}>
+          {trialConclusionText(t, trial.conclusion)}
+        </Tag>
+        <Tag tone={TRIAL_POLICY_TONE[trial.policy] ?? 'quiet'}>{trialPolicyText(t, trial.policy)}</Tag>
+        <span className={css.meta}>{t('market.trial.elapsed', { ms: trial.elapsedMs })}</span>
+      </div>
+      {/* 最要紧的一句：放行不等于通过。它必须在成功路径上出现（task-14/18 的第三次机会）。 */}
+      {trial.policy === 'warned' ? <p className={css.error}>{t('market.trial.warned')}</p> : null}
+      {trial.conclusion === 'cannot-trial' ? <p className={css.error}>{t('market.trial.cannotTrial')}</p> : null}
+      {trial.policy === 'skipped' ? <p className={css.metaLabel}>{t('market.trial.skipped')}</p> : null}
+      <p className={css.metaLabel}>
+        {t('market.trial.depth', { depth: trialDepthText(t, trial.depth) })}
+        {trial.escalated
+          ? ' · ' + t('market.trial.escalated', { reason: trial.escalationReason ?? t('env.unknown') })
+          : ''}
+      </p>
+      <p className={css.metaLabel}>{t('market.trial.baseline', { verdict: trialVerdictText(t, trial.baseline) })}</p>
+      <p className={css.metaLabel}>{t('market.trial.candidate', { verdict: trialVerdictText(t, trial.candidate) })}</p>
+      {trial.policyNote === '' ? null : <p className={css.metaLabel}>{trial.policyNote}</p>}
+    </div>
+  )
+}
+
 /**
  * 渲染插件市场页。
  *
@@ -143,6 +268,7 @@ export function MarketplacePage({
   const installError = useMarketplace((state: MarketplaceState) => state.installError)
   const gateIssues = useMarketplace((state: MarketplaceState) => state.gateIssues)
   const rolledBack = useMarketplace((state: MarketplaceState) => state.rolledBack)
+  const trial = useMarketplace((state: MarketplaceState) => state.trial)
   const [sort, setSort] = useState<MarketSort>('stars')
   const [descending, setDescending] = useState(true)
   const [stateFilter, setStateFilter] = useState<MarketStateFilter>('all')
@@ -349,6 +475,9 @@ export function MarketplacePage({
           )}
         </div>
       )}
+
+      {/* 试装结论单独一块：它在**成功路径上也要出现**（warn 放行的安装是成功的，但没通过验证）。 */}
+      {trial === undefined ? null : <TrialResult t={t} trial={trial} />}
 
       {result === undefined && loading
         ? <p className={css.intro} role="status">{t('common.loading')}</p>

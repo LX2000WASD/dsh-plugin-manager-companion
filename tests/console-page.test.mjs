@@ -92,7 +92,10 @@ function boot(options = {}) {
     settingsScope: {
       bind() {
         return {
-          getSnapshot: () => ({ status: 'ready', value: undefined, base: undefined, user: undefined, revision: 1, writable: true, mode: 'host' }),
+          getSnapshot: () => ({
+            status: 'ready', value: options.configValue, base: undefined, user: undefined,
+            revision: 1, writable: true, mode: 'host',
+          }),
           subscribe: () => () => {}, mutate: async () => {}, set: async () => {}, unset: async () => {},
         }
       },
@@ -355,16 +358,15 @@ describe('环境子页与设置子页：控件唯一、归因准确、作用域�
   })
 
   it('设置子页如实点明作用域（配置对所有环境生效）', () => {
-    const shim = shimReact()
-    const { entry, face, t } = boot({ react: shim.react })
-    face.hooks.config.update((draft) => {
-      draft.status = 'ready'
-      draft.value = {
+    // 走真实的归一通道：值由 settingsScope 给，ConfigController 归一成草稿。
+    // 以前这里手工往 state 里塞一份未归一的 draft；task-52 之后草稿由归一保证一定有
+    // trial 段，手工塞的那份会让渲染读到 undefined（那正是它该报出来的信号）。
+    const { entry, face, t } = boot({
+      configValue: {
         diagnostics: { dependency: true, composition: true, runtime: true, consistency: true, ecosystem: false },
         qualityGate: { enabled: true, mode: 'block', allowlist: [] },
         marketplace: { enabled: true, cacheTtlMinutes: 1440, timeoutMs: 15000, indexUrl: '' },
-      }
-      draft.draft = draft.value
+      },
     })
     const html = renderTab(entry, face, t, 'settings')
     assert.ok(html.includes('配置对所有环境生效。'), '设置子页要有一句作用域事实：' + html.slice(0, 300))
@@ -845,15 +847,15 @@ describe('只读标记（task-48）：状态用标记承载，不用句子', () 
   })
 
   it('设置只读时显示「只读」标记 + 后果半句；可写时不显示', () => {
-    const booted = boot()
-    const value = {
-      diagnostics: { dependency: true, composition: true, runtime: true, consistency: true, ecosystem: false },
-      qualityGate: { enabled: true, mode: 'block', allowlist: [] },
-      marketplace: { enabled: true, cacheTtlMinutes: 1440, timeoutMs: 15000, indexUrl: '' },
-    }
-    booted.face.hooks.config.update((draft) => {
-      draft.status = 'ready'; draft.writable = true; draft.value = value; draft.draft = value
+    // 值经真实归一（宿主文档缺 trial 段时由客户端补齐）；可写性仍由 settingsScope 决定。
+    const booted = boot({
+      configValue: {
+        diagnostics: { dependency: true, composition: true, runtime: true, consistency: true, ecosystem: false },
+        qualityGate: { enabled: true, mode: 'block', allowlist: [] },
+        marketplace: { enabled: true, cacheTtlMinutes: 1440, timeoutMs: 15000, indexUrl: '' },
+      },
     })
+    booted.face.hooks.config.update((draft) => { draft.writable = true })
     const writable = renderTab(booted.entry, booted.face, booted.t, 'settings')
     assert.ok(!writable.includes('只读'), '可写时不该出现只读标记：' + writable.slice(0, 300))
 
@@ -989,11 +991,13 @@ describe('视觉令牌护栏（task-67）：承重层级与真令牌', () => {
     assert.deepEqual(offenders, [], '这些文件用了官方不存在的令牌名：' + offenders.join(', '))
   })
 
-  it('四处代码字体（issueCode/evidenceAt/envDir、templateBundles、kinds.path、market.repo）都在真令牌上', () => {
+  it('代码字体用法（issueCode/evidenceAt/envDir、templateBundles、kinds.path、market.repo、试装环境名）都在真令牌上', () => {
     const files = ['src/client/ConsolePage.module.css', 'src/client/KindsPage.module.css', 'src/client/MarketplacePage.module.css']
     const uses = files.flatMap(file =>
       readFileSync(file, 'utf8').match(/font-family:[ ]*var[(]--dsw-font-markdown-code-font-family[)]/g) || [])
-    assert.equal(uses.length, 4, '四处代码字体都要显式消费 --dsw-font-markdown-code-font-family：' + String(uses.length))
+    // 5 = task-67 的四处（issueCode/evidenceAt/envDir 合并成一条规则 + templateBundles + kinds.path + market.repo）
+    //     加 task-52 新增的试装环境名（工具生成的目录名，同属代码文本）。
+    assert.equal(uses.length, 5, '代码字体都要显式消费 --dsw-font-markdown-code-font-family：' + String(uses.length))
   })
 
   /** 取某个类自己的规则里的 color 令牌；类必须有独立规则，否则它只是"跟着别人一起变"。 */

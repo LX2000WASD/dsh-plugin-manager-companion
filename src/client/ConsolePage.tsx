@@ -26,15 +26,17 @@ import {
 import { defineStore, type HandleOf } from '@deepseek-ai/dsh-client-store'
 import type { ComposedProps, EntryKeyOf, SnapshotSelectorHook, TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
 import type { DiagnosticGroup, DiagnosticIssue, DiagnosticLayer, ManifestField } from '../types.ts'
-import { NS } from './locales.ts'
+import { NS, type CompanionLocaleKey } from './locales.ts'
 import { PmSelect } from './pmSelect.tsx'
 import {
   callOp,
   DIAGNOSTIC_LABEL, LAYER_LABEL, LAYER_ORDER,
-  evidenceKindOf, formatRelative, healthScore, issueInGroup, layerLabelKey, severityLabelKey, severityToneOf,
+  evidenceKindOf, formatBytes, formatRelative, healthScore, issueInGroup, layerLabelKey, severityLabelKey, severityToneOf,
   type CompanionSlotProps, type ConfigFace, type ConfigState, type ConsoleFace,
   type EnvironmentsFace, type EnvironmentsState, type HealthFace, type HealthState,
+  type TrialActionState, type TrialFace, type TrialState,
 } from './shared.ts'
+import type { TrialEnvironmentView, TrialEnvironmentsView } from './wire.ts'
 import css from './ConsolePage.module.css'
 
 /** 本文件里 t 的键域（本插件字典）。 */
@@ -51,6 +53,7 @@ const RENDERED_FIELDS: Record<ManifestField, true> = { bundles: true, dependenci
 /** 只带动作、不带 hooks 隔间的注入子面（子面板只吃自己需要的动作）。 */
 type EnvironmentActions = Omit<EnvironmentsFace, 'hooks'>
 type ConfigActions = Omit<ConfigFace, 'hooks'>
+type TrialActions = Omit<TrialFace, 'hooks'>
 
 /** 控制台里跨重挂载必须存活的状态。 */
 export interface ConsoleStoreState {
@@ -114,10 +117,11 @@ interface ConsoleTab {
  * @returns 带本地子页面切换的控制台。
  */
 export function ConsolePage({
-  t, useStore, actions, useHealth, useEnvironments, useConfig,
+  t, useStore, actions, useHealth, useEnvironments, useConfig, useTrial,
   diagnose, fix, setDiagnosticTarget, refreshEnvironments, startEnvironment, stopEnvironment,
   createEnvironment, renameEnvironment, removeEnvironment, copyPlugins, exportBackup, loadBackup,
   diffBackup, restoreBackup, dismissEnvironmentNotice, editConfigField, saveConfig, discardConfig,
+  loadTrial, removeTrialEnvironment, cleanupTrialEnvironments,
 }: ConsolePageProps) {
   const tabsId = useId()
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([])
@@ -140,6 +144,7 @@ export function ConsolePage({
     dismissEnvironmentNotice,
   }
   const configActions: ConfigActions = { editConfigField, saveConfig, discardConfig }
+  const trialActions: TrialActions = { loadTrial, removeTrialEnvironment, cleanupTrialEnvironments }
 
   return (
     <div className={css.page}>
@@ -203,7 +208,15 @@ export function ConsolePage({
             )
             : tab.id === 'env'
               ? <EnvironmentsPanel t={t} useEnvironments={useEnvironments} actions={environmentActions} />
-              : <ConfigPanel t={t} useConfig={useConfig} actions={configActions} />}
+              : (
+                <ConfigPanel
+                  t={t}
+                  useConfig={useConfig}
+                  useTrial={useTrial}
+                  actions={configActions}
+                  trialActions={trialActions}
+                />
+              )}
         </div>
       ))}
     </div>
@@ -1242,7 +1255,9 @@ function EnvironmentsPanel({ t, useEnvironments, actions }: EnvironmentsPanelPro
 interface ConfigPanelProps {
   readonly t: T
   readonly useConfig: SnapshotSelectorHook<ConfigState>
+  readonly useTrial: SnapshotSelectorHook<TrialState>
   readonly actions: ConfigActions
+  readonly trialActions: TrialActions
 }
 
 /**
@@ -1254,7 +1269,7 @@ interface ConfigPanelProps {
  * @param props - 字典座位、配置状态选择器与配置动作。
  * @returns 配置表单。
  */
-export function ConfigPanel({ t, useConfig, actions }: ConfigPanelProps) {
+export function ConfigPanel({ t, useConfig, useTrial, actions, trialActions }: ConfigPanelProps) {
   const status = useConfig(state => state.status)
   const writable = useConfig(state => state.writable)
   const value = useConfig(state => state.value)
@@ -1264,6 +1279,25 @@ export function ConfigPanel({ t, useConfig, actions }: ConfigPanelProps) {
   const saving = useConfig(state => state.saving)
   const failed = useConfig(state => state.failed)
   const saved = useConfig(state => state.saved)
+
+  const disclosure = useTrial(state => state.disclosure)
+  const disclosureError = useTrial(state => state.disclosureError)
+  const disclosureErrorKey = useTrial(state => state.disclosureErrorKey)
+  const report = useTrial(state => state.report)
+  const trialLoading = useTrial(state => state.loading)
+  const trialBusy = useTrial(state => state.busy)
+  const trialError = useTrial(state => state.error)
+  const trialErrorKey = useTrial(state => state.errorKey)
+  const trialAction = useTrial(state => state.action)
+
+  // 披露事实与测试环境列表各读一次（与体检页补环境列表同一手法：只补一次，失败不重试，
+  // 否则会形成 loading 翻转的死循环；失败原因由这一节自己如实显示）。
+  const requestedTrial = useRef(false)
+  useEffect(() => {
+    if (requestedTrial.current) return
+    requestedTrial.current = true
+    trialActions.loadTrial()
+  }, [trialActions])
 
   // 三种状态都必须是"能读的界面"：官方宿主的 settings 快照可能尚在加载、可能没有这个
   // 命名空间、也可能只给出残缺文档。draft 是归一后的值（见 shared.ts 的 ConfigController），
@@ -1398,6 +1432,146 @@ export function ConfigPanel({ t, useConfig, actions }: ConfigPanelProps) {
         </div>
       </fieldset>
 
+      <fieldset className={css.group} disabled={!writable}>
+        <legend className={css.groupTitle}>{t('config.trial')}</legend>
+        <div className={css.fieldRow}>
+          <span className={css.metaLabel}>{t('config.trial.enabled')}</span>
+          <Switch
+            checked={draft.trial.enabled}
+            label={t('config.trial.enabled')}
+            onChange={(next) => { actions.editConfigField(['trial', 'enabled'], next) }}
+          />
+        </div>
+        {/*
+          披露事实：一句一行。数字与口径都取自 host 的 capabilities.trialDisclosure——
+          抄一份就会在下次实测后漂移，而漂移的是"用户以为自己承担了什么风险"。
+          读不到时如实说「未知」并给出原因：静默等于把不知道说成没风险。
+        */}
+        {disclosure === undefined ? (
+          <p className={css.warn} role="status">
+            <Tag tone="warning">{t('config.trial.disclosureUnknown')}</Tag>
+            <span className={css.trialFactNote}>
+              {t('config.trial.disclosureReason', {
+                reason: disclosureErrorKey === undefined ? disclosureError ?? t('env.unknown') : t(disclosureErrorKey),
+              })}
+            </span>
+          </p>
+        ) : (
+          <>
+            {disclosure.executesCandidateCode ? <p className={css.trialFact}>{t('config.trial.factExecutes')}</p> : null}
+            <p className={css.trialFact}>{t('config.trial.factMemory', { mib: disclosure.peakMemoryMiB })}</p>
+            <p className={css.trialFactNote}>{t('config.trial.factMeasurement', { measurement: disclosure.measurement })}</p>
+          </>
+        )}
+        <div className={css.fieldRow}>
+          <span className={css.metaLabel}>{t('config.trial.depth')}</span>
+          <PmSelect
+            label={t('config.trial.depth')}
+            placeholder={t('config.trial.depth.auto')}
+            value={draft.trial.depth}
+            options={[
+              { id: 'auto', label: t('config.trial.depth.auto') },
+              { id: 'shallow', label: t('config.trial.depth.shallow') },
+              { id: 'full', label: t('config.trial.depth.full') },
+            ]}
+            onChange={(id) => { actions.editConfigField(['trial', 'depth'], id) }}
+          />
+        </div>
+        <p className={css.hint}>
+          {draft.trial.depth === 'shallow'
+            ? t('config.trial.depth.shallowHint')
+            : draft.trial.depth === 'full' ? t('config.trial.depth.fullHint') : t('config.trial.depth.autoHint')}
+        </p>
+        <div className={css.fieldRow}>
+          <span className={css.metaLabel}>{t('config.trial.baseline')}</span>
+          <Switch
+            checked={draft.trial.baseline}
+            label={t('config.trial.baseline')}
+            onChange={(next) => { actions.editConfigField(['trial', 'baseline'], next) }}
+          />
+        </div>
+        <p className={css.hint}>{t('config.trial.baselineHint')}</p>
+        <div className={css.fieldRow}>
+          <span className={css.metaLabel}>{t('config.trial.allowNetwork')}</span>
+          <Switch
+            checked={draft.trial.allowNetwork}
+            label={t('config.trial.allowNetwork')}
+            onChange={(next) => { actions.editConfigField(['trial', 'allowNetwork'], next) }}
+          />
+        </div>
+        <p className={css.hint}>{t('config.trial.allowNetworkHint')}</p>
+        <div className={css.fieldRow}>
+          <span className={css.metaLabel}>{t('config.trial.onFailure')}</span>
+          <PmSelect
+            label={t('config.trial.onFailure')}
+            placeholder={t('config.trial.onFailure.block')}
+            value={draft.trial.onFailure}
+            options={[
+              { id: 'block', label: t('config.trial.onFailure.block') },
+              { id: 'warn', label: t('config.trial.onFailure.warn') },
+            ]}
+            onChange={(id) => { actions.editConfigField(['trial', 'onFailure'], id) }}
+          />
+        </div>
+        <p className={css.hint}>
+          {draft.trial.onFailure === 'warn' ? t('config.trial.onFailure.warnHint') : t('config.trial.onFailure.blockHint')}
+        </p>
+        <div className={css.fieldRow}>
+          <span className={css.metaLabel}>{t('config.trial.autoCleanup')}</span>
+          <Switch
+            checked={draft.trial.autoCleanup}
+            label={t('config.trial.autoCleanup')}
+            onChange={(next) => { actions.editConfigField(['trial', 'autoCleanup'], next) }}
+          />
+        </div>
+        <div className={css.fieldRow}>
+          <span className={css.metaLabel}>{t('config.trial.retentionDays')}</span>
+          <Input
+            type="number"
+            min={1}
+            max={3650}
+            value={String(draft.trial.retentionDays)}
+            aria-label={t('config.trial.retentionDays')}
+            onChange={(event) => {
+              const next = Number(event.target.value)
+              if (Number.isFinite(next) && next >= 1) {
+                actions.editConfigField(['trial', 'retentionDays'], Math.min(3650, Math.trunc(next)))
+              }
+            }}
+          />
+        </div>
+        <p className={css.hint}>{t('config.trial.retentionHint')}</p>
+        <div className={css.fieldRow}>
+          <span className={css.metaLabel}>{t('config.trial.maxKept')}</span>
+          <Input
+            type="number"
+            min={0}
+            max={1000}
+            value={String(draft.trial.maxKept)}
+            aria-label={t('config.trial.maxKept')}
+            onChange={(event) => {
+              const next = Number(event.target.value)
+              if (Number.isFinite(next) && next >= 0) {
+                actions.editConfigField(['trial', 'maxKept'], Math.min(1000, Math.trunc(next)))
+              }
+            }}
+          />
+        </div>
+        <p className={css.hint}>{t('config.trial.maxKeptHint')}</p>
+      </fieldset>
+
+      <TrialEnvironments
+        t={t}
+        report={report}
+        loading={trialLoading}
+        busy={trialBusy}
+        action={trialAction}
+        error={trialError}
+        errorKey={trialErrorKey}
+        onRemove={trialActions.removeTrialEnvironment}
+        onCleanup={trialActions.cleanupTrialEnvironments}
+      />
+
       <div className={css.configFooter}>
         <span className={css.hint} role="status">
           {saving ? t('config.saving') : dirty ? t('config.dirty') : saved && value !== undefined ? t('config.saved') : t('config.clean')}
@@ -1424,3 +1598,178 @@ export function ConfigPanel({ t, useConfig, actions }: ConfigPanelProps) {
     </section>
   )
 }
+
+/** 试装环境管理那一节的 props：全是值 + 两个回调（订阅只在 ConfigPanel 一处）。 */
+interface TrialEnvironmentsProps {
+  readonly t: T
+  readonly report: TrialEnvironmentsView | undefined
+  readonly loading: boolean
+  readonly busy: string | undefined
+  readonly action: TrialActionState | undefined
+  readonly error: string | undefined
+  readonly errorKey: CompanionLocaleKey | undefined
+  readonly onRemove: (name: string) => void
+  readonly onCleanup: () => void
+}
+
+/**
+ * 渲染一个测试环境：名字 + 状态标记 + 占地/时间 + 删除入口。
+ *
+ * 布尔事实读不到时显示「未知」而不是「未运行」「归属没了」：后者是结论，不能拿它顶替读不到。
+ *
+ * @param props - 字典座位、这一条环境的事实与删除回调。
+ * @returns 一行测试环境。
+ */
+function TrialEnvironmentRow({ t, entry, busy, onRemove }: {
+  readonly t: T
+  readonly entry: TrialEnvironmentView
+  readonly busy: boolean
+  readonly onRemove: () => void
+}) {
+  return (
+    <li className={css.trialItem}>
+      <div className={css.trialHead}>
+        <code className={css.trialName}>{entry.name}</code>
+        {entry.running === true ? <Tag tone="info">{t('env.running')}</Tag> : null}
+        {entry.running === false ? <Tag tone="neutral">{t('env.stopped')}</Tag> : null}
+        {entry.running === undefined ? <Tag tone="warning">{t('trial.runningUnknown')}</Tag> : null}
+        {entry.ownerExists === false ? <Tag tone="warning">{t('trial.orphan')}</Tag> : null}
+        {entry.ownerExists === undefined ? <Tag tone="quiet">{t('trial.ownerUnknown')}</Tag> : null}
+      </div>
+      <div className={css.envMeta}>
+        <span className={css.metaLabel}>
+          {t('trial.owner', { name: entry.owner === '' ? t('env.unknown') : entry.owner })}
+        </span>
+        <span className={css.metaLabel}>
+          {entry.bytes === null
+            ? t('trial.bytesUnknown', { reason: entry.bytesReason ?? t('env.unknown') })
+            : t('trial.bytes', { size: formatBytes(entry.bytes) })}
+        </span>
+        <span className={css.metaLabel}>
+          {entry.ageDays === undefined
+            ? t('trial.modifiedAt', { at: entry.modifiedAt === '' ? t('env.unknown') : formatRelative(t, entry.modifiedAt) })
+            : t('trial.age', { days: entry.ageDays })}
+        </span>
+        {entry.sharedFiles > 0 ? (
+          <span className={css.metaLabel}>{t('trial.sharedFiles', { count: entry.sharedFiles })}</span>
+        ) : null}
+        <span className={css.metaLabel}>
+          {entry.snapshotMatchesOwner === true
+            ? t('trial.snapshotCurrent')
+            : entry.snapshotMatchesOwner === false ? t('trial.snapshotStale') : t('trial.snapshotNotApplicable')}
+        </span>
+      </div>
+      <Button variant="ghost" size="sm" disabled={busy} onClick={onRemove}>{t('trial.doRemove')}</Button>
+    </li>
+  )
+}
+
+/**
+ * 渲染「测试环境」那一节：谁存在、多大、最后一次物化是什么时候，以及删除与清理过期。
+ *
+ * 这是管理界面而不是解释界面：只列事实与动作。读失败时显示失败本身（含原因），
+ * 不显示空列表——空列表会被读成"没有测试环境"。
+ *
+ * @param props - 字典座位、这一节的状态与两个动作。
+ * @returns 测试环境列表、清理入口与操作结果。
+ */
+function TrialEnvironments({
+  t, report, loading, busy, action, error, errorKey, onRemove, onCleanup,
+}: TrialEnvironmentsProps) {
+  const [confirming, setConfirming] = useState<string | undefined>(undefined)
+  const failed = error !== undefined || errorKey !== undefined
+  // 上一次操作的结果：成功也必须说出来（清理 0 个与清理 2 个是两件不同的事），
+  // 失败走失败行——绝不把失败渲染成"完成"（task-14/18 的护栏）。
+  const actionText = action === undefined
+    ? undefined
+    : action.kind === 'cleanup' && action.ok
+      ? action.removed.length === 0 ? t('trial.cleanupNone') : t('trial.cleanupDone', { count: action.removed.length })
+      : action.output
+  return (
+    <fieldset className={css.group}>
+      <legend className={css.groupTitle}>{t('trial.title')}</legend>
+      {busy === undefined ? null : <p className={css.hint} role="status">{t('env.busy', { name: busy })}</p>}
+      {failed ? (
+        <p className={css.error} role="status">
+          {t('trial.failed', { message: errorKey === undefined ? error ?? t('env.unknown') : t(errorKey) })}
+        </p>
+      ) : null}
+      {report === undefined
+        ? (loading ? <p className={css.hint} role="status">{t('trial.loading')}</p> : null)
+        : (
+          <>
+            <div className={css.trialSummary}>
+              <span className={css.metaLabel}>{t('trial.count', { count: report.totals.count })}</span>
+              <span className={css.metaLabel}>{t('trial.total', { size: formatBytes(report.totals.bytes) })}</span>
+              {report.totals.unknownBytes > 0 ? (
+                <Tag tone="warning">{t('trial.unknownBytes', { count: report.totals.unknownBytes })}</Tag>
+              ) : null}
+              {report.overCap === true ? <Tag tone="warning">{t('trial.overCap')}</Tag> : null}
+              <Button variant="outline" size="sm" disabled={busy !== undefined} onClick={onCleanup}>
+                {t('trial.cleanup')}
+              </Button>
+            </div>
+            {report.factsReadable === false ? (
+              <p className={css.warn} role="status">
+                <Tag tone="warning">
+                  {t('trial.factsUnreadable', { reason: report.factsReason ?? t('env.unknown') })}
+                </Tag>
+                <span className={css.trialFactNote}>{t('trial.factsUnreadableNote')}</span>
+              </p>
+            ) : null}
+            {report.notes.map(note => <p key={note} className={css.hint}>{note}</p>)}
+            {report.environments.length === 0
+              ? <p className={css.hint} role="status">{t('trial.empty')}</p>
+              : (
+                <ul className={css.trialList}>
+                  {report.environments.map(entry => (
+                    <TrialEnvironmentRow
+                      key={entry.name}
+                      t={t}
+                      entry={entry}
+                      busy={busy !== undefined}
+                      onRemove={() => { setConfirming(entry.name) }}
+                    />
+                  ))}
+                </ul>
+              )}
+          </>
+        )}
+      {action === undefined ? null : (
+        action.ok
+          ? <p className={css.notice} role="status">{actionText}</p>
+          : (
+            <p className={css.error} role="status">
+              {t('trial.failed', { message: action.output === '' ? action.code ?? t('env.unknown') : action.output })}
+            </p>
+          )
+      )}
+      <Modal
+        open={confirming !== undefined}
+        onClose={() => { setConfirming(undefined) }}
+        title={t('trial.removeTitle', { name: confirming ?? '' })}
+        description={t('trial.removeDesc')}
+        closeLabel={t('common.close')}
+        footer={(
+          <>
+            <Button variant="ghost" size="md" onClick={() => { setConfirming(undefined) }}>{t('common.cancel')}</Button>
+            <Button
+              variant="primary"
+              size="md"
+              onClick={() => {
+                const name = confirming
+                setConfirming(undefined)
+                if (name !== undefined) onRemove(name)
+              }}
+            >
+              {t('trial.doRemove')}
+            </Button>
+          </>
+        )}
+      >
+        <p className={css.warn}>{t('trial.removeDesc')}</p>
+      </Modal>
+    </fieldset>
+  )
+}
+

@@ -311,6 +311,73 @@
   white-space: nowrap;
 }
 
+/* ── 试装（质量门第二步）：披露事实与测试环境管理 ───────────────────────── */
+
+.trialFact {
+  margin: 0 0 6px;
+  font-size: 13px;
+  line-height: 20px;
+  /* 承重：这两条事实决定用户要不要在自己机器上执行第三方代码，删掉就没法判断。 */
+  color: var(--dsw-alias-label-secondary);
+}
+
+.trialFactNote {
+  margin: 0 0 8px;
+  font-size: 12px;
+  line-height: 18px;
+  /* 口径与数字同档：没有口径的数字没有意义。 */
+  color: var(--dsw-alias-label-secondary);
+}
+
+.trialSummary {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin: 0 0 10px;
+}
+
+.trialList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.trialItem {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 0.5px solid var(--dsw-alias-border-l1);
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-layer-1);
+}
+
+.trialHead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.trialName {
+  font-family: var(--dsw-font-markdown-code-font-family);
+  font-size: 12px;
+  color: var(--dsw-alias-label-secondary);
+  word-break: break-all;
+}
+
+/* 操作结果（成功也留到下一次操作为止）：失败走 .error，成功的留在这里。 */
+.notice {
+  margin: 0 0 8px;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-secondary);
+}
+
 /* 环境子页 */
 
 .envList {
