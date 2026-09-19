@@ -828,6 +828,7 @@ function EnvironmentsPanel({ t, useEnvironments, actions }: EnvironmentsPanelPro
         {environments.map((environment) => {
           const running = environment.runs.length > 0
           const unknownFields = environment.unknownFields ?? []
+          const runsUnknown = environment.runsKnown === false
           const bundlesUnknown = unknownFields.includes('bundles')
           const dependenciesUnknown = unknownFields.includes('dependencies')
           // 两栏之外的字段名：闭集下不该出现，但"host 知道的事实被客户端悄悄丢掉"与"把不知道说成知道"
@@ -856,7 +857,13 @@ function EnvironmentsPanel({ t, useEnvironments, actions }: EnvironmentsPanelPro
                 <span className={css.envName}>{environment.name}</span>
                 {environment.current ? <Tag tone="info">{t('env.current')}</Tag> : null}
                 {environment.builtin ? <Tag tone="neutral">{t('env.builtin')}</Tag> : null}
-                <Tag tone={running ? 'success' : 'quiet'}>{running ? t('env.running') : t('env.stopped')}</Tag>
+                {/*
+                  运行栏也要区分"确实没在运行"与"我看不见进程表"：后者显示 未知，
+                  显示成"未运行"就是把"我不知道"说成"确实没有"（与层栈那两栏同一类误读）。
+                */}
+                {runsUnknown
+                  ? <Tag tone="warning">{t('env.unknown')}</Tag>
+                  : <Tag tone={running ? 'success' : 'quiet'}>{running ? t('env.running') : t('env.stopped')}</Tag>}
               </div>
               <div className={css.envMeta}>
                 <code className={css.envDir}>{environment.dir}</code>
@@ -872,6 +879,10 @@ function EnvironmentsPanel({ t, useEnvironments, actions }: EnvironmentsPanelPro
                   ? <Tag tone="warning">{t('env.unknown')}</Tag>
                   : <span>{t('env.dependencies', { count: environment.dependencies.length })}</span>}
                 {unknownLine === undefined ? null : <span className={css.envUnknownReason}>{unknownLine}</span>}
+                {/* 进程事实不可读的原因：可见文本，不挂 title。 */}
+                {runsUnknown && environment.runsUnknownReason !== undefined
+                  ? <span className={css.envUnknownReason}>{environment.runsUnknownReason}</span>
+                  : null}
                 {environment.runs.map(run => (
                   <span key={run.pid} className={css.envRun}>
                     {t('env.pid', { pid: run.pid })}

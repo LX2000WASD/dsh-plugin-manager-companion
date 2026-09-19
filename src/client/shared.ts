@@ -293,6 +293,7 @@ export const KIND_LABEL: Readonly<Record<MarketItemKind, CompanionLocaleKey>> = 
  */
 export const MARKET_LABEL: Readonly<Record<MarketLabelKey, CompanionLocaleKey>> = {
   sortStars: 'market.sort.stars',
+  sortTrending: 'market.sort.trending',
   sortAz: 'market.sort.az',
   sortUpdated: 'market.sort.updated',
   sortCategory: 'market.sort.category',
@@ -309,26 +310,6 @@ export const MARKET_LABEL: Readonly<Record<MarketLabelKey, CompanionLocaleKey>> 
   securityMedium: 'market.security.medium',
   securityHigh: 'market.security.high',
   securityUnknown: 'market.security.unknown',
-}
-
-/**
- * 一个市场标签的展示文案。
- *
- * 分类与主题是上游原始词（本地化只做"值 → 文案"，不做重排）；安装形态、策展状态与
- * 安全等级走 marketView 的键函数，未知等级折叠成"未知"而不是"低"。
- *
- * @param t - 本插件字典的翻译函数。
- * @param kind - 标签类别。
- * @param value - 标签原始值。
- * @returns 已本地化的标签文本。
- */
-export function marketTagLabel(t: TranslateNS<typeof NS>, kind: MarketTagKind, value: string): string {
-  switch (kind) {
-    case 'type': return t(MARKET_LABEL[typeLabelKey(value)])
-    case 'status': return t(MARKET_LABEL[statusLabelKey(value)])
-    case 'security': return t(MARKET_LABEL[securityLabelKey(value)])
-    default: return value
-  }
 }
 
 /**

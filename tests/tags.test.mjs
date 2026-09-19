@@ -1,109 +1,122 @@
 /**
- * tests/tags.test.mjs — 市场标签模型的验收测试（import 构建产物 dist/tags.js）。
+ * tests/tags.test.mjs — 市场徽标模型与详情数据的验收测试（import 构建产物 dist/tags.js）。
  *
- * 覆盖：顺序契约（category → type → status → verify → security → topic）、跨 kind 同值去重、
- * topic 预算按**实际产出**计数（旧审计 m-2 的修法）、色调映射、分类计数聚合。
+ * 被测对象是**构建产物**，不是 src：沿用旧仓库"被验的代码就是线上跑的代码"的方法论。
+ * 覆盖 docs/private/market-tags-policy.md 的契约（task-45 全量 13,998 条实测得出）：
+ *   · 优先级顺序 risk › caution › manual › pick › archived › category › topic（BADGE_PRIORITY）
+ *   · 卡片最多 3 槽；不满不占位
+ *   · **跨来源按归一化值去重**（上游 499 条把自己的 category 又写进 topics）
+ *   · 主题被泛化词过滤、限量 2、空值不重复不占预算
+ *   · 详情八项：顺序、空值不出行、外链只在 https 时出现、风险明细带 severity
  */
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-const { buildMarketTags, marketTagKey, categoryCounts, normalizeInstalledKind, statusTone, securityTone, TAG_KIND_ORDER } = await import('../dist/tags.js')
+const { buildMarketTags, buildMarketDetail, marketTagKey, categoryCounts, BADGE_PRIORITY, TAG_SLOT_LIMIT, TOPIC_SLOT_LIMIT } =
+  await import('../dist/tags.js')
 
-/** 一个"什么字段都有"的条目。 */
+/** 一个"什么信号都有"的条目（用来验证优先级与截断）。 */
 function fullSource(over = {}) {
   return {
-    category: 'memory',
-    installed: true,
-    kind: 'cordis-plugin',
-    status: '✅ listed',
-    verification: { level: 2, label: 'feature-tested' },
-    security: { riskLevel: 'medium', status: 'audited' },
-    topics: ['retrieval', 'vector', 'rag'],
+    category: 'vision',
+    installable: 'manual',
+    riskTier: 'risk',
+    marketTags: ['community-pick'],
+    archived: true,
+    topics: ['ocr', 'multimodal', 'rag'],
     ...over,
   }
 }
 
-test('顺序契约：category → type → status → verify → security → topic', () => {
-  assert.deepEqual(TAG_KIND_ORDER, ['category', 'type', 'status', 'verify', 'security', 'topic'])
-  const tags = buildMarketTags(fullSource(), { topicLimit: 1 })
-  assert.deepEqual(tags.map((tag) => tag.kind), ['category', 'type', 'status', 'verify', 'security', 'topic'])
-  // 产出的 kind 序列必须与契约非递减对应（渲染方按数组顺序画，不再排序）
-  const indexOf = (kind) => TAG_KIND_ORDER.indexOf(kind)
+test('顺序契约：risk → caution → manual → pick → archived → category → topic', () => {
+  assert.deepEqual(BADGE_PRIORITY, ['risk', 'caution', 'manual', 'pick', 'archived', 'category', 'topic'])
+  const tags = buildMarketTags(fullSource(), { slotLimit: 99 })
+  assert.deepEqual(
+    tags.map((tag) => tag.kind),
+    ['risk', 'manual', 'pick', 'archived', 'category', 'topic', 'topic'],
+    '顺序即政策优先级；主题永远排在最后',
+  )
+  const indexOf = (kind) => BADGE_PRIORITY.indexOf(kind)
   for (let index = 1; index < tags.length; index += 1) {
-    assert.ok(indexOf(tags[index - 1].kind) <= indexOf(tags[index].kind))
+    assert.ok(indexOf(tags[index - 1].kind) <= indexOf(tags[index].kind), '产出顺序必须与优先级非递减')
   }
 })
 
-test('跨 kind 同值去重：保留优先级更高的那次出现（大小写/空白不敏感）', () => {
-  const tags = buildMarketTags({ category: ' memory ', topics: ['memory', 'Memory', ' rag ', ''] })
-  assert.deepEqual(tags.map((tag) => tag.kind + ':' + tag.value), ['category:memory', 'topic:rag'])
-  // 主题与分类同名 → 只留分类
-  assert.equal(tags.filter((tag) => tag.value.toLowerCase() === 'memory').length, 1)
-  // status 与 topic 同值 → 保留 status
-  const statusFirst = buildMarketTags({ status: 'listed', topics: ['listed'] })
-  assert.deepEqual(statusFirst.map((tag) => tag.kind), ['status'])
-})
-
-test('topic 预算按实际产出计数：被去重吃掉的、空白的都不占额度（m-2）', () => {
-  const tags = buildMarketTags({ category: 'memory', topics: ['memory', 'cli', 'api'] })
-  assert.deepEqual(tags.map((tag) => tag.kind + ':' + tag.value), ['category:memory', 'topic:cli', 'topic:api'])
-  // 旧实现在这里只输出一个 topic（先把 3 个切片成 2 个，再被去重吃掉一个，且不补位）
-  assert.equal(tags.filter((tag) => tag.kind === 'topic').length, 2)
-
-  const blanks = buildMarketTags({ topics: ['  ', 'cli', '', 'api'] })
-  assert.deepEqual(blanks.map((tag) => tag.value), ['cli', 'api'])
-  assert.equal(buildMarketTags({ topics: ['cli', 'api'] }, { topicLimit: 0 }).length, 0)
-  assert.equal(buildMarketTags({ topics: ['cli', 'api'] }, { topicLimit: -1 }).length, 0)
-  assert.equal(buildMarketTags({ topics: ['cli', 'api'] }, { topicLimit: 1 }).length, 1)
-  // 非字符串主题（上游 JSON 漂移）不该炸掉整张卡片
-  assert.deepEqual(buildMarketTags({ topics: [7, 'cli'] }).map((tag) => tag.value), ['7', 'cli'])
-})
-
-test('type 标签：仅已安装条目有，值取归一化形态', () => {
-  assert.deepEqual(buildMarketTags({ installed: false, kind: 'skill' }), [])
-  assert.deepEqual(buildMarketTags({ kind: 'skill' }).map((tag) => tag.value), [], '未标记已安装就没有 type 标签')
-  const skill = buildMarketTags({ installed: true, kind: 'skill' })
-  assert.deepEqual(skill.map((tag) => tag.kind + ':' + tag.value), ['type:skill'])
-  assert.equal(buildMarketTags({ installed: true, kind: 'agent-preset' })[0].value, 'agent-preset')
-  assert.equal(buildMarketTags({ installed: true, kind: 'unknown' })[0].value, 'cordis-plugin')
-  assert.equal(buildMarketTags({ installed: true })[0].value, 'cordis-plugin')
-  assert.equal(normalizeInstalledKind(undefined), 'cordis-plugin')
-  assert.equal(normalizeInstalledKind('skill'), 'skill')
-})
-
-test('色调与 title：状态、验证等级、安全等级都如实映射', () => {
-  const tags = buildMarketTags(fullSource({ topics: [] }))
-  const byKind = Object.fromEntries(tags.map((tag) => [tag.kind, tag]))
-  assert.equal(byKind.status.tone, 'success')
-  assert.equal(byKind.status.title, '✅ listed')
-  assert.equal(byKind.verify.tone, 'success')
-  assert.equal(byKind.verify.level, 2)
-  assert.equal(byKind.verify.title, 'feature-tested')
-  assert.equal(byKind.security.tone, 'warning')
-  assert.equal(byKind.security.title, 'audited')
-  assert.equal(byKind.category.title, undefined)
-
-  assert.equal(statusTone('✅ verified'), 'success')
-  assert.equal(statusTone('something archived'), 'warning')
-  assert.equal(statusTone('待测'), 'neutral')
-  assert.equal(securityTone('low'), 'success')
-  assert.equal(securityTone('medium'), 'warning')
-  assert.equal(securityTone('HIGH'), 'danger')
-  assert.equal(securityTone('critical'), 'danger')
-  assert.equal(securityTone('unknown'), 'neutral')
-
-  // 跳过的扫描不该显示成"低风险"
-  assert.equal(buildMarketTags({ security: { riskLevel: 'low', status: 'skipped' } }).length, 0)
-  assert.equal(buildMarketTags({ verification: { level: 1, label: 'found' } })[0].tone, 'neutral')
-})
-
-test('空值/缺字段：一律不产出标签', () => {
+test('卡片最多 3 槽；不满不占位', () => {
+  assert.equal(TAG_SLOT_LIMIT, 3)
+  const tags = buildMarketTags(fullSource())
+  assert.equal(tags.length, 3, '六个信号也只出三个')
+  assert.deepEqual(tags.map((tag) => tag.kind), ['risk', 'manual', 'pick'], '取优先级最高的三个')
   assert.deepEqual(buildMarketTags({}), [])
-  assert.deepEqual(buildMarketTags({ category: '   ', topics: [], status: '' }), [])
-  // 生态泛化主题的过滤在 registry.functionalTopics（数据源层）做；这里只管顺序与预算
-  assert.deepEqual(buildMarketTags({ category: 'tool', topics: ['ai'] }).map((tag) => tag.value), ['tool', 'ai'])
-  assert.equal(marketTagKey({ kind: 'topic', value: 'cli', tone: 'neutral' }), 'topic:cli')
+  assert.deepEqual(buildMarketTags({ riskTier: 'safe' }).map((tag) => tag.kind), [], 'safe 不是徽标（政策：只有非 safe 才提示）')
+  assert.deepEqual(buildMarketTags({ topics: [] }), [], '没有信号就不占位')
+})
+
+test('跨来源同值去重：分类与主题同名时只留分类（上游 499 条的实例）', () => {
+  const tags = buildMarketTags({ category: 'vision', topics: ['vision', 'ocr'] }, { slotLimit: 99 })
+  assert.deepEqual(tags.map((tag) => tag.value), ['vision', 'ocr'], 'vision 只出现一次，且来自优先级更高的分类')
+  assert.equal(tags.filter((tag) => tag.value.toLowerCase() === 'vision').length, 1)
+  const dupes = buildMarketTags({ category: ' Memory ', topics: ['memory', 'MEMORY', 'rag'] }, { slotLimit: 99 })
+  assert.deepEqual(dupes.map((tag) => tag.value), ['Memory', 'rag'], '大小写不敏感、值两端空白被 trim')
+})
+
+test('主题：泛化词过滤、限量 2、空值与重复不占预算', () => {
+  assert.equal(TOPIC_SLOT_LIMIT, 2)
+  const tags = buildMarketTags({ topics: ['dsh-plugin', 'ai', 'ocr', 'ocr', 'rag', 'vector'] }, { slotLimit: 99 })
+  assert.deepEqual(tags.map((tag) => tag.value), ['ocr', 'rag'], '泛化词被剔、重复被去重、最多 2 个')
+  const blanks = buildMarketTags({ topics: ['  ', 'ocr', '', 'rag'] }, { slotLimit: 99 })
+  assert.deepEqual(blanks.map((tag) => tag.value), ['ocr', 'rag'])
+  assert.deepEqual(buildMarketTags({ topics: ['ocr'] }, { topicLimit: 0 }), [])
+  assert.deepEqual(buildMarketTags({ topics: [7, 'ocr'] }, { slotLimit: 99 }).map((tag) => tag.value), ['7', 'ocr'], '非字符串主题不该炸卡片')
+})
+
+test('色调：政策 §3.3 的语义分级（只说上游结论）', () => {
+  const toneOf = (item) => Object.fromEntries(buildMarketTags(item, { slotLimit: 99 }).map((tag) => [tag.kind, tag.tone]))
+  assert.deepEqual(toneOf({ riskTier: 'risk' }), { risk: 'danger' })
+  assert.deepEqual(toneOf({ riskTier: 'caution' }), { caution: 'warning' })
+  assert.deepEqual(toneOf({ installable: 'manual' }), { manual: 'neutral' })
+  assert.deepEqual(toneOf({ marketTags: ['community-pick'] }), { pick: 'success' })
+  assert.deepEqual(toneOf({ archived: true }), { archived: 'warning' })
+  assert.deepEqual(toneOf({ category: 'tool' }), { category: 'neutral' })
+  assert.deepEqual(buildMarketTags({ category: 'tool' }).map((tag) => tag.kind), ['category'], '上游没给风险结论时不显示风险徽标')
+  assert.deepEqual(buildMarketTags({ marketTags: ['verified-install'] }), [], '未知收录标记不产出徽标（只认 community-pick）')
+  assert.equal(marketTagKey({ kind: 'topic', value: 'ocr', tone: 'neutral' }), 'topic:ocr')
+})
+
+test('详情：八项的顺序、空值不出行、外链与风险明细', () => {
+  const detail = buildMarketDetail({
+    kind: 'cordis-plugin',
+    category: 'vision',
+    topics: ['dsh-plugin', 'ocr', 'multimodal'],
+    riskTier: 'risk',
+    riskFlags: [
+      { id: 'curl-pipe-shell', severity: 'critical', category: 'downloadExec' },
+      { id: 'setenv-var-path', severity: 'high', category: 'pathStartup' },
+    ],
+    reportUrl: 'https://github.com/qing3a/dsh-plugin-verify/blob/main/reports/modlens-2026-08-15.json',
+    verifiedBy: 'dsh-plugin-verify@0.1.2',
+    verifiedAt: '2026-08-15',
+    license: 'MIT',
+    packageName: 'modlens',
+    latestVersion: '1.2.3',
+  })
+  assert.deepEqual(
+    detail.map((entry) => entry.key),
+    ['kind', 'category', 'topics', 'riskTier', 'riskFlags', 'verified', 'license', 'npm', 'version'],
+  )
+  const byKey = Object.fromEntries(detail.map((entry) => [entry.key, entry]))
+  assert.equal(byKey.topics.value, 'ocr, multimodal', '主题在详情里过滤泛化词、最多 8 个')
+  assert.equal(byKey.riskFlags.value, 'curl-pipe-shell(critical), setenv-var-path(high)', '风险明细带 severity，原样呈现')
+  assert.equal(byKey.verified.value, 'dsh-plugin-verify@0.1.2 · 2026-08-15', '校验证据必须有"谁 + 何时"')
+  assert.equal(byKey.verified.href, 'https://github.com/qing3a/dsh-plugin-verify/blob/main/reports/modlens-2026-08-15.json', '报告外链挂在同一条证据上')
+  assert.equal(byKey.riskTier.tone, 'danger')
+
+  assert.deepEqual(buildMarketDetail({ category: 'tool' }).map((entry) => entry.key), ['category'], '空值不出行')
+  assert.equal(buildMarketDetail({ category: 'tool' }).some((entry) => entry.key === 'verified'), false, '没有校验证据就没有那一行')
+  assert.equal(buildMarketDetail({ riskTier: 'safe' }).some((entry) => entry.key === 'riskTier'), false, 'safe 不产出风险行')
+  const many = buildMarketDetail({ topics: Array.from({ length: 12 }, (_, index) => 'topic' + String(index)) })
+  assert.equal(many[0].value.split(', ').length, 8, '主题在详情里最多 8 个')
 })
 
 test('categoryCounts：聚合、trim、空值不计、顺序确定', () => {
@@ -113,7 +126,6 @@ test('categoryCounts：聚合、trim、空值不计、顺序确定', () => {
   ])
   assert.deepEqual(counts, { tool: 2, memory: 1 })
   assert.deepEqual(Object.keys(counts), ['tool', 'memory'], 'key 顺序 = 首次出现顺序')
-  assert.equal(JSON.stringify(counts), JSON.stringify(categoryCounts([{ category: 'tool' }, { category: 'tool' }, { category: 'memory' }])), '同内容同序列化')
   assert.deepEqual(categoryCounts([]), {})
   const list = [{ category: 'tool' }]
   categoryCounts(list)

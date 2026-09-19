@@ -35,12 +35,18 @@ import { charMask, fuzzyScoreLowered, type CharMask } from './rank.ts'
 
 /**
  * 排序模式。
- * - `stars`：星数；`az`：名称；`updated`：最后更新；`category`：上游分类。
+ * - `stars`：星数；`trending`：近 7 天 star 增量；`az`：名称；`updated`：最后更新；`category`：上游分类。
  */
-export type MarketSort = 'stars' | 'az' | 'updated' | 'category'
+export type MarketSort = 'stars' | 'trending' | 'az' | 'updated' | 'category'
 
-/** 工具栏里的模式顺序（也是循环切换的顺序）。 */
-export const SORT_MODES: readonly MarketSort[] = ['stars', 'az', 'updated', 'category']
+/**
+ * 工具栏里的模式顺序（也是循环切换的顺序）。
+ *
+ * `trending` 用上游的 stars_delta_7d（近 7 天增量，12,921 条有值）：星数排序对新插件不利
+ * （全体星数中位 1、6,466 条 0 星），"最近在涨"是另一件事。政策规定它**只做排序、不做徽标**
+ * （7,735 条增量为 0，做成徽标就是噪声）。
+ */
+export const SORT_MODES: readonly MarketSort[] = ['stars', 'trending', 'az', 'updated', 'category']
 
 /**
  * 每个模式的**默认方向**（切换模式时套用；用户按方向按钮可再翻转）。
@@ -48,6 +54,7 @@ export const SORT_MODES: readonly MarketSort[] = ['stars', 'az', 'updated', 'cat
  */
 export const SORT_DEFAULT_DESCENDING: Readonly<Record<MarketSort, boolean>> = {
   stars: true,
+  trending: true,
   az: false,
   updated: true,
   category: false,
@@ -64,16 +71,9 @@ export const ALL_CATEGORIES = ''
 /** 分类筛选下拉里被钉在最后的兜底分类（上游分类器的大杂烩桶）。 */
 export const CATCH_ALL_CATEGORY = 'other'
 
-/** 卡片标签行每行放的标签数（两行是卡片的固定预算）。 */
-export const TAG_SLOTS = 4
-/** 卡片标签行数。 */
-export const TAG_ROWS = 2
-/** 卡片能显示的标签总数。 */
-export const VISIBLE_TAGS = TAG_SLOTS * TAG_ROWS
-
 /** 本模块产出的字典键（client 侧字典必须有这些键；文案不在这里硬编码）。 */
 export type MarketLabelKey =
-  | 'sortStars' | 'sortAz' | 'sortUpdated' | 'sortCategory'
+  | 'sortStars' | 'sortTrending' | 'sortAz' | 'sortUpdated' | 'sortCategory'
   | 'sortAsc' | 'sortDesc' | 'filterCategory'
   | 'typeCordisPlugin' | 'typeSkill' | 'typeAgentPreset'
   | 'statusVerified' | 'statusArchived' | 'statusPending'
@@ -82,6 +82,7 @@ export type MarketLabelKey =
 /** 模式的字典键。 */
 export function sortLabelKey(sort: MarketSort): MarketLabelKey {
   switch (sort) {
+    case 'trending': return 'sortTrending'
     case 'az': return 'sortAz'
     case 'updated': return 'sortUpdated'
     case 'category': return 'sortCategory'
@@ -163,6 +164,10 @@ export function compareByMode(left: MarketItem, right: MarketItem, sort: MarketS
       return compareText(left.name, right.name)
     case 'updated':
       return compareStamp(left.updatedAt, right.updatedAt)
+    case 'trending':
+      // 近 7 天 star 增量；增量为 0 与"上游没给"在这里同值——政策只把它当排序维度，
+      // 不承担"有没有数据"的表达（60% 为 0，做成徽标就是噪声）。
+      return (left.starsDelta7d ?? 0) - (right.starsDelta7d ?? 0)
     case 'category': {
       const leftCategory = (left.category ?? '').trim()
       const rightCategory = (right.category ?? '').trim()
@@ -215,6 +220,47 @@ export function rowComparator(sort: MarketSort, descending: boolean): (left: Mar
  */
 export function sortRows(items: readonly MarketItem[], sort: MarketSort, descending: boolean): MarketItem[] {
   return [...items].sort(rowComparator(sort, descending))
+}
+
+/**
+ * 状态筛选：全部 / 只看已安装 / 只看可更新。
+ *
+ * 「可更新」用与卡片徽标同一个判据（{@link updateAvailable}），不在第二处重新判断"什么算可更新"。
+ */
+export type MarketStateFilter = 'all' | 'installed' | 'updatable'
+
+/** 状态筛选的选项顺序（工具栏顺序）。 */
+export const STATE_FILTERS: readonly MarketStateFilter[] = ['all', 'installed', 'updatable']
+
+/**
+ * 状态筛选。
+ *
+ * @param items - 条目。
+ * @param filter - 选中的状态；`all` 原样返回。
+ * @returns 筛后的条目（不筛时原样返回入参）。
+ */
+export function filterByState(items: readonly MarketItem[], filter: MarketStateFilter): readonly MarketItem[] {
+  if (filter === 'all') return items
+  if (filter === 'installed') return items.filter((item) => item.installed === true)
+  return items.filter((item) => updateAvailable(item))
+}
+
+/**
+ * 上游可装性过滤（政策 §3.2 第 1 条）。
+ *
+ * **只过滤一种**：installable = non-plugin（上游明说"不是插件"，1,018 条，样本里有 96,949★ 的蹭话题仓库）。
+ * 其余一律照常显示——上游没标记（12,256 条）不等于"可一键安装"，我们**不替上游补这个结论**；
+ * installable = manual 也不隐藏，它由「需手动安装」徽标如实说明。
+ *
+ * 过滤是**展示决策**，所以放在客户端：REST 结果里这些条目仍然在，host 从不替用户做取舍。
+ *
+ * @param items - 条目。
+ * @param includeNonPlugin - 用户是否主动打开「显示非插件条目」。
+ * @returns 筛后的条目。
+ */
+export function filterInstallable(items: readonly MarketItem[], includeNonPlugin: boolean): readonly MarketItem[] {
+  if (includeNonPlugin) return items
+  return items.filter((item) => item.installable !== 'non-plugin')
 }
 
 /**
@@ -312,24 +358,6 @@ export function updateAvailable(item: MarketItem): boolean {
 /** 一个条目的标签（每次列表构建一次，作为卡片的 memo 依赖）。 */
 export function tagsOf(item: MarketItem): readonly MarketTag[] {
   return buildMarketTags(item)
-}
-
-/**
- * "+n" 徽标的数字：共享标签模型没有吐出来的主题（它按契约限量）+ 超出两行预算的标签。
- * 主题按去重后的实际数量算，重复主题不会把计数吹大。
- */
-export function tagOverflowCount(tags: readonly MarketTag[], topics: readonly string[] | undefined, slots: number = VISIBLE_TAGS): number {
-  const topicTotal = new Set((topics ?? [])
-    .map((topic) => topic.trim().toLowerCase())
-    .filter((topic) => topic.length > 0)).size
-  const shownTopics = tags.reduce((count, tag) => (tag.kind === 'topic' ? count + 1 : count), 0)
-  const hiddenTags = Math.max(0, tags.length - slots)
-  return Math.max(0, topicTotal - shownTopics) + hiddenTags
-}
-
-/** 被两行预算挤掉的标签（client 用字典把它们拼成 title 文案）。 */
-export function tagOverflowTags(tags: readonly MarketTag[], slots: number = VISIBLE_TAGS): readonly MarketTag[] {
-  return tags.slice(slots)
 }
 
 // ── 搜索（P1：只搜名称 → 搜名称 / repo / 主题 / 描述） ──────────────────────

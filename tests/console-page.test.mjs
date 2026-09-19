@@ -827,3 +827,48 @@ describe('只读标记（task-48）：状态用标记承载，不用句子', () 
     assert.ok(!readOnly.includes('本部署的设置是只读的'), '状态句不得回来（已由标记承载）')
   })
 })
+
+describe('环境列表：进程事实不可读时运行栏显示「未知」而不是「未运行」（task-63）', () => {
+  const payload = (extra) => [{
+    name: 'pm-runs', dir: '/tmp/pm-runs', current: true, builtin: false,
+    bundles: ['@deepseek-ai/dsh-base'], dependencies: [], runs: [],
+    ...extra,
+  }]
+
+  /** 走 wire 归一（最接近真机路径），再渲染「环境」子页。 */
+  async function renderEnv(payloadValue) {
+    const booted = boot()
+    const stub = stubFetch({ listEnvironments: () => ({ ok: true, value: payloadValue }) })
+    try {
+      booted.face.refreshEnvironments()
+      await until(() => booted.face.hooks.environments.getSnapshot().loading === false, '环境列表落地')
+      return { ...booted, html: renderTab(booted.entry, booted.face, booted.t, 'env') }
+    } finally { stub.restore() }
+  }
+
+  it('runsKnown=false：显示「未知」+ 可见原因，且**不出现「未运行」**', async () => {
+    const reason = 'powershell CIM 不可用（spawnSync powershell ENOENT）：无法读取进程表'
+    const { html } = await renderEnv(payload({ runsKnown: false, runsUnknownReason: reason }))
+    assert.ok(html.includes('未知'), '运行栏要显示未知：' + html.slice(0, 500))
+    assert.ok(!html.includes('未运行'), '不知道就不能说"未运行"（这正是本任务要防的误读）')
+    assert.ok(html.includes(reason), '原因必须是可见文本，不是只挂 title')
+  })
+
+  it('反向：缺省 runsKnown 时照旧显示真实状态（空 runs = 未运行）', async () => {
+    const { html } = await renderEnv(payload({ runs: [] }))
+    assert.ok(html.includes('未运行'), '确定没在运行就照旧说未运行：' + html.slice(0, 400))
+    assert.ok(!html.includes('未知'), '不是未知就不能出现未知')
+  })
+
+  it('反向：有运行实例时显示「运行中」', async () => {
+    const { html } = await renderEnv(payload({ runs: [{ pid: 42, port: 3090, command: 'node dsh.js' }] }))
+    assert.ok(html.includes('运行中'), '有实例就是运行中：' + html.slice(0, 400))
+    assert.ok(!html.includes('未知'), '不是未知就不能出现未知')
+  })
+
+  it('只透传已知事实：runsKnown 是别的取值时不发明「未知」', async () => {
+    const { html } = await renderEnv(payload({ runsKnown: 'no', runsUnknownReason: '一些原因' }))
+    assert.ok(html.includes('未运行'), '非 false 一律按已知处理：' + html.slice(0, 400))
+    assert.ok(!html.includes('未知'), '不发明未知')
+  })
+})

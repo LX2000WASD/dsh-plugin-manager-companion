@@ -25,7 +25,7 @@ import { dirname, join } from 'node:path'
 import { gunzipSync } from 'node:zlib'
 import { dshHome } from './paths.ts'
 import type { Fetcher } from './net.ts'
-import type { MarketItemKind } from './types.ts'
+import type { MarketInstallable, MarketItemKind, MarketRiskFlag, MarketRiskTier } from './types.ts'
 
 /** 社区索引仓库。只读消费，永远是硬编码兜底，不是依赖。 */
 export const REGISTRY_OWNER = 'bradeGithub'
@@ -87,6 +87,32 @@ export interface RegistryRepo {
   readonly latestVersion?: string
   /** 上游若显式给出条目形态就透传；否则由 marketplace.ts 按来源判定。 */
   readonly kind?: MarketItemKind
+  /**
+   * ── 上游元数据（task-45 政策决定"展示哪些"，本层只负责**原样透传事实**）──
+   *
+   * 分层：**服务端只给事实，展示决策在客户端**。典型例子：installable=non-plugin 的条目
+   * 仍然会出现在 REST 结果里（1,018 条），是否隐藏由 UI 的 filterInstallable 决定——
+   * host 替用户做过滤会让"上游到底标了什么"无从查证。
+   */
+  readonly installable?: MarketInstallable
+  /** 上游风险等级；缺省表示上游没给结论（不是 safe）。 */
+  readonly riskTier?: MarketRiskTier
+  /** 上游风险明细（超长会截断：卡片不用，详情够用）。 */
+  readonly riskFlags?: readonly MarketRiskFlag[]
+  /** 独立验证报告外链（仅在 verdict=pass 时透传，见 normalize）。 */
+  readonly reportUrl?: string
+  /** 上游收录标记（community-pick / verified-install / …）。 */
+  readonly marketTags?: readonly string[]
+  /** 仓库已归档。 */
+  readonly archived?: boolean
+  /** 近 7 天 star 增量（只用于排序）。 */
+  readonly starsDelta7d?: number
+  /** 仓库许可证（SPDX id）；按政策只进详情。 */
+  readonly license?: string
+  /** 独立校验方（verdict=pass 时）。 */
+  readonly verifiedBy?: string
+  /** 独立校验时间（verdict=pass 时，ISO 日期）。 */
+  readonly verifiedAt?: string
 }
 
 const MARKET_ITEM_KINDS: readonly MarketItemKind[] = ['cordis-plugin', 'skill', 'agent-preset', 'unknown']
@@ -123,6 +149,7 @@ export function normalizeRegistryRepo(raw: unknown): RegistryRepo | null {
   const kind = MARKET_ITEM_KINDS.includes(record['kind'] as MarketItemKind)
     ? record['kind'] as MarketItemKind
     : undefined
+  const upstream = upstreamFacts(record)
   const category = str(record['category'])
   const packageName = str(record['pkg_name']) ?? str(record['package_name'])
   const latestVersion = str(record['version'])
@@ -137,6 +164,62 @@ export function normalizeRegistryRepo(raw: unknown): RegistryRepo | null {
     ...(packageName === undefined ? {} : { packageName }),
     ...(latestVersion === undefined ? {} : { latestVersion }),
     ...(kind === undefined ? {} : { kind }),
+    ...upstream,
+  }
+}
+
+/** 上游风险明细的透传上限：多到够说明问题，又不至于把 13,998 条撑大。 */
+const RISK_FLAG_LIMIT = 12
+/** 收录标记的透传上限（上游目前最多 2 个）。 */
+const MARKET_TAG_LIMIT = 8
+
+/**
+ * 解析上游元数据（task-46 新增）。
+ *
+ * 三条边界写在这里而不是散在各处：
+ * 1. **原样透传，不改写**：installable / risk_tier / market_tags 的值域原样保留，host 不做任何取舍；
+ * 2. **证据簇只在 verdict=pass 时透传**：reportUrl / verifiedBy / verifiedAt 单看没有意义，
+ *    与"这条被独立验证过"这个结论绑定；没有 verdict 时它们一律丢弃，避免客户端把孤立的链接当结论；
+ * 3. **外链只认 https**：reportUrl 会被渲染成 href，必须挡住 javascript: 之类的取巧值。
+ *
+ * @param record - 原始条目。
+ * @returns 可直接展开进 RegistryRepo 的字段。
+ */
+function upstreamFacts(record: Record<string, unknown>): Partial<RegistryRepo> {
+  const installableValue = str(record['installable'])
+  const riskTierValue = str(record['risk_tier'])
+  const riskFlags = Array.isArray(record['risk_flags'])
+    ? record['risk_flags']
+      .map((raw): MarketRiskFlag | null => {
+        if (raw === null || typeof raw !== 'object') return null
+        const flag = raw as Record<string, unknown>
+        const id = str(flag['id'])
+        if (id === undefined) return null
+        return { id, severity: str(flag['severity']) ?? '', category: str(flag['category']) ?? '' }
+      })
+      .filter((flag): flag is MarketRiskFlag => flag !== null)
+      .slice(0, RISK_FLAG_LIMIT)
+    : []
+  const marketTags = Array.isArray(record['market_tags'])
+    ? record['market_tags'].map((tag) => String(tag).trim()).filter((tag) => tag.length > 0).slice(0, MARKET_TAG_LIMIT)
+    : []
+  const verdictPass = str(record['verdict']) === 'pass'
+  const reportUrlRaw = str(record['reportUrl'])
+  const reportUrl = verdictPass && reportUrlRaw !== undefined && reportUrlRaw.startsWith('https://') ? reportUrlRaw : undefined
+  const starsDelta7d = typeof record['stars_delta_7d'] === 'number' && Number.isFinite(record['stars_delta_7d'])
+    ? record['stars_delta_7d']
+    : undefined
+  return {
+    ...(installableValue === 'manual' || installableValue === 'non-plugin' ? { installable: installableValue as MarketInstallable } : {}),
+    ...(riskTierValue === 'safe' || riskTierValue === 'caution' || riskTierValue === 'risk' ? { riskTier: riskTierValue as MarketRiskTier } : {}),
+    ...(riskFlags.length === 0 ? {} : { riskFlags }),
+    ...(reportUrl === undefined ? {} : { reportUrl }),
+    ...(marketTags.length === 0 ? {} : { marketTags }),
+    ...(record['archived'] === true ? { archived: true } : {}),
+    ...(starsDelta7d === undefined ? {} : { starsDelta7d }),
+    ...(str(record['license']) === undefined ? {} : { license: str(record['license'])! }),
+    ...(verdictPass && str(record['verifiedBy']) !== undefined ? { verifiedBy: str(record['verifiedBy'])! } : {}),
+    ...(verdictPass && str(record['verifiedAt']) !== undefined ? { verifiedAt: str(record['verifiedAt'])! } : {}),
   }
 }
 

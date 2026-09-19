@@ -71,6 +71,18 @@ export function registryItem(repo: RegistryRepo): MarketplaceCandidate {
     ...(repo.packageName === undefined ? {} : { packageName: repo.packageName }),
     ...(repo.latestVersion === undefined ? {} : { latestVersion: repo.latestVersion }),
     kind: repo.kind ?? 'cordis-plugin',
+    // 上游元数据**原样**带过去，host 不替用户做取舍：installable=non-plugin 的条目照样进结果，
+    // 是否隐藏由客户端 filterInstallable 决定（政策 §3.2；registry.ts 的 upstreamFacts 有同样说明）。
+    ...(repo.installable === undefined ? {} : { installable: repo.installable }),
+    ...(repo.riskTier === undefined ? {} : { riskTier: repo.riskTier }),
+    ...(repo.riskFlags === undefined ? {} : { riskFlags: repo.riskFlags }),
+    ...(repo.reportUrl === undefined ? {} : { reportUrl: repo.reportUrl }),
+    ...(repo.marketTags === undefined ? {} : { marketTags: repo.marketTags }),
+    ...(repo.archived === undefined ? {} : { archived: repo.archived }),
+    ...(repo.starsDelta7d === undefined ? {} : { starsDelta7d: repo.starsDelta7d }),
+    ...(repo.license === undefined ? {} : { license: repo.license }),
+    ...(repo.verifiedBy === undefined ? {} : { verifiedBy: repo.verifiedBy }),
+    ...(repo.verifiedAt === undefined ? {} : { verifiedAt: repo.verifiedAt }),
   }
 }
 
@@ -131,6 +143,16 @@ export function toWireItem(item: MarketplaceCandidate): MarketItem {
     ...(item.kind === undefined ? {} : { kind: item.kind }),
     ...(item.packageName === undefined ? {} : { packageName: item.packageName }),
     installSpec: installSpecFor(item.repo, item.packageName),
+    ...(item.installable === undefined ? {} : { installable: item.installable }),
+    ...(item.riskTier === undefined ? {} : { riskTier: item.riskTier }),
+    ...(item.riskFlags === undefined ? {} : { riskFlags: item.riskFlags }),
+    ...(item.reportUrl === undefined ? {} : { reportUrl: item.reportUrl }),
+    ...(item.marketTags === undefined ? {} : { marketTags: item.marketTags }),
+    ...(item.archived === undefined ? {} : { archived: item.archived }),
+    ...(item.starsDelta7d === undefined ? {} : { starsDelta7d: item.starsDelta7d }),
+    ...(item.license === undefined ? {} : { license: item.license }),
+    ...(item.verifiedBy === undefined ? {} : { verifiedBy: item.verifiedBy }),
+    ...(item.verifiedAt === undefined ? {} : { verifiedAt: item.verifiedAt }),
   }
 }
 

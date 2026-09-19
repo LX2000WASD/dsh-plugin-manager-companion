@@ -29,8 +29,8 @@ import type {
   DiagnosticEvidence, DiagnosticFix, DiagnosticGroup, DiagnosticIssue, DiagnosticLayer,
   DiagnosticReport, DiagnosticScopeCount, DiagnosticSeverity, DiagnosticSkip, EnvironmentBackup,
   EnvironmentBackupDiff, EnvironmentInfo, ManifestField,
-  EnvironmentResult, GatedInstallResult, InstalledKind, KindListResult, MarketItem,
-  MarketItemKind, MarketplaceResult,
+  EnvironmentResult, GatedInstallResult, InstalledKind, KindListResult, MarketInstallable, MarketItem,
+  MarketItemKind, MarketRiskFlag, MarketplaceResult, MarketRiskTier,
 } from '../types.ts'
 import type { OfficialCapabilities } from '../official.ts'
 import type { CompanionConfig } from '../settings.ts'
@@ -365,6 +365,14 @@ export function normalizeEnvironments(raw: unknown): EnvironmentInfo[] | undefin
       runs: asArray(record['runs'])
         .map(entry => run(entry))
         .filter((entry): entry is EnvironmentInfo['runs'][number] => entry !== undefined),
+      // 进程事实**是否可读**：只有明确的 false 才带（缺字段/任何其它取值一律按可读处理，不发明"未知"）。
+      // 读数归零不能推成"没在运行"——"runs 是空数组"与"我看不见进程表"是两件事。
+      ...(record['runsKnown'] === false ? { runsKnown: false } : {}),
+      // 原因只在 false 且是非空字符串时带。
+      ...(record['runsKnown'] === false && typeof record['runsUnknownReason'] === 'string'
+        && record['runsUnknownReason'] !== ''
+        ? { runsUnknownReason: record['runsUnknownReason'] as string }
+        : {}),
     })
   }
   return out
@@ -470,6 +478,9 @@ export function normalizeBackupDiff(raw: unknown): EnvironmentBackupDiff | undef
 /** 条目类型的合法值（与 src/types.ts 的 MarketItemKind 同集合）。 */
 const KINDS: readonly MarketItemKind[] = ['cordis-plugin', 'skill', 'agent-preset', 'unknown']
 
+/** 上游风险明细的透传上限（与 host 侧 registry.ts 的 RISK_FLAG_LIMIT 对齐）。 */
+const RISK_FLAG_LIMIT = 12
+
 /**
  * 归一一条市场条目。
  *
@@ -492,7 +503,18 @@ function marketItem(raw: unknown): MarketItem | undefined {
     latestVersion: asText(record['latestVersion']),
     packageName: asText(record['packageName']),
     installSpec: asText(record['installSpec']),
+    installable: asInstallable(record['installable']),
+    riskTier: asRiskTier(record['riskTier']),
+    reportUrl: asHttpsUrl(record['reportUrl']),
+    license: asText(record['license']),
+    verifiedBy: asText(record['verifiedBy']),
+    verifiedAt: asText(record['verifiedAt']),
   }
+  const marketTags = texts(record['marketTags'])
+  const riskFlags = riskFlagList(record['riskFlags'])
+  const starsDelta7d = typeof record['starsDelta7d'] === 'number' && Number.isFinite(record['starsDelta7d'])
+    ? record['starsDelta7d']
+    : undefined
   return {
     repo,
     name: text(record['name'], repo),
@@ -507,7 +529,53 @@ function marketItem(raw: unknown): MarketItem | undefined {
     ...KINDS.includes(kind as MarketItemKind) ? { kind: kind as MarketItemKind } : {},
     ...optional.packageName === undefined ? {} : { packageName: optional.packageName },
     ...optional.installSpec === undefined ? {} : { installSpec: optional.installSpec },
+    ...optional.installable === undefined ? {} : { installable: optional.installable },
+    ...optional.riskTier === undefined ? {} : { riskTier: optional.riskTier },
+    ...riskFlags === undefined ? {} : { riskFlags },
+    ...optional.reportUrl === undefined ? {} : { reportUrl: optional.reportUrl },
+    ...marketTags.length === 0 ? {} : { marketTags },
+    ...record['archived'] === true ? { archived: true } : {},
+    ...starsDelta7d === undefined ? {} : { starsDelta7d },
+    ...optional.license === undefined ? {} : { license: optional.license },
+    ...optional.verifiedBy === undefined ? {} : { verifiedBy: optional.verifiedBy },
+    ...optional.verifiedAt === undefined ? {} : { verifiedAt: optional.verifiedAt },
   }
+}
+
+/**
+ * 归一上游可装性标记：只认上游那两个值，其余（含未知新值）一律丢掉。
+ *
+ * 为什么未知值不原样透传：这个字段的**每个值都会变成一个徽标或一次过滤**，
+ * 上游新增取值时我们希望它变成"没有标记"，而不是画出一个我们还没定义文案的徽标。
+ */
+function asInstallable(value: unknown): MarketInstallable | undefined {
+  return value === 'manual' || value === 'non-plugin' ? value : undefined
+}
+
+/** 归一上游风险等级：同上，只认 safe / caution / risk。 */
+function asRiskTier(value: unknown): MarketRiskTier | undefined {
+  return value === 'safe' || value === 'caution' || value === 'risk' ? value : undefined
+}
+
+/** 归一外链：只接受 https（它会被渲染成 href）。 */
+function asHttpsUrl(value: unknown): string | undefined {
+  const text = asText(value)
+  return text !== undefined && text.startsWith('https://') ? text : undefined
+}
+
+/** 归一风险明细：缺 id 的条目丢掉（详情里它就是一行证据，没有 id 无从指认）；超长截断。 */
+function riskFlagList(value: unknown): readonly MarketRiskFlag[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const out: MarketRiskFlag[] = []
+  for (const entry of value) {
+    const record = asObject(entry)
+    if (record === undefined) continue
+    const id = asText(record['id'])
+    if (id === undefined) continue
+    out.push({ id, severity: asText(record['severity']) ?? '', category: asText(record['category']) ?? '' })
+    if (out.length >= RISK_FLAG_LIMIT) break
+  }
+  return out.length === 0 ? undefined : out
 }
 
 /**

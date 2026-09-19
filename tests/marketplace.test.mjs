@@ -780,19 +780,21 @@ test('工具栏模型：方向键位与比较器同源', () => {
   assert.equal(view.marketToolbarModel('stars', true).category, view.ALL_CATEGORIES)
 })
 
-test('updateAvailable 与标签溢出计数', () => {
+test('updateAvailable 与徽标槽位（政策后的卡片契约）', () => {
   assert.equal(view.updateAvailable(item({ installed: true, installedVersion: '1.0.0', latestVersion: '1.1.0' })), true)
   assert.equal(view.updateAvailable(item({ installed: true, installedVersion: '1.1.0', latestVersion: '1.1.0' })), false)
   assert.equal(view.updateAvailable(item({ installed: true, installedVersion: '2.0.0', latestVersion: '1.1.0' })), false, '仓库回滚不报更新')
   assert.equal(view.updateAvailable(item({ installed: false, installedVersion: '1.0.0', latestVersion: '1.1.0' })), false)
   assert.equal(view.updateAvailable(item({ installed: true, installedVersion: '1.0.0' })), false)
 
-  const built = tags.buildMarketTags({ category: 'tool', installed: true, kind: 'cordis-plugin', topics: ['memory', 'cli', 'api', 'rag'] })
-  assert.equal(view.tagOverflowCount(built, ['memory', 'cli', 'api', 'rag']), 2)
-  assert.deepEqual(view.tagOverflowTags(built, 2).map((tag) => tag.value), ['memory', 'cli'], '被两行预算挤掉的标签')
-  assert.deepEqual(view.tagOverflowTags(built).map((tag) => tag.value), [], '默认预算内没有溢出标签')
-  assert.equal(view.TAG_SLOTS * view.TAG_ROWS, view.VISIBLE_TAGS)
-  assert.deepEqual(view.tagsOf(item({ category: 'tool', topics: ['cli'] })).map((tag) => tag.value), ['tool', 'cli'])
+  // 卡片徽标：政策 ≤3 槽、优先级取前、跨来源去重（详见 tests/tags.test.mjs 的政策用例）
+  assert.deepEqual(view.tagsOf(item({ category: 'tool', topics: ['memory'] })).map((tag) => tag.value), ['tool', 'memory'])
+  assert.equal(view.tagsOf(item({ category: 'tool', riskTier: 'risk', installable: 'manual', topics: ['memory', 'rag'] })).length, 3, '最多 3 个')
+  assert.deepEqual(
+    view.tagsOf(item({ category: 'vision', topics: ['vision', 'ocr'] })).map((tag) => tag.value),
+    ['vision', 'ocr'],
+    '分类与主题同名时只留分类（那 499 条同名重复的实例）',
+  )
   assert.equal(view.typeLabelKey('skill'), 'typeSkill')
   assert.equal(view.typeLabelKey('agent-preset'), 'typeAgentPreset')
   assert.equal(view.typeLabelKey(undefined), 'typeCordisPlugin')
@@ -894,6 +896,41 @@ test('端到端接线：loadRegistryIndex → registryItem → buildInstalledInd
   assert.equal(byRepo['who/skill-pack'].kind, 'skill')
   // 再次请求：同一份数据必须命中同一对象（REST 层的序列化缓存可以拿它当 key）
   assert.equal(build(), result)
+})
+
+test('政策筛选：非插件默认隐藏、状态筛选复用同一个可更新判据', () => {
+  const items = [
+    item({ repo: 'a/plain', name: 'plain' }),
+    item({ repo: 'b/nonplugin', name: 'nonplugin', installable: 'non-plugin' }),
+    item({ repo: 'c/manual', name: 'manual', installable: 'manual' }),
+    item({ repo: 'd/installed', name: 'installed', installed: true, installedVersion: '1.0.0', latestVersion: '1.1.0' }),
+    item({ repo: 'e/uptodate', name: 'uptodate', installed: true, installedVersion: '1.1.0', latestVersion: '1.1.0' }),
+  ]
+  // 非插件过滤：**只**隐藏 non-plugin；manual 与"上游没标记"都要留着（不替上游补结论）
+  assert.deepEqual(view.filterInstallable(items, false).map((entry) => entry.repo), ['a/plain', 'c/manual', 'd/installed', 'e/uptodate'])
+  assert.equal(view.filterInstallable(items, true), items, '打开开关时原样返回')
+  // 状态筛选：可更新用与卡片徽标同一个判据（updateAvailable）
+  assert.equal(view.filterByState(items, 'all'), items)
+  assert.deepEqual(view.filterByState(items, 'installed').map((entry) => entry.repo), ['d/installed', 'e/uptodate'])
+  assert.deepEqual(view.filterByState(items, 'updatable').map((entry) => entry.repo), ['d/installed'])
+  assert.deepEqual([...view.STATE_FILTERS], ['all', 'installed', 'updatable'])
+  // **分层**：host 不过滤，过滤只发生在展示层——所以上面这些条目在原始结果里都还在
+  assert.equal(items.some((entry) => entry.repo === 'b/nonplugin'), true)
+})
+
+test('政策排序：热度用 stars_delta_7d，缺值时按 0 处理', () => {
+  const items = [
+    item({ repo: 'a/slow', name: 'slow', starsDelta7d: 5, stars: 9000 }),
+    item({ repo: 'b/hot', name: 'hot', starsDelta7d: 400, stars: 10 }),
+    item({ repo: 'c/unknown', name: 'unknown' }),
+  ]
+  assert.deepEqual(view.sortRows(items, 'trending', true).map((entry) => entry.repo), ['b/hot', 'a/slow', 'c/unknown'], '增量降序、缺值当 0 落末尾')
+  assert.deepEqual(view.sortRows(items, 'trending', false).map((entry) => entry.repo), ['c/unknown', 'a/slow', 'b/hot'], '升序是同一主键取反')
+  assert.equal(view.SORT_MODES.includes('trending'), true)
+  assert.equal(view.defaultDescendingFor('trending'), true)
+  assert.equal(view.sortLabelKey('trending'), 'sortTrending')
+  // 星数排序不受影响（两个维度是两件事：新插件星少但可能在涨）
+  assert.deepEqual(view.sortRows(items, 'stars', true).map((entry) => entry.repo), ['a/slow', 'b/hot', 'c/unknown'])
 })
 
 test('被测代码就是线上跑的代码：dist 产物存在，纯函数模块不碰 node 内置模块', () => {

@@ -21,19 +21,20 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
-  Button, IconChevronDownOutline14, IconChevronUpOutline14, IconGlobeOutline14, IconRefreshOutline14,
+  Button, Checkbox, IconChevronDownOutline14, IconChevronUpOutline14, IconGlobeOutline14, IconRefreshOutline14,
   IconSearchOutline16, Input, Modal, Tag, Toast, Tooltip,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
 import {
-  categoryOptions, filterByCategory, marketToolbarModel, prepareMarketSearch, searchMarket, sortRows, tagsOf,
-  updateAvailable, type MarketSort,
+  categoryOptions, filterByCategory, filterByState, filterInstallable, marketToolbarModel, prepareMarketSearch,
+  searchMarket, sortRows, tagsOf, updateAvailable, STATE_FILTERS, type MarketSort, type MarketStateFilter,
 } from '../marketView.ts'
+import { buildMarketDetail, type MarketTag, type MarketTagKind } from '../tags.ts'
 import type { MarketItem, MarketItemKind } from '../types.ts'
 import { NS } from './locales.ts'
 import { PmSelect } from './pmSelect.tsx'
 import {
-  KIND_LABEL, MARKET_LABEL, formatRelative, marketTagLabel,
+  KIND_LABEL, MARKET_LABEL, formatRelative,
   type CompanionSlotProps, type MarketplaceFace, type MarketplaceState,
 } from './shared.ts'
 import css from './MarketplacePage.module.css'
@@ -46,6 +47,62 @@ export type MarketplacePageProps = CompanionSlotProps<'settings.section', Market
 
 /** 类型筛选器的全部选项（上游 index 的 kind 字段）。 */
 const KINDS: readonly MarketItemKind[] = ['cordis-plugin', 'skill', 'agent-preset', 'unknown']
+
+/**
+ * 徽标文案（政策 §3.3）。
+ *
+ * 映射刻意写在本文件里，**不塞进 shared.ts**：那是跨页面共享模块，把市场页的文案规则放进去
+ * 会让两个页面的文案互相耦合（Lead 明确要求）。分类与主题直接用上游原词，不做翻译。
+ *
+ * @param t - 本插件字典。
+ * @param tag - 徽标。
+ * @returns 展示文本。
+ */
+function badgeText(t: T, tag: MarketTag): string {
+  switch (tag.kind) {
+    case 'risk': return t('market.tag.risk')
+    case 'caution': return t('market.tag.caution')
+    case 'manual': return t('market.tag.manual')
+    case 'pick': return t('market.tag.pick')
+    case 'archived': return t('market.tag.archived')
+    default: return tag.value
+  }
+}
+
+/** 详情行的标签（政策 §3.1 的八项 + 上游风险结论）。 */
+function detailLabel(t: T, key: string): string {
+  switch (key) {
+    case 'kind': return t('market.detail.kind')
+    case 'category': return t('market.detail.category')
+    case 'topics': return t('market.detail.topics')
+    case 'riskTier': return t('market.detail.risk')
+    case 'riskFlags': return t('market.detail.riskFlags')
+    case 'manual': return t('market.tag.manual')
+    case 'archived': return t('market.tag.archived')
+    case 'verified': return t('market.detail.verified')
+    case 'license': return t('market.detail.license')
+    case 'npm': return t('market.detail.npm')
+    case 'version': return t('market.detail.version')
+    default: return key
+  }
+}
+
+/** 详情行的值：只有"上游结论"需要换成本地词（风险等级），其余是原始事实（分类 id、flag、版本号…）。 */
+function detailValue(t: T, key: string, value: string): string {
+  if (key === 'kind') return t(KIND_LABEL[value as MarketItemKind] ?? 'market.kind.unknown')
+  if (key === 'riskTier') return value === 'risk' ? t('market.tag.risk') : t('market.tag.caution')
+  return value
+}
+
+/** 徽标类别 → 官方 Tag 的色调（两者取值域一致；分开写是为了让"政策定的色调"显式可见）。 */
+const TAG_TONE = { neutral: 'neutral', success: 'success', warning: 'warning', danger: 'danger' } as const
+
+/** 状态筛选的字典键（顺序即工具栏顺序，来自 marketView.STATE_FILTERS）。 */
+const FILTER_LABEL = {
+  all: 'market.filter.all',
+  installed: 'market.filter.installed',
+  updatable: 'market.filter.updatable',
+} as const
 
 /**
  * 首屏渲染的条目数。
@@ -88,6 +145,11 @@ export function MarketplacePage({
   const rolledBack = useMarketplace((state: MarketplaceState) => state.rolledBack)
   const [sort, setSort] = useState<MarketSort>('stars')
   const [descending, setDescending] = useState(true)
+  const [stateFilter, setStateFilter] = useState<MarketStateFilter>('all')
+  // 上游标记 non-plugin 的条目默认隐藏（政策 §3.2 第 1 条）；这是**展示决策**，REST 结果里它们仍在。
+  const [showNonPlugin, setShowNonPlugin] = useState(false)
+  /** 展开详情的条目 repo（同时只开一张卡，避免长列表里堆 DOM）。 */
+  const [openDetail, setOpenDetail] = useState<string>()
   const [target, setTarget] = useState<MarketItem>()
   const [toast, setToast] = useState<{ text: string; seq: number }>()
   const [limit, setLimit] = useState(RENDER_BATCH)
@@ -113,10 +175,11 @@ export function MarketplacePage({
     () => [{ id: '', label: t('market.all') }, ...KINDS.map(item => ({ id: item, label: t(KIND_LABEL[item]) }))],
     [t],
   )
-  // 分类/类型筛选：只有它变化时才重建候选集。
+  // 候选集：非插件过滤 → 状态筛选 → 分类 → 类型。只有这些输入变化时才重建（搜索不在这里）。
   const scoped = useMemo(
-    () => filterByCategory(result?.items ?? [], category).filter(item => kind === '' || (item.kind ?? 'unknown') === kind),
-    [result, category, kind],
+    () => filterByCategory(filterByState(filterInstallable(result?.items ?? [], showNonPlugin), stateFilter), category)
+      .filter(item => kind === '' || (item.kind ?? 'unknown') === kind),
+    [result, showNonPlugin, stateFilter, category, kind],
   )
   // 检索索引（小写字段 + 掩码）：**每次列表变化建一次**，绝不放进每键击路径。
   const searchable = useMemo(() => prepareMarketSearch(scoped), [scoped])
@@ -131,7 +194,7 @@ export function MarketplacePage({
   // 否则"切换一次就把一万多条全倒出来"，等于窗口形同虚设。
   useEffect(() => {
     setLimit(RENDER_BATCH)
-  }, [query, category, kind, toolbar.sort, toolbar.descending, result])
+  }, [query, category, kind, stateFilter, showNonPlugin, toolbar.sort, toolbar.descending, result])
 
   const shown = rows.length > limit ? rows.slice(0, limit) : rows
   const remaining = rows.length - shown.length
@@ -213,6 +276,13 @@ export function MarketplacePage({
           onChange={(id) => { setMarketKind(id === '' ? '' : id as MarketItemKind) }}
         />
         <PmSelect
+          label={t('market.filter')}
+          placeholder={t('market.filter.all')}
+          value={stateFilter}
+          options={STATE_FILTERS.map(entry => ({ id: entry, label: t(FILTER_LABEL[entry]) }))}
+          onChange={(id) => { setStateFilter(id as MarketStateFilter) }}
+        />
+        <PmSelect
           label={t('market.sort')}
           placeholder={t('market.sort')}
           value={sort}
@@ -234,6 +304,11 @@ export function MarketplacePage({
             {t(MARKET_LABEL[toolbar.directionLabelKey])}
           </Button>
         </Tooltip>
+        <Checkbox
+          checked={showNonPlugin}
+          onChange={(next) => { setShowNonPlugin(next) }}
+          label={t('market.showNonPlugin')}
+        />
         {result === undefined ? null : (
           <span className={css.meta}>
             {t('market.generatedAt', { at: formatRelative(t, result.generatedAt) })}
@@ -283,13 +358,15 @@ export function MarketplacePage({
           : (
         <ul className={css.list}>
           {shown.map((item) => {
+            // 政策：卡片最多 3 个上游徽标（风险 › 需手动安装 › 社区精选 › 已归档 › 分类 › 主题×2，取前 3）。
+            // 这里**不再有 kind 徽标**——上游索引没有 kind 字段，那个位置永远是同一个词（政策 §3.4）；
+            // kind 移到详情行里，只有"已装成技能/预设"时才与默认值不同。
             const tags = tagsOf(item)
-            const overflow = tags.length - 8
+            const detail = openDetail === item.repo ? buildMarketDetail(item) : []
             return (
               <li key={item.repo} className={css.card}>
                 <div className={css.cardHead}>
                   <span className={css.name}>{item.name}</span>
-                  <Tag tone="quiet">{t(KIND_LABEL[item.kind ?? 'unknown'])}</Tag>
                   {item.installed === true ? <Tag tone="neutral">{t('market.installed')}</Tag> : null}
                   {updateAvailable(item) ? <Tag tone="info">{t('market.updatable', { version: item.latestVersion ?? '' })}</Tag> : null}
                   {item.stars === null || item.stars === undefined ? null : <span className={css.meta}>{t('market.stars', { count: item.stars })}</span>}
@@ -306,16 +383,28 @@ export function MarketplacePage({
                 <p className={css.desc}>{item.description}</p>
                 {tags.length === 0 ? null : (
                   <p className={css.topics}>
-                    {tags.slice(0, 8).map(tag => (
-                      <Tag key={`${tag.kind}:${tag.value}`} tone={tag.tone}>
-                        {marketTagLabel(t, tag.kind, tag.value)}
+                    {tags.map(tag => (
+                      <Tag key={`${tag.kind}:${tag.value}`} tone={TAG_TONE[tag.tone]}>
+                        {badgeText(t, tag)}
                       </Tag>
                     ))}
-                    {overflow <= 0 ? null : (
-                      <Tooltip label={tags.slice(8).map(tag => marketTagLabel(t, tag.kind, tag.value)).join(' · ')}>
-                        <span className={css.meta}>{t('market.moreTags', { count: overflow })}</span>
-                      </Tooltip>
-                    )}
+                  </p>
+                )}
+                {/*
+                  详情（政策 §3.1 的八项）：分类、主题、风险结论与明细、验证证据（含报告外链）、许可证、npm 包、版本、形态。
+                  复用既有的 flex-wrap 行样式（本文件不持有 CSS Module 的写权），每项是一对「标签：值」。
+                */}
+                {detail.length === 0 ? null : (
+                  <p className={css.topics}>
+                    {detail.map(entry => (
+                      <span key={entry.key} className={css.metaLabel}>
+                        {detailLabel(t, entry.key)}
+                        {'：'}
+                        {entry.href === undefined
+                          ? detailValue(t, entry.key, entry.value)
+                          : <a className={css.link} href={entry.href} target="_blank" rel="noreferrer">{detailValue(t, entry.key, entry.value)}</a>}
+                      </span>
+                    ))}
                   </p>
                 )}
                 <div className={css.cardActions}>
@@ -326,6 +415,14 @@ export function MarketplacePage({
                     onClick={() => { dismissInstallNotice(); setTarget(item) }}
                   >
                     {installing === item.repo ? t('market.installing') : t('market.install')}
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    aria-expanded={openDetail === item.repo}
+                    onClick={() => { setOpenDetail(previous => previous === item.repo ? undefined : item.repo) }}
+                  >
+                    {openDetail === item.repo ? t('market.detailHide') : t('market.detailShow')}
                   </Button>
                 </div>
               </li>

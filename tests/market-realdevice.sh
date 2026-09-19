@@ -83,6 +83,9 @@ echo "== 段 1/3：正常索引（市场页 + 中文搜索）=="
 boot "$LOG_PREFIX-normal.log" || exit 2
 TOKEN=$(token_of "$LOG_PREFIX-normal.log")
 node "$REPO/tests/market-browser-evidence.mjs" --port "$PORT" --token "$TOKEN" --phase normal --out "$OUT" | tail -20
+echo "-- 徽标/筛选/详情 取证（task-46）--"
+POLICY_DUP_QUERY="${POLICY_DUP_QUERY:-vision}" POLICY_DUP_VALUE="${POLICY_DUP_VALUE:-vision}" \
+  node "$REPO/tests/market-policy-evidence.mjs" --port "$PORT" --token "$TOKEN" --out "$OUT" | tail -45
 stop
 
 echo "== 段 2/3：索引不可用（死代理 + 无缓存）=="
