@@ -52,6 +52,12 @@ describe('客户端渲染健壮性（残缺载荷不许变成空白页）', () =
         diagnostics: { dependency: true, composition: true, runtime: true, consistency: true, ecosystem: false },
         qualityGate: { enabled: true, mode: 'block', allowlist: [] },
         marketplace: { enabled: true, cacheTtlMinutes: 1440, timeoutMs: 15_000, indexUrl: '' },
+        // 完整文档必须带 trial 段：宿主 schema 里它与其它三组同构地带默认值，
+        // 官方 settings 解析过的配置一定有它；缺了它就是宿主只发了部分载荷（task-52）。
+        trial: {
+          enabled: false, depth: 'auto', baseline: true, allowNetwork: true,
+          onFailure: 'block', autoCleanup: true, retentionDays: 14, maxKept: 0,
+        },
       },
     })
     const reg = registration(slotRegistrations, 'plugins.bundle.config')
