@@ -337,6 +337,52 @@
   margin: 0 0 10px;
 }
 
+/* 下次清理计划（task-90）：不可逆操作之前必须能看出"会动到什么"。 */
+.trialPlan {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border: 0.5px solid var(--dsw-alias-border-l1);
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-layer-1);
+}
+
+.trialPlanGroup {
+  margin: 0;
+  font-size: 12px;
+  line-height: 18px;
+  /* 承重：这是用户按"清理"之前唯一能看出后果的地方。 */
+  color: var(--dsw-alias-label-secondary);
+}
+
+.trialPlanList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/*
+  名字与原因**分层**（各占一个元素、上下两行）。
+  R2（§12.9）：宿主的 reason 自带冒号，拼成一行会是"名字：原因：从句"——一行两个冒号。
+*/
+.trialPlanItem {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-left: 10px;
+}
+
+.trialPlanReason {
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
 .trialList {
   list-style: none;
   margin: 0;

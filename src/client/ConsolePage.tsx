@@ -1613,6 +1613,66 @@ interface TrialEnvironmentsProps {
 }
 
 /**
+ * 渲染"下次清理会删谁、留谁"。
+ *
+ * 为什么必须画出来（task-90）：清理是**删目录**的不可逆操作，而用户点「清理过期」之前
+ * 看不到会删谁——引擎虽然有"运行中永不删"这类纪律，但把计划藏起来等于让用户凭运气按下去。
+ * 宿主早就在 `trialEnvironments` 的返回值里给了这份计划（types.ts 的 plan.remove/keep，
+ * 各带 name + reason），客户端一直没渲染。
+ *
+ * 两件事实都要给：
+ *   · **会删**——不可逆的那部分，必须逐个列出；
+ *   · **会留 + 为什么留**——用户最常问的就是"为什么没删它"，只列"会删"回答不了这个问题。
+ *
+ * R2（§12.9）：宿主的 reason 里自带冒号（例如"正在运行：不删（先让用户停）"），
+ * 所以**名字与原因必须分层**——拼成一行会变成"名字：原因：从句"，一行两个冒号。
+ * 这也是把 trial.planRow 从 `{name}：{reason}` 改掉的原因（见字典里的注释）。
+ *
+ * @param props - 字典座位与计划。
+ * @returns 计划区；宿主没给计划时 null（不猜、不留白）。
+ */
+function TrialCleanupPlan({ t, plan }: {
+  readonly t: T
+  readonly plan: TrialEnvironmentsView['plan']
+}) {
+  // 宿主没给计划：这是"读不到"，不是"没有需要清理的"。两者必须分开说（§12.3.3）。
+  if (plan === undefined) return null
+  const empty = plan.remove.length === 0 && plan.keep.length === 0
+  return (
+    <div className={css.trialPlan}>
+      <p className={css.metaLabel}>{t('trial.planTitle')}</p>
+      {empty ? <p className={css.hint} role="status">{t('trial.cleanupNone')}</p> : null}
+      {plan.remove.length === 0 ? null : (
+        <>
+          <p className={css.trialPlanGroup}>{t('trial.planRemove', { count: plan.remove.length })}</p>
+          <ul className={css.trialPlanList}>
+            {plan.remove.map(entry => (
+              <li key={entry.name} className={css.trialPlanItem}>
+                <code className={css.trialName}>{entry.name}</code>
+                <span className={css.trialPlanReason}>{entry.reason}</span>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+      {plan.keep.length === 0 ? null : (
+        <>
+          <p className={css.trialPlanGroup}>{t('trial.planKeep', { count: plan.keep.length })}</p>
+          <ul className={css.trialPlanList}>
+            {plan.keep.map(entry => (
+              <li key={entry.name} className={css.trialPlanItem}>
+                <code className={css.trialName}>{entry.name}</code>
+                <span className={css.trialPlanReason}>{entry.reason}</span>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+    </div>
+  )
+}
+
+/**
  * 渲染一个测试环境：名字 + 状态标记 + 占地/时间 + 删除入口。
  *
  * 布尔事实读不到时显示「未知」而不是「未运行」「归属没了」：后者是结论，不能拿它顶替读不到。
@@ -1718,6 +1778,11 @@ function TrialEnvironments({
               </p>
             ) : null}
             {report.notes.map(note => <p key={note} className={css.hint}>{note}</p>)}
+            {/*
+              "下次清理会删谁、留谁"放在环境列表**之前**：它是按「清理过期」这个按钮之前
+              唯一能回答"会动到什么"的东西，压在列表后面等于没有（task-90）。
+            */}
+            <TrialCleanupPlan t={t} plan={report.plan} />
             {report.environments.length === 0
               ? <p className={css.hint} role="status">{t('trial.empty')}</p>
               : (

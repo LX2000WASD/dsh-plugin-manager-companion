@@ -105,6 +105,121 @@ describe('试装设置页（task-52）：披露来自 host、未知如实、warn
     }
   })
 
+
+  it('清理计划：会删的逐个列出、会留的连原因一起列出（不可逆操作之前必须能看出会动到什么）', async () => {
+    // task-90：宿主早就返回了 plan.remove/keep（types.ts:698），客户端一直没画。
+    // 清理是**删目录**的不可逆操作——把计划藏起来等于让用户凭运气按下去。
+    const { entry, face, t } = boot('settings.section', 'console', {})
+    const stub = stubFetch({
+      capabilities: () => ({ ok: true, value: { capabilities: {}, trialDisclosure: DISCLOSURE } }),
+      trialEnvironments: () => ({
+        ok: true,
+        value: {
+          ...ENV_EMPTY,
+          environments: [
+            { name: 'a-dpmc', owner: 'a', dir: '/tmp/a-dpmc', modifiedAt: '', files: 0, sharedFiles: 0, snapshotMatchesOwner: null },
+            { name: 'b-dpmc', owner: 'b', dir: '/tmp/b-dpmc', modifiedAt: '', files: 0, sharedFiles: 0, snapshotMatchesOwner: null },
+          ],
+          totals: { count: 2, running: 1, bytes: 0, unknownBytes: 0 },
+          // 原因逐字取自宿主 planTrialCleanup（envManager.ts:2735-2747）。
+          plan: {
+            remove: [{ name: 'a-dpmc', reason: '超过保留期 14 天（20.1 天）' }],
+            keep: [{ name: 'b-dpmc', reason: '正在运行：不删（先让用户停）' }],
+          },
+        },
+      }),
+    })
+    try {
+      face.loadTrial()
+      await until(() => face.hooks.trial.getSnapshot().report !== undefined, '计划落状态')
+      const html = renderSettings(entry, face, t)
+      assert.ok(html.includes('下次清理'), '要有计划标题：' + html.slice(0, 600))
+      assert.ok(html.includes('会删这 1 个'), '要说出会删几个')
+      assert.ok(html.includes('会留这 1 个'), '要说出会留几个')
+      assert.ok(html.includes('a-dpmc'), '会删的那个必须点名')
+      assert.ok(html.includes('b-dpmc'), '会留的那个也必须点名')
+      // 用户最常问的是"为什么没删它"——所以"会留"必须带原因，不能只列名字。
+      assert.ok(html.includes('超过保留期 14 天（20.1 天）'), '会删的原因要给')
+      assert.ok(html.includes('正在运行'), '会留的原因要给（否则用户不知道为什么没删它）')
+    } finally {
+      stub.restore()
+    }
+  })
+
+  it('清理计划：空计划说「没有需要清理的」，计划读不到时不留白也不冒充空', async () => {
+    const emptyBoot = boot('settings.section', 'console', {})
+    const emptyStub = stubFetch({
+      capabilities: () => ({ ok: true, value: { capabilities: {}, trialDisclosure: DISCLOSURE } }),
+      trialEnvironments: () => ({ ok: true, value: ENV_EMPTY }),
+    })
+    try {
+      emptyBoot.face.loadTrial()
+      await until(() => emptyBoot.face.hooks.trial.getSnapshot().report !== undefined, '空计划落状态')
+      const html = renderSettings(emptyBoot.entry, emptyBoot.face, emptyBoot.t)
+      assert.ok(html.includes('没有需要清理的测试环境'), '空计划要如实说：' + html.slice(0, 600))
+    } finally {
+      emptyStub.restore()
+    }
+
+    // 宿主没给 plan 段（旧宿主/载荷不全）：这是"读不到"，不是"没有需要清理的"。
+    // 两者必须分开（§12.3.3：不许用缺席表达状态）——所以这时**什么都不画**，
+    // 而不是画一句"没有需要清理的"（那是替宿主下结论）。
+    const noPlanBoot = boot('settings.section', 'console', {})
+    const noPlanStub = stubFetch({
+      capabilities: () => ({ ok: true, value: { capabilities: {}, trialDisclosure: DISCLOSURE } }),
+      trialEnvironments: () => {
+        const { plan: _drop, ...rest } = ENV_EMPTY
+        return { ok: true, value: rest }
+      },
+    })
+    try {
+      noPlanBoot.face.loadTrial()
+      await until(() => noPlanBoot.face.hooks.trial.getSnapshot().report !== undefined, '无 plan 段落状态')
+      const html = renderSettings(noPlanBoot.entry, noPlanBoot.face, noPlanBoot.t)
+      assert.ok(!html.includes('没有需要清理的测试环境'),
+        '宿主没给计划时不许说"没有需要清理的"——那是替宿主下结论：' + html.slice(0, 600))
+    } finally {
+      noPlanStub.restore()
+    }
+  })
+
+  it('R2 自洽性：清理计划的"名字 + 原因"不许拼成一行（宿主的原因自带冒号）', async () => {
+    // Lead 在 task-90 里留的自洽性检查：trial.planRow 的 `{name}：{reason}` 形态
+    // **确实触发** §12.9 R2——因为宿主 planTrialCleanup 有一条原因是
+    // "正在运行：不删（先让用户停）"，拼起来就是 "名字：正在运行：不删…"（一行两个冒号）。
+    // 实测确认后：planRow 键已删，名字与原因**分层渲染**（各占一个元素）。
+    // 这条用例钉住"分层"这件事：真机渲染出来的计划里，任何一行都不能有两个冒号。
+    const { entry, face, t } = boot('settings.section', 'console', {})
+    const stub = stubFetch({
+      capabilities: () => ({ ok: true, value: { capabilities: {}, trialDisclosure: DISCLOSURE } }),
+      trialEnvironments: () => ({
+        ok: true,
+        value: {
+          ...ENV_EMPTY,
+          environments: [],
+          plan: {
+            remove: [{ name: 'a-dpmc', reason: '超过保留期 14 天（20.1 天）' }],
+            // 这条就是触发 R2 的那一条（宿主原文）。
+            keep: [{ name: 'b-dpmc', reason: '正在运行：不删（先让用户停）' }],
+          },
+        },
+      }),
+    })
+    try {
+      face.loadTrial()
+      await until(() => face.hooks.trial.getSnapshot().report !== undefined, '计划落状态')
+      const html = renderSettings(entry, face, t)
+      // 把渲染结果切成"屏幕上的一行"再判：SSR 是一整行 HTML，标签边界即屏幕上的换行。
+      const rendered = html.replace(/<[^>]*>/g, String.fromCharCode(10))
+      const { violationsOf } = await import('./copy-rules.mjs')
+      const hits = violationsOf(rendered, 'rendered')
+      assert.deepEqual(hits, [], '清理计划命中了 §12.9：' + hits.join(', '))
+      // 反向：那条触发 R2 的原因确实渲染出来了（否则这条用例是空转）。
+      assert.ok(html.includes('正在运行'), '触发 R2 的那条原因必须真的在（否则用例空转）')
+    } finally {
+      stub.restore()
+    }
+  })
   it('测试环境：空列表说「没有测试环境」，读失败说失败（不把故障画成空列表）', async () => {
     const okBoot = boot('settings.section', 'console', {})
     const okStub = stubFetch({

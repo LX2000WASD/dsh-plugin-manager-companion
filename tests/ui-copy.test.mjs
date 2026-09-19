@@ -722,13 +722,12 @@ describe('UI 文案标准（DESIGN §12）', () => {
     //   · 有过但现在没了 = 被取代（该删，不该留）。
     // 下面这些**全部是"从未有过"**（实测），也就是说它们是**没接完的界面**，不是历史包袱。
     const KNOWN_DEAD = [
-      // ── 试装清理：宿主已经返回"清理计划"，客户端还没画（实测 types.ts:698 的 plan.remove/keep 有 name+reason）──
-      { key: k('trial', 'cleanupTitle'), why: '清理对话框标题；ConsolePage 的清理区当前只有按钮（trial.cleanup），没弹确认框' },
-      { key: k('trial', 'cleanupDesc'), why: '同上：清理前该说清"会删哪些、留哪些"' },
-      { key: k('trial', 'planTitle'), why: '试装环境报告的 plan 段（types.ts:698）；客户端目前只渲染 environments 列表' },
-      { key: k('trial', 'planRemove'), why: '同上：plan.remove 的名字列表（宿主已给，客户端未画）' },
-      { key: k('trial', 'planKeep'), why: '同上：plan.keep 的名字列表' },
-      { key: k('trial', 'planRow'), why: '同上：plan 每一项的「名字：原因」' },
+      // ── 试装清理：计划已接（task-90），但"清理动作本身的确认框"还没做 ──────────────
+      // task-90 把 plan.remove/keep 画出来了（TrialCleanupPlan），所以 trial.planTitle/
+      // planRemove/planKeep 三个键已复活、trial.planRow 已删除（它触发 §12.9 R2）。
+      // 剩下这两个属于**清理这个动作**：现在点「清理过期」直接执行，不弹确认框。
+      { key: k('trial', 'cleanupTitle'), why: '清理确认框的标题；现在点「清理过期」直接执行（计划已在旁边列出，但没做二次确认）' },
+      { key: k('trial', 'cleanupDesc'), why: '同上：确认框里那句"会删什么、不可撤销"' },
       // ── 市场页：标签超额时的折叠提示 ────────────────────────────────────────
       { key: k('market', 'moreTags'), why: '市场卡片标签超上限时的"还有 N 个"；MarketplacePage 目前全量渲染 tagsOf(item)' },
       // ── 升级：task-77（关于 → 软件升级）要用的那几档状态 ────────────────────
