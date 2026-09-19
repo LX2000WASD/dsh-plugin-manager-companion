@@ -129,9 +129,17 @@
 
 - 官方**没有**"启动 + 验证 + 退出"模式（`apps/cli/src/args.ts` 的 `DshInvocation` 只有 profile / dump-config / plugin）。
 - `--dump-config` 60–79ms 且**不加载任何 JS** → 抓不到 import/apply/服务冲突，只能当组合层快筛。
-- 真验证只能用 **headless 启动且不给任务**：519–558ms，真挂载整棵树，拆除 2ms。
-- **退出码不可用于判定**——健康环境也是 exit 1（官方以"缺任务"收场）。判定读 stderr 特征：
-  正常只有一行 `dsh: a task is required…`；失败是 `plugin tree failed to load` + 44–52 行 cause 链。
+- 真验证 = 启动一次并读**官方自己的就绪信号**。两类环境各用各的信号，谁先出现算谁：
+  · **headless 类**：启动且不给任务，519–558ms 真挂载整棵树，拆除 2ms；就绪 = stderr 只有一行
+    `dsh: a task is required…`。
+  · **含 web 层的环境**（官方默认模板建的、以及 GUI 自己那个环境）：缺任务法**不成立** —— 端口 3080 被 GUI
+    占着会 EADDRINUSE，让开端口后树挂上了却以服务形态常驻、只能报"判不出来"。改跑服务形态：
+    启动参数加 `--port 0 --no-open`（官方 CLI 只解析启动器自己的标志，其余原样交给树；官方自己的 e2e 与
+    发布脚本就是这么跑的：`dsh web --no-open --host 127.0.0.1 --port 0`），**读 stdout** 的
+    `dsh web: http://…` —— 该行在 Loader settle 之后才打印，官方注释写明它是给 supervisor 的就绪信号；
+    读到即判 mounted 并立刻杀子进程。`--port 0` 由 OS 分配端口，永不与 GUI 抢口。
+- **退出码不可用于判定**——健康环境也是 exit 1（官方以"缺任务"收场）。失败一律读 stderr：
+  `plugin tree failed to load` + 44–52 行 cause 链；两类信号都没有 → "判不出来"，不许当通过。
 - **绝不传任务文本**。实测 `env -u DEEPSEEK_API_KEY` + `stdin=/dev/null`：不需要 key、不调模型、
   无 session 落盘（只多一个 223 B 的 `cordis.yml`）。给任务就变成"真跑一轮 agent"，那是花用户的钱。
 
