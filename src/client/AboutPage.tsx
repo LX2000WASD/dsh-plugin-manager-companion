@@ -149,6 +149,12 @@ function DshInfoTab({ t, facts, loading, error, errorKey, onRetry }: {
         <FactRow t={t} label={t('about.dshVersion')} fact={facts.runtime.version} />
         <FactRow t={t} label={t('about.installAnchor')} fact={facts.runtime.installAnchor} />
         <FactRow t={t} label={t('about.node')} fact={facts.process.node} />
+        {/*
+          平台与架构**保持 Node 的英文枚举**（linux / darwin / win32 / x64 / arm64），不翻译。
+          这是 Lead 复核 task-95 时的裁决，理由记在这里免得后来人当成漏翻：
+          它们是 Node 的官方取值，用户拿这个值去搜索、去对官方文档时正是这几个字；
+          翻成"Linux 64 位"反而让用户对不上文档。
+        */}
         <FactRow t={t} label={t('about.platform')} fact={facts.process.platform} />
         <FactRow t={t} label={t('about.arch')} fact={facts.process.arch} />
       </section>

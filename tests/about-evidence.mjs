@@ -12,6 +12,7 @@
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { launchChrome, openTab, evaluate, capture } from '../tools/cdp-shot.mjs'
+import { shotMd5, visibleExpr } from '../tools/shot-assert.mjs'
 
 const argv = process.argv.slice(2)
 const arg = (name, fallback) => {
@@ -141,14 +142,23 @@ async function main() {
     // 截图前把**要证的那一行**滚进视口。
     // 未知态要拍的是"缓存年龄"那一行（它降级了）——滚到页首是拍不到它的：
     // 第一版两张图 md5 完全相同，就是因为它落在折叠线以下（断言过、图里没有 = 假证据）。
+    // 用 tools/shot-assert.mjs 的统一手法（CODE-POLICY §7.14）：滚进去 + **断言它在视口内**。
+    // 只断言 scrollTop 变了还不够——它可能滚过头把目标推到另一侧；
+    // 判据是目标与视口**相交**（那才是"截图拍得到"）。
     const scrolled = await evaluate(tab, SCROLL_TARGET(STATE === 'unknown' ? '缓存年龄' : '运行时'))
     check('目标那一行滚进了视口（截图才拍得到）', scrolled !== 'no-target' && scrolled !== 'no-scroller', String(scrolled))
     await sleep(400)
+    // 事实区（第一组卡片）必须在视口内——本次要证的每一行都在里面。
+    const visible = await evaluate(tab, visibleExpr('[class*=group]'))
+    check('要证的那一组与视口相交（截图确实拍得到它）', visible === true, String(visible))
     shots.push(await capture(tab, join(OUT, 'about-' + STATE + '-' + THEME + '.png'), { fullPage: false }))
   } finally {
     await tab.close()
     await chrome.close()
   }
+  // 打印 md5：外层脚本靠它断言"四次运行的产物两两不同"（CODE-POLICY §7.14）。
+  // 本脚本每次只出一张，所以"两张不同"这条判据必须由能同时看到多张的那一层来断言。
+  for (const path of shots) console.log('  [md5] ' + shotMd5(path) + '  ' + path)
   const failed = results.filter(entry => !entry.ok)
   console.log('== about/' + STATE + '/' + THEME + '：' + String(results.length - failed.length) + '/' + String(results.length) + ' 通过 ==')
   process.exit(failed.length === 0 ? 0 : 1)
