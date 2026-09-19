@@ -149,7 +149,7 @@ export function normalizeRegistryRepo(raw: unknown): RegistryRepo | null {
   const kind = MARKET_ITEM_KINDS.includes(record['kind'] as MarketItemKind)
     ? record['kind'] as MarketItemKind
     : undefined
-  const upstream = upstreamFacts(record)
+  const upstream = normalizeUpstreamFields(record)
   const category = str(record['category'])
   const packageName = str(record['pkg_name']) ?? str(record['package_name'])
   const latestVersion = str(record['version'])
@@ -176,6 +176,9 @@ const MARKET_TAG_LIMIT = 8
 /**
  * 解析上游元数据（task-46 新增）。
  *
+ * 入参是**上游字段名**的对象：网络路径直接传原始记录，缓存路径把自有记录形映射成同名再传进来
+ * （见 {@link normalizeCachedRepo}）——这样"值域怎么校验、截断几条、外链认什么协议"只有一处实现。
+ *
  * 三条边界写在这里而不是散在各处：
  * 1. **原样透传，不改写**：installable / risk_tier / market_tags 的值域原样保留，host 不做任何取舍；
  * 2. **证据簇只在 verdict=pass 时透传**：reportUrl / verifiedBy / verifiedAt 单看没有意义，
@@ -185,7 +188,7 @@ const MARKET_TAG_LIMIT = 8
  * @param record - 原始条目。
  * @returns 可直接展开进 RegistryRepo 的字段。
  */
-function upstreamFacts(record: Record<string, unknown>): Partial<RegistryRepo> {
+function normalizeUpstreamFields(record: Record<string, unknown>): Partial<RegistryRepo> {
   const installableValue = str(record['installable'])
   const riskTierValue = str(record['risk_tier'])
   const riskFlags = Array.isArray(record['risk_flags'])
@@ -313,6 +316,18 @@ export function registryIndexSources(options: { readonly indexUrl?: string; read
   return sources
 }
 
+/**
+ * 磁盘缓存的落盘格式版本。
+ *
+ * 为什么必须显式带版本：缓存里存的是**我们归一化后的记录形**（stars / updatedAt / riskTier …），
+ * 与上游 registry.json 的 snake_case 完全不同。旧版本（无该字段）的读法把缓存记录又喂给上游解析器，
+ * 于是 11 个字段静默丢失（stars 变 null、riskTier/marketTags/starsDelta7d 等整块消失）——
+ * 表现为"缓存命中的那次加载功能少一半，冷抓取却正常"。
+ *
+ * 版本不符按**无缓存**处理：宁可重新抓一次，也不读出一份被削过的数据。
+ */
+export const REGISTRY_CACHE_FORMAT = 2
+
 /** 磁盘缓存的落盘形状。 */
 export interface RegistryCacheFile {
   /** 落盘时刻（epoch ms）——文件年龄。 */
@@ -320,6 +335,8 @@ export interface RegistryCacheFile {
   /** 索引自身生成时间（ISO）；未知时 null。 */
   readonly generatedAt: string | null
   readonly repos: readonly RegistryRepo[]
+  /** 形状对不上而被丢弃的记录数（如实记账用；0 表示整份缓存都可用）。 */
+  readonly skipped: number
 }
 
 /** 索引磁盘缓存路径（本插件自己的缓存目录，不与旧包共用）。 */
@@ -328,23 +345,124 @@ export function registryCachePath(): string {
 }
 
 /**
- * 读取磁盘缓存；不存在/损坏/形状不对时返回 null。
+ * 解析一条**已归一化**的缓存记录（我们自己的记录形）。
  *
- * 损坏的缓存**不抛错**：它是可重建的派生物，抛错会把一次网络抖动升级成市场页整页失败。
+ * 与 {@link normalizeRegistryRepo} 的唯一区别是字段名：那个读上游的 snake_case
+ * （stargazers_count / updated_at / risk_tier …），这个读我们自己写出去的名字
+ * （stars / updatedAt / riskTier …）。**两者不能互相复用**——这正是本轮缺陷的成因。
+ *
+ * 校验仍然严格：缓存是外部文件（用户可能手改、磁盘可能截断），形状对不上的条目
+ * 一律丢弃并计数，绝不产出一条"看着像记录、其实缺了半数字段"的对象。
+ *
+ * @param raw - 缓存文件里的一条记录。
+ * @returns 归一化条目；形状不可用时 null。
+ */
+export function normalizeCachedRepo(raw: unknown): RegistryRepo | null {
+  if (raw === null || typeof raw !== 'object') return null
+  const record = raw as Record<string, unknown>
+  const repoName = str(record['repo'])
+  if (repoName === undefined || !/^[^/\s]+\/[^/\s]+$/.test(repoName)) return null
+  const name = str(record['name']) ?? repoName.slice(repoName.lastIndexOf('/') + 1)
+  const topics = Array.isArray(record['topics'])
+    ? record['topics'].filter((topic): topic is string => typeof topic === 'string')
+    : []
+  const stars = typeof record['stars'] === 'number' && Number.isFinite(record['stars']) ? record['stars'] : null
+  const updatedAt = str(record['updatedAt']) ?? null
+  const kind = MARKET_ITEM_KINDS.includes(record['kind'] as MarketItemKind) ? record['kind'] as MarketItemKind : undefined
+  const category = str(record['category'])
+  const packageName = str(record['packageName'])
+  const latestVersion = str(record['latestVersion'])
+  const license = str(record['license'])
+  // 上游元数据走与上游解析同一套校验（值域、截断、外链只认 https），只是字段名不同。
+  const upstream = normalizeUpstreamFields({
+    installable: record['installable'],
+    risk_tier: record['riskTier'],
+    risk_flags: record['riskFlags'],
+    reportUrl: record['reportUrl'],
+    market_tags: record['marketTags'],
+    archived: record['archived'],
+    stars_delta_7d: record['starsDelta7d'],
+    verdict: record['verifiedBy'] === undefined && record['verifiedAt'] === undefined ? undefined : 'pass',
+    verifiedBy: record['verifiedBy'],
+    verifiedAt: record['verifiedAt'],
+  })
+  return {
+    repo: repoName,
+    name,
+    description: str(record['description']) ?? '',
+    stars,
+    updatedAt,
+    topics,
+    ...(category === undefined ? {} : { category }),
+    ...(packageName === undefined ? {} : { packageName }),
+    ...(latestVersion === undefined ? {} : { latestVersion }),
+    ...(kind === undefined ? {} : { kind }),
+    ...upstream,
+    ...(license === undefined ? {} : { license }),
+  }
+}
+
+/**
+ * 缓存里有记录被丢弃时的说明；没有丢弃就返回空数组。
+ *
+ * 为什么要如实说：静默丢弃会重演本轮缺陷的另一半——数据看着"读到了"，其实少了一截。
+ *
+ * @param skipped - {@link readRegistryCacheFile} 报出的丢弃条数。
+ * @returns 一条说明（或空）。
+ */
+function cacheShapeNote(skipped: number): string[] {
+  return skipped === 0 ? [] : ['磁盘缓存有 ' + String(skipped) + ' 条记录形状不符，已丢弃（将重新抓取）']
+}
+
+/**
+ * 解析缓存文件里的记录列表（我们自己的记录形）：严格校验 + 按 repo 去重。
+ *
+ * @param list - 缓存文件里的 repos 数组。
+ * @returns 记录与丢弃计数；没有任何可用记录时 null。
+ */
+export function parseCachedRepos(list: unknown): { repos: RegistryRepo[]; skipped: number } | null {
+  if (!Array.isArray(list)) return null
+  const seen = new Set<string>()
+  const repos: RegistryRepo[] = []
+  let skipped = 0
+  for (const entry of list) {
+    const repo = normalizeCachedRepo(entry)
+    if (repo === null) {
+      skipped += 1
+      continue
+    }
+    const key = repo.repo.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    repos.push(repo)
+  }
+  return repos.length === 0 ? null : { repos, skipped }
+}
+
+/**
+ * 读取磁盘缓存；不存在/损坏/格式版本不符/形状不对时返回 null。
+ *
+ * 三条边界：
+ * 1. **不抛错**：缓存是可重建的派生物，抛错会把一次网络抖动升级成市场页整页失败；
+ * 2. **格式版本不符即视为无缓存**（旧文件按新读法读会得到一份被削过的数据，宁可重抓）；
+ * 3. **按我们自己的记录形解析**（{@link parseCachedRepos}），不再复用上游解析器——
+ *    复用会让 11 个字段在往返里静默消失（本轮 task-69 的根因）。
  */
 export function readRegistryCacheFile(): RegistryCacheFile | null {
   const path = registryCachePath()
   if (!existsSync(path)) return null
   try {
     const raw = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>
-    const parsed = parseRegistryPayload(raw['repos'])
+    if (raw['formatVersion'] !== REGISTRY_CACHE_FORMAT) return null
+    const parsed = parseCachedRepos(raw['repos'])
     if (parsed === null) return null
     const savedAt = typeof raw['savedAt'] === 'number' && Number.isFinite(raw['savedAt']) ? raw['savedAt'] : null
     if (savedAt === null) return null
     return {
       savedAt,
-      generatedAt: str(raw['generatedAt']) ?? parsed.generatedAt,
+      generatedAt: str(raw['generatedAt']) ?? null,
       repos: parsed.repos,
+      skipped: parsed.skipped,
     }
   } catch {
     return null
@@ -358,11 +476,21 @@ export function readRegistryCacheFile(): RegistryCacheFile | null {
  *
  * @returns 是否真的写成功了（调用方据此在 notes 里如实记账）。
  */
-export function writeRegistryCacheFile(entry: RegistryCacheFile): boolean {
+export function writeRegistryCacheFile(entry: {
+  readonly savedAt: number
+  readonly generatedAt: string | null
+  readonly repos: readonly RegistryRepo[]
+}): boolean {
   try {
     const path = registryCachePath()
     mkdirSync(dirname(path), { recursive: true })
-    writeFileSync(path, JSON.stringify({ savedAt: entry.savedAt, generatedAt: entry.generatedAt, repos: entry.repos }) + '\n')
+    writeFileSync(path, JSON.stringify({
+      // formatVersion 必须与读侧一致：它声明"这份文件里存的是我们归一化后的记录形"。
+      formatVersion: REGISTRY_CACHE_FORMAT,
+      savedAt: entry.savedAt,
+      generatedAt: entry.generatedAt,
+      repos: entry.repos,
+    }) + '\n')
     return true
   } catch {
     return false
@@ -629,7 +757,10 @@ export async function loadRegistryIndex(options: LoadRegistryIndexOptions = {}):
     if (memoryCache !== null && isRegistryCacheFresh(memoryCache.index, now, ttlMs)) return memoryCache.index
     const disk = readRegistryCacheFile()
     if (disk !== null && isRegistryCacheFresh(disk, now, ttlMs)) {
-      return publish(disk.repos, disk.generatedAt, now, ['来自磁盘缓存（未过期）'], true, false, 'cache', 0)
+      return publish(disk.repos, disk.generatedAt, now, [
+        '来自磁盘缓存（未过期）',
+        ...cacheShapeNote(disk.skipped),
+      ], true, false, 'cache', 0)
     }
   }
 
@@ -658,7 +789,11 @@ export async function loadRegistryIndex(options: LoadRegistryIndexOptions = {}):
     }
     const stale = readRegistryCacheFile()
     if (stale !== null) {
-      return publish(stale.repos, stale.generatedAt, now, [...result.notes, '全部网络来源失败，回退到过期磁盘缓存'], true, true, 'cache-stale', 0)
+      return publish(stale.repos, stale.generatedAt, now, [
+        ...result.notes,
+        '全部网络来源失败，回退到过期磁盘缓存',
+        ...cacheShapeNote(stale.skipped),
+      ], true, true, 'cache-stale', 0)
     }
     // cached=false 是有意的：这一支**什么都没有拿到**，说"来自缓存"是撒谎；调用方据 source='empty'
     // 与 stale=true 呈现"索引不可用，可重试"（旧版本这里传 true，UI 会画出"来自缓存"的假象）。
