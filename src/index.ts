@@ -12,6 +12,7 @@
  */
 
 import type { Context } from "@deepseek-ai/cordis"
+import { collectAboutFacts } from "./about.ts"
 import { analyzeEnvironment } from "./diagnostics.ts"
 import { DEFAULT_ENVIRONMENT_TEMPLATE, backupDiff, backupExport, backupRestore, cleanupTrialEnvironments, copyPlugins, createEnvironment, environmentFingerprint, environmentTemplates, listEnvironments, listTrialEnvironments, planTrialCleanup, processFacts, removeEnvironment, removeTrialEnvironment, renameEnvironment, repairDependencies, runTrialInstall, scanRuns, startEnvironment, stopEnvironment, trialEnvironmentName } from "./envManager.ts"
 import type { SnapshotDepth, TrialConclusion, TrialInstallOptions, TrialInstallResult } from "./envManager.ts"
@@ -227,6 +228,38 @@ function bootPortConflict(verdict: { readonly kind: string; readonly reason?: st
   if (!/EADDRINUSE|address already in use/i.test(text)) return null
   const hit = /address already in use[ :]*([0-9a-zA-Z.:\[\]_-]+)/i.exec(text)
   return hit === null ? "（错误里没写地址）" : hit[1]
+}
+
+/**
+ * 「关于」页要的 profile 事实（官方 profileContext 的三个字段）。
+ *
+ * 与 {@link currentEnvironmentName} / 环境目录那两处同一读法（结构式窄化 + 逐字段判空），
+ * 抽出来是因为 about 要一次读三个字段，散在调用处会重复三次同样的窄化。
+ *
+ * 读不到时**不给空串**：返回 undefined，由 about.ts 如实标 unknown（§12.3.3）。
+ *
+ * @param ctx - host 上下文。
+ * @returns 三个字段（各自可能缺失）；profileContext 整个读不到时 undefined。
+ */
+function profileFactsOf(ctx: Context | undefined): {
+  readonly installAnchor?: string
+  readonly profileName?: string
+  readonly profileDir?: string
+} {
+  const profileContext = ctx?.get("profileContext") as {
+    installAnchor?: unknown
+    name?: unknown
+    dir?: unknown
+  } | undefined
+  if (profileContext === undefined) return {}
+  const facts: { installAnchor?: string; profileName?: string; profileDir?: string } = {}
+  const put = (value: unknown, assign: (text: string) => void): void => {
+    if (typeof value === "string" && value.length > 0) assign(value)
+  }
+  put(profileContext.installAnchor, (text) => { facts.installAnchor = text })
+  put(profileContext.name, (text) => { facts.profileName = text })
+  put(profileContext.dir, (text) => { facts.profileDir = text })
+  return facts
 }
 
 /** 当前环境名（官方 profileContext 的 name）；读不到时为 null。 */
@@ -934,6 +967,16 @@ async function dispatch(op: string, body: Record<string, unknown>, deps: OpDepen
       const input = upgradeInput(deps, body, config)
       return asJob(async () => await rollbackUpgrade({ ...input, ...deps.upgrade ?? {} }))
     }
+
+    case "about":
+      // 纯读：本页要的运行时/安装/文件事实（task-95）。
+      //
+      // 为什么单开一个 op 而不塞进 capabilities：capabilities 的语义是"官方能力是否可用"，
+      // 混进"版本/路径"会让它变成杂物袋（Lead 裁决）。
+      //
+      // 为什么必须由 host 读：客户端是浏览器 bundle，没有 process、没有 node:fs——
+      // 这些事实里的大半它一条都拿不到（调研见 docs/private/task76-recon.md）。
+      return collectAboutFacts(profileFactsOf(deps.ctx))
 
     case "trialEnvironments":
       // 纯读：列出测试环境 + 清理计划预览 + 现在生效的保留策略。这个 op 不删任何东西。

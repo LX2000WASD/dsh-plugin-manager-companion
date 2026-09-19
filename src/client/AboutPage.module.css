@@ -1,0 +1,117 @@
+/* 「关于」页（task-95）。类名与 ConsolePage 同构，便于对照维护。 */
+
+.page {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.heading {
+  margin: 0;
+  font-size: 16px;
+  line-height: 24px;
+  color: var(--dsw-alias-label-primary);
+}
+
+/* 子页标签：与环境控制台同一形态（下划线选中态 + roving tabindex）。 */
+.tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 0.5px solid var(--dsw-alias-border-l1);
+}
+
+.tab {
+  appearance: none;
+  border: 0;
+  background: none;
+  padding: 6px 10px;
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+}
+
+.tab[data-active='true'] {
+  color: var(--dsw-alias-label-primary);
+  border-bottom-color: var(--dsw-alias-label-primary);
+}
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 0.5px solid var(--dsw-alias-border-l1);
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-layer-1);
+}
+
+.groupTitle {
+  margin: 0;
+  font-size: 12px;
+  line-height: 18px;
+  font-weight: 500;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.fact {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.factLabel {
+  flex: 0 0 96px;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.factBody {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+/* 承重：版本号与路径是用户来这一页要看的两个东西。 */
+.factValue {
+  font-family: var(--dsw-font-markdown-code-font-family);
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-primary);
+  word-break: break-all;
+}
+
+/* 来源与原因同档："这条事实怎么来的"与"为什么读不到"都是排查要看的。 */
+.factSource,
+.factReason {
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-tertiary);
+  word-break: break-all;
+}
+
+.hint {
+  margin: 0;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.error {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-state-error-primary, var(--dsw-alias-label-secondary));
+}

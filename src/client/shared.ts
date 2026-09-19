@@ -36,12 +36,12 @@ import type {
 } from '../types.ts'
 import { NS, type CompanionLocaleKey } from './locales.ts'
 import {
-  normalizeBackup, normalizeBackupDiff, normalizeCapabilities, normalizeConfig,
+  normalizeAbout, normalizeBackup, normalizeBackupDiff, normalizeCapabilities, normalizeConfig,
   normalizeEnvironmentResult, normalizeEnvironments, normalizeGatedInstall, normalizeKindList,
   normalizeMarketplace, normalizeReport, normalizeTrialCleanup, normalizeTrialDisclosure,
   normalizeTrialEnvironments, normalizeUpgradeAction, normalizeUpgradeCheck, normalizeUpgradeRollback,
-  type ClientConfig, type TrialDisclosureView, type TrialEnvironmentsView, type TrialOutcomeView,
-  type UpgradeCheckView,
+  type AboutFactsView, type ClientConfig, type TrialDisclosureView, type TrialEnvironmentsView,
+  type TrialOutcomeView, type UpgradeCheckView,
 } from './wire.ts'
 import { canaryVerdict, upgradeOutcome, type UpgradeOutcomeKind } from '../upgradeView.ts'
 
@@ -1562,6 +1562,94 @@ export interface UpgradeFace {
   dismissUpgradeNotice(): void
 }
 
+// ── 「关于」页（task-95）─────────────────────────────────────────────────
+
+/** 「关于」页的状态。 */
+export interface AboutState {
+  /** 事实集合；undefined = 还没读到（界面显示"还没读到"，不是一张空表）。 */
+  facts: AboutFactsView | undefined
+  loading: boolean
+  /** 读失败的原因（op 挂了）；文案归字典。 */
+  error: string | undefined
+  errorKey?: CompanionLocaleKey
+}
+
+/** 「关于」页的注入面。 */
+export interface AboutFace {
+  hooks: { about: SnapshotStore<AboutState> }
+  /**
+   * 读一次事实。
+   *
+   * 与升级面的"进入即查"不同，这里**不去重**：关于页读的是本地事实（无网络、无副作用），
+   * 每次进入重读一遍反而更准（缓存年龄会随时间变、用户可能刚删了缓存文件）。
+   * 去重那一套是为"出网"设计的，套在这里只会让数字变旧。
+   *
+   * @param refresh - 用户点的重试（与首次进入走同一条路，保留参数是为了接口一致）。
+   */
+  loadAbout(refresh: boolean): void
+}
+
+/**
+ * 「关于」页的控制器。
+ *
+ * 与 UpgradeController 同一形状（store + 读失败账本），但**没有** busy / 动作结果——
+ * 这一页纯读，没有任何写动作，所以不需要那些字段。
+ */
+export class AboutController {
+  private readonly store: SnapshotStore<AboutState>
+  /** "读事实"写下的失败；只有它能被下一次成功的读取清掉（见 ReadFailureLedger）。 */
+  private readonly readFailure = new ReadFailureLedger()
+
+  constructor() {
+    this.store = createSnapshotStore<AboutState>({ facts: undefined, loading: false, error: undefined })
+  }
+
+  /** 供注册项使用的注入面。 */
+  inject(): AboutFace {
+    return {
+      hooks: { about: this.store },
+      loadAbout: (refresh) => { void this.load(refresh) },
+    }
+  }
+
+  /** 当前快照。 */
+  snapshot(): AboutState {
+    return this.store.getSnapshot()
+  }
+
+  /**
+   * 读一次事实。
+   *
+   * 只动 loading / 自己写下的读失败——与升级面同一条纪律：
+   * 一次刷新无权替上一次的失败宣布结果。
+   *
+   * @param _refresh - 用户点的重试（本 op 无缓存，参数不影响读法）。
+   */
+  async load(_refresh: boolean): Promise<void> {
+    this.store.update((draft) => { draft.loading = true })
+    try {
+      const facts = normalizeAbout(await callOp<unknown>('about', {}))
+      if (facts === undefined) {
+        this.store.update((draft) => {
+          draft.loading = false
+          draft.errorKey = this.readFailure.record('error.incompletePayload')
+        })
+        return
+      }
+      this.store.update((draft) => {
+        draft.facts = facts
+        draft.loading = false
+        this.readFailure.clearOwn(draft)
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.store.update((draft) => {
+        draft.loading = false
+        draft.error = this.readFailure.record(message)
+      })
+    }
+  }
+}
 /**
  * 市场页的注入面：市场自己的面 + 升级面。
  *

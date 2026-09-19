@@ -28,6 +28,7 @@ import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 import type { CompanionConfig } from '../settings.ts'
+import { AboutPage, createAboutStore } from './AboutPage.tsx'
 import { ConsolePage, createConsoleStore } from './ConsolePage.tsx'
 import { KindsPage } from './KindsPage.tsx'
 import { MarketplacePage } from './MarketplacePage.tsx'
@@ -35,8 +36,8 @@ import { CompanionOfficialItem } from './OfficialSlots.tsx'
 import { createUpgradeRowComponent, type UpgradeRowProps } from './UpgradeRow.tsx'
 import { NS, en, zh } from './locales.ts'
 import {
-  ConfigController, EnvironmentsController, HealthController, KindsController, MarketplaceController,
-  SETTINGS_NAMESPACE, TrialController, UpgradeController,
+  AboutController, ConfigController, EnvironmentsController, HealthController, KindsController,
+  MarketplaceController, SETTINGS_NAMESPACE, TrialController, UpgradeController,
   type ConsoleFace, type MarketplaceConsoleFace, type UpgradeFace, type UpgradeState,
 } from './shared.ts'
 import { registeredNames } from '../upgradeView.ts'
@@ -75,6 +76,8 @@ export function apply(ctx: ClientContext): void {
   const kindsFace = new KindsController().inject()
   const trialFace = new TrialController().inject()
   const upgradeController = new UpgradeController()
+  // 「关于」页（task-95）：纯读事实，无写动作。
+  const aboutController = new AboutController()
   const upgradeFace = upgradeController.inject()
 
   // 一个入口、三个子页面，所以只有一份注入面：三个控制器的 hooks 隔间合在一个
@@ -141,6 +144,22 @@ export function apply(ctx: ClientContext): void {
     store: consoleStore,
     inject: consoleFace,
   }, ConsolePage))
+
+  // 一级入口 4：「关于」（order 100）。
+  //
+  // 为什么用 100：官方现有 0/10/15/20/25，我们 16/17/22——用一个远端正数把"最后一位"
+  // 这个意图**编码进数值**（而不是靠"当前没人用 30"这种会过期的假设）。
+  // 官方 navIcon 对未知 id 回落到齿轮图标，这是预期，不绕。
+  const aboutStore = createAboutStore()
+  ctx.slots.inject('settings.section', () => ctx.slots.register({
+    name: 'settings.section',
+    id: 'about',
+    order: 100,
+    label: () => t('nav.about'),
+    locale: NS,
+    store: aboutStore,
+    inject: () => aboutController.inject(),
+  }, AboutPage))
 
   // 一级入口 3：技能与预设（order 22，插在官方 agent-presets=20 之后）。
   ctx.slots.inject('settings.section', () => ctx.slots.register({

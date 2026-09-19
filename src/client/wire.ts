@@ -104,6 +104,114 @@ export function normalizeCapabilities(raw: unknown): OfficialCapabilities | unde
   }
 }
 
+// ── 「关于」页的事实（about op，task-95）─────────────────────────────────
+
+/**
+ * 一条可能读不到的事实（与 host 的 `AboutFact<T>` 同构）。
+ *
+ * 客户端**不做**二次归一（例如把 unknown 折成空串）：那会抹掉"读不到"与"读到了空值"的区别，
+ * 而界面正是靠这个区别决定显示"未知"还是显示值（§12.3.3）。
+ */
+export type AboutFactView<T> =
+  | { readonly value: T; readonly source: string }
+  | { readonly unknown: string }
+
+/** 「关于」页的全部事实（客户端视图）。 */
+export interface AboutFactsView {
+  readonly runtime: {
+    readonly version: AboutFactView<string>
+    readonly installAnchor: AboutFactView<string>
+  }
+  readonly process: {
+    readonly node: AboutFactView<string>
+    readonly platform: AboutFactView<string>
+    readonly arch: AboutFactView<string>
+  }
+  readonly companion: { readonly version: AboutFactView<string> }
+  readonly profile: {
+    readonly name: AboutFactView<string>
+    readonly dir: AboutFactView<string>
+  }
+  readonly files: {
+    readonly settingsPath: AboutFactView<string>
+    readonly registryCachePath: AboutFactView<string>
+    readonly registryCacheAgeMs: AboutFactView<number>
+  }
+}
+
+/**
+ * 归一一条事实。
+ *
+ * 判据：载荷里有**非空字符串的 `unknown`** 才算"读不到"；有可用 `value` 才算读到了。
+ * 两者都缺（形状不对）时按 unknown 处理并给出原因——**绝不**折成"读到空值"：
+ * 那会让界面上少一行错误提示，而多一个空白字段。
+ *
+ * @param raw - 原始值。
+ * @param what - 字段名（写进形状不对时的原因里）。
+ * @param parse - 值的解析器（字符串用 asText，数字用 optionalNumber）。
+ * @returns 归一后的事实；形状不可用时给 unknown。
+ */
+function aboutFact<T>(raw: unknown, what: string, parse: (value: unknown) => T | undefined): AboutFactView<T> {
+  const record = asObject(raw)
+  if (record === undefined) return { unknown: what + '：载荷里没有这一条' }
+  const unknown = asText(record['unknown'])
+  if (unknown !== undefined) return { unknown }
+  const value = parse(record['value'])
+  if (value === undefined) return { unknown: what + '：载荷形状不对（既没有 unknown 也没有可用的 value）' }
+  return { value, source: text(record['source']) }
+}
+
+/**
+ * 归一一个事实组（同一形状反复出现，抽出来避免多处重复）。
+ *
+ * @param raw - 组对象。
+ * @param fields - 组里的字段名。
+ * @returns 逐字段的事实。
+ */
+function aboutStringFacts(raw: unknown, fields: readonly string[]): Record<string, AboutFactView<string>> {
+  const record = asObject(raw)
+  const out: Record<string, AboutFactView<string>> = {}
+  for (const field of fields) out[field] = aboutFact(record?.[field], field, asText)
+  return out
+}
+
+/**
+ * 归一 `about` op 的结果。
+ *
+ * @param raw - op 的原始值。
+ * @returns 视图；载荷整体不可用时 undefined（界面显示"读不到"并给重试，而不是画一张空表）。
+ */
+export function normalizeAbout(raw: unknown): AboutFactsView | undefined {
+  const record = asObject(raw)
+  if (record === undefined) return undefined
+  const runtime = aboutStringFacts(record['runtime'], ['version', 'installAnchor'])
+  const proc = aboutStringFacts(record['process'], ['node', 'platform', 'arch'])
+  const companion = aboutStringFacts(record['companion'], ['version'])
+  const profile = aboutStringFacts(record['profile'], ['name', 'dir'])
+  const files = asObject(record['files'])
+  const required = (group: Record<string, AboutFactView<string>>, field: string): AboutFactView<string> =>
+    group[field] ?? { unknown: field + '：载荷里没有这一条' }
+  return {
+    runtime: {
+      version: required(runtime, 'version'),
+      installAnchor: required(runtime, 'installAnchor'),
+    },
+    process: {
+      node: required(proc, 'node'),
+      platform: required(proc, 'platform'),
+      arch: required(proc, 'arch'),
+    },
+    companion: { version: required(companion, 'version') },
+    profile: { name: required(profile, 'name'), dir: required(profile, 'dir') },
+    files: {
+      settingsPath: aboutFact(files?.['settingsPath'], 'settingsPath', asText),
+      registryCachePath: aboutFact(files?.['registryCachePath'], 'registryCachePath', asText),
+      // 年龄是数字：asText 会把数字拒掉，所以单独一个解析器。
+      registryCacheAgeMs: aboutFact(files?.['registryCacheAgeMs'], 'registryCacheAgeMs', optionalNumber),
+    },
+  }
+}
+
 // ── 诊断报告 ────────────────────────────────────────────────────────────
 
 /** 处置等级：未知值折叠成 report-only（未知一律不提供一键修复）。 */

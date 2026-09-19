@@ -26,6 +26,7 @@
 | `marketplace` | `{ refresh?: boolean }` | `MarketplaceResult` | |
 | `listKinds` | `{}` | `KindListResult` | |
 | `uninstallKind` | `{ repo: string }` | `EnvironmentResult` | job |
+| `about` | `{}` | `AboutFacts` | |
 | `trialEnvironments` | `{}` | `TrialEnvironmentReport` | |
 | `trialRemove` | `{ name: string }` | `EnvironmentResult` | |
 | `trialCleanup` | `{}` | `TrialCleanupResult` | job |
@@ -124,6 +125,49 @@ node_modules 实体、凭据、缓存都不进来——备份的价值是可重�
 - **启动方式**如实返回：终端窗口（带终端名）或后台。后台启动默认加 `--no-open`（没有人看着
   那个窗口，官方否则会在那台机器桌面弹浏览器）；终端模式保持官方默认行为。
 
+## 「关于」页的事实（`about` op，task-95）
+
+返回 `AboutFacts`：**每条事实要么带来源、要么带读不到的原因**。
+
+```ts
+type AboutFact<T> = { value: T; source: string } | { unknown: string }
+```
+
+**为什么做成三选一而不是 `value | undefined`**：用可选值时，界面很容易把"读不到"渲染成空白或 0——
+那正是 §12.3.3 禁的形态。类型上强制二选一，漏判会在编译期暴露。
+
+| 字段 | 读法 | 读不到时 |
+|---|---|---|
+| `runtime.version` | 官方安装锚点 `@deepseek-ai/dsh/package.json` 的 `version` | `unknown` + 原因（拿不到锚点 / 文件不存在 / 没有该字段） |
+| `runtime.installAnchor` | `ctx.profileContext.installAnchor` | `unknown`（进程不是以 dsh profile 启动） |
+| `process.node` / `platform` / `arch` | `process.version` / `process.platform` / `process.arch` | 实际读不到（这三个是进程事实，恒有值） |
+| `companion.version` | **本插件自身** package.json（由 `import.meta.url` 定位，不依赖 cwd） | `unknown` + 原因 |
+| `profile.name` / `dir` | `ctx.profileContext` | `unknown`（宿主没提供 profileContext） |
+| `files.settingsPath` | 由 `DSH_HOME` 推导 | 恒有值（推导值，不是读到的文件） |
+| `files.registryCachePath` | `registryCachePath()` | 恒有值（路径本身可推导） |
+| `files.registryCacheAgeMs` | 缓存文件的 mtime 与现在的差 | `unknown`（缓存还不存在）——**不是 0**：0 是"刚刚写过" |
+
+### 三条纪律（DESIGN §12.10 的应用）
+
+1. **只读事实，不猜事实**。明确不做三件事：不用 `navigator.userAgent` 推平台（客户端根本没这字段）、
+   不把版本号写成打包时常量（构建期与运行期可能不是同一份安装）、不用"看起来像"的兜底值填空。
+2. **每条都要能回答"这条事实怎么来的"**——所以 `value` 必带 `source`。
+   一个没有来源的版本号与一个猜出来的版本号，在界面上长得一模一样。
+3. **`companion.version` 不许绕道 `upgradeCheck` 的 self 单元**（Lead 点名）：那条路是"顺带拿到"，
+   要用户先进升级检查、且语义是"这个包的升级单元"，不是"我正在跑的是哪一版"。
+
+### 为什么必须是 host 侧的 op
+
+客户端是浏览器 bundle：**没有 `process`、没有 `node:fs`**（实测两项 grep 零命中）。
+这 8 条事实里客户端原本只能拿到 3 条（环境列表 / 官方能力 / 市场索引状态），
+其余 5 条（DSH 版本、安装位置、Node 版本平台架构、缓存路径与年龄、settings.yaml 路径）**一条都拿不到**。
+按客户端自足做会得到一张"一半未知"的表，而空格恰好在版本/安装位置这两个最常被问的位置——
+用"永远未知"去满足"读不到就显示未知"这条纪律，是拿纪律当借口。调研记录见 `docs/private/task76-recon.md`。
+
+### 与 task-77 的关系
+
+task-77 的"官方运行时"那一条同样要安装事实（版本 / 位置 / 怎么升），**同一个缺口不在两处开两次**：
+77 直接复用本 op，不再新增 host 侧读取。
 ## 试装（质量门第二步，DESIGN §5.2/§5.3）
 
 **接入点**：`install` op（市场页安装、`dshpmc install`、`fix` 里的补装）都走同一个
