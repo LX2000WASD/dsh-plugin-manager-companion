@@ -1102,14 +1102,21 @@ test('指纹五元组全部读盘：任一文件变化都必须改变 hash，且
 })
 
 test('浅快照缺依赖的失败形态要被认出来（启动器层），否则升级分支就是装饰', () => {
-  // 真机实测：浅快照没带 node_modules 时，启动器在挂载前就 throw（既没有 Loader 标记，也没有缺任务提示）
+  // 真机实测（逐字，task-73 探针复采）：浅快照没带 node_modules 时启动器在挂载前 throw。
   const resolver = [
-    'file:///…/@deepseek-ai/dsh-app-boot/lib/index.js:904',
-    '  throw new Error(`dsh: cannot resolve profile bundle "dsh-t50-linklayer" from the dsh installation or /tmp/x/profiles/real-dpmc`);',
+    'file:///home/u/.pnpm/@deepseek-ai+dsh-app-boot@0.1.6/lib/index.js:904',
+    'throw new Error(`\${binName}: cannot resolve profile bundle \${JSON.stringify(packageName)} from the dsh installation or \${profileDir}`);',
+    '^',
+    'Error: dsh: cannot resolve profile bundle "dsh-t50-linklayer" from the dsh installation or /tmp/x/profiles/real-dpmc',
+    "    at resolveBundleDir (file:///home/u/.pnpm/@deepseek-ai+dsh-app-boot@0.1.6/lib/index.js:904:8)",
   ].join('\n')
   const verdict = env.judgeBootStderr(resolver)
   assert.equal(verdict.kind, 'failed', '层解析不到是明确失败，不是「判不出来」（否则升级永远不触发）')
   assert.match(verdict.reason, /cannot resolve profile bundle/)
+  // task-73 顺手项：根因不能是那一行源码模板（里面有 ${…} 占位符，连包名都看不出）。
+  assert.match(verdict.reason, /^Error: dsh: cannot resolve profile bundle "dsh-t50-linklayer"/, '要取真正的消息行')
+  assert.doesNotMatch(verdict.reason, /throw new Error/)
+  assert.ok(verdict.chain.every((line) => !line.startsWith('throw ') && !line.startsWith('at ') && line !== '^'), '栈帧与源码行不许进根因链')
   // 三种形态互不混淆
   assert.equal(env.judgeBootStderr('Error: dsh: plugin tree failed to load: x').kind, 'failed')
   assert.equal(env.judgeBootStderr('dsh: a task is required, for example: …').kind, 'mounted')

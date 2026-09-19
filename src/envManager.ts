@@ -2283,6 +2283,7 @@ const BOOT_UNRESOLVED_LAYER = /cannot resolve profile bundle/
 function isChainNoise(line: string): boolean {
   if (/^at\s/.test(line)) return true          // 栈帧：at fn (file:line:col)
   if (/^throw\s/.test(line)) return true       // 抛错处源码
+  if (/^\^+$/.test(line)) return true          // Node 代码帧里的插入符标记行
   if (/^\(node:\d+\)/.test(line)) return true // Node 运行期警告
   if (/^node:internal\//.test(line)) return true
   return false
@@ -2311,8 +2312,16 @@ export function judgeBootStderr(stderr: string): BootVerdict {
   }
   // 层解析不到：明确的失败（不是「判不出来」）。升级 full 的判据靠它。
   if (lines.some((line) => BOOT_UNRESOLVED_LAYER.test(line))) {
-    const hit = lines.find((line) => BOOT_UNRESOLVED_LAYER.test(line)) ?? lines[0] ?? ''
-    return { kind: 'failed', reason: hit, chain: lines.slice(0, 4) }
+    // 真机实测的 stderr 长这样（逐字见 tests 的用例）：先是 Node 的代码帧（file 路径 /
+    // throw 那一行源码 / 插入符），然后是真正的消息行 Error: dsh: cannot resolve profile bundle "X" …，
+    // 最后是栈帧。旧实现取"第一行含该短语的行"，于是用户读到的"为什么快照起不来"是一行**源码模板**
+    // ——里面还是 ${…} 占位符，连是哪个包都看不出来。这里先滤噪声，再在干净行里找消息。
+    const clean = lines.filter((line) => !isChainNoise(line))
+    const hit = clean.find((line) => BOOT_UNRESOLVED_LAYER.test(line))
+      ?? clean[0]
+      ?? lines.find((line) => BOOT_UNRESOLVED_LAYER.test(line))
+      ?? ''
+    return { kind: 'failed', reason: hit, chain: clean.slice(0, 4) }
   }
   if (lines.some((line) => BOOT_TASK_REQUIRED.test(line))) return { kind: 'mounted' }
   return {
