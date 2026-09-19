@@ -426,7 +426,9 @@ test('stopEnvironment：拒绝当前环境、未运行时报 not-running', async
   assert.equal(current.code, 'current')
 })
 
-test('stopEnvironment 按 pid 精确 kill 真实进程（绝不 pkill）', { skip: process.platform === 'win32' }, async () => {
+// W-23：不再 skip win32 —— 「跳过」等于 Windows 上永远没有这几条证据。
+// 断言本身是平台无关的（只杀指定 pid、旁观 pid 不受影响）；Windows 上走 taskkill 分支。
+test('stopEnvironment 按 pid 精确 kill 真实进程（绝不 pkill）', async () => {
   makeEnv('stopme')
   // 一个命令行长相与真实实例一致的自有进程：入口路径含 @deepseek-ai/dsh，位置参数是环境名。
   const entry = join(HOME, 'fake-install', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
@@ -451,7 +453,7 @@ test('stopEnvironment 按 pid 精确 kill 真实进程（绝不 pkill）', { ski
   }
 })
 
-test('进程表指错 pid 时拒绝 kill（误杀防护）', { skip: process.platform === 'win32' }, async () => {
+test('进程表指错 pid 时拒绝 kill（误杀防护）', async () => {
   makeEnv('stopme2')
   // 一个真实存活、但命令行完全不属于该环境的进程。
   const bystander = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' })
@@ -794,3 +796,69 @@ test('N-04: 日志尾巴的乱码如实标注，不冒充可读信息', async ()
   assert.doesNotMatch(result.output, /abc-DEF_123/, 'token 仍然必须脱敏')
   assert.match(result.output, /token=\*\*\*/)
 })
+
+// ── task-58：进程事实「不可读」必须可区分（W-19/W-04/W-05）────────────────────
+// 用伪装 win32 在 Linux 上造出「进程事实读不到」的真实路径：win32 分支要 powershell，
+// 本机没有 → 读取器返回带原因的失败（而不是旧的空表）。
+test('W-19: 进程事实不可读时，破坏性操作拒绝并如实说「运行状态未知」', async () => {
+  makeEnv('facts-demo')
+  const facts = await withPlatformAsync('win32', () => env.processFacts({ fresh: true }))
+  assert.equal(facts.readable, false, 'Linux 上没有 powershell → 事实不可读')
+  assert.match(String(facts.reason), /powershell/)
+
+  const stopped = await withPlatformAsync('win32', () => env.stopEnvironment('facts-demo', { current: null }))
+  assert.equal(stopped.ok, false)
+  assert.equal(stopped.code, 'facts-unavailable', '不能把「读不到」说成「没有运行中的实例」')
+  assert.match(stopped.output, /运行状态未知/)
+
+  const removed = await withPlatformAsync('win32', () => env.removeEnvironment('facts-demo', { current: null }))
+  assert.equal(removed.ok, false)
+  assert.equal(removed.code, 'facts-unavailable')
+  assert.equal(existsSync(join(PROFILES, 'facts-demo', 'package.json')), true, '未知状态下绝不允许删除')
+
+  const renamed = await withPlatformAsync('win32', () => env.renameEnvironment('facts-demo', 'facts-other', { current: null }))
+  assert.equal(renamed.code, 'facts-unavailable')
+  assert.equal(existsSync(join(PROFILES, 'facts-demo')), true)
+})
+
+test('W-19: 事实不可读时启动照常，但要如实说明「未做重复实例检查」', async () => {
+  makeEnv('facts-start', { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'] })
+  let clock = 0
+  const result = await withPlatformAsync('win32', () => env.startEnvironment('facts-start', {
+    mode: 'background', port: 4790, readyTimeoutMs: 200,
+    launch: async () => ({ ok: true, mode: 'background', detail: 'x' }),
+    probe: async () => 401, sleep: async () => {}, now: () => (clock += 100),
+  }))
+  assert.equal(result.ok, true, result.output)
+  assert.match(result.output, /进程表不可读/, '必须如实带出未做检查这件事')
+  assert.match(result.output, /未做重复实例检查/)
+})
+
+test('W-04/W-05: 读取器不再把失败折叠成空表，且没有 -match 预筛', () => {
+  // 行为面：注入的 reader 仍然可用（那是测试缝），并在不可读时给出原因
+  const fake = env.processFactsNow({ reader: () => ['4242\tC:\\x\\@deepseek-ai\\dsh\\lib\\bin.js --profile demo'] })
+  assert.equal(fake.readable, true)
+  // 源码面：预筛会让命令行里没写 dsh 的包装进程被漏掉（审计 W-05），钉住它不许回来。
+  // 注意断言对象是**代码形态**（Where-Object），不是「-match 'dsh'」这串文字 ——
+  // 注释里会解释这条修复，dist 保留注释，拿文字当判据会误伤自己。
+  const source = readFileSync(new URL('../dist/envManager.js', import.meta.url), 'utf8')
+  assert.doesNotMatch(source, /Where-Object/, 'PowerShell 预筛（Where-Object）必须已删除')
+  assert.match(source, /Get-CimInstance Win32_Process/, '进程表查询本身还在')
+})
+
+test('W-12: 权限说辞如实（Linux 0600 / Windows 依赖目录 ACL），不再宣称 0600 是保证', () => {
+  const source = readFileSync(new URL('../dist/envManager.js', import.meta.url), 'utf8')
+  assert.match(source, /Windows：权限位\*\*不生效\*\*|权限位不生效/, '要写明 Windows 上权限位不生效')
+  assert.match(source, /ACL/, '要写明依赖目录 ACL')
+})
+
+/** async 版平台伪装：必须在 await 之后才还原（否则伪装在第一个 await 处失效）。 */
+async function withPlatformAsync(platform, body) {
+  const original = Object.getOwnPropertyDescriptor(process, 'platform')
+  Object.defineProperty(process, 'platform', { value: platform, configurable: true })
+  try {
+    return await body()
+  } finally {
+    Object.defineProperty(process, 'platform', original)
+  }
+}

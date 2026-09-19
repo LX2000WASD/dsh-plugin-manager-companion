@@ -133,6 +133,8 @@ export type EnvironmentErrorCode =
   | 'no-web-layer'
   /** 调用方显式指定的端口已经被监听：不猜「应答来自谁」，直接拒绝、不发起启动。 */
   | 'port-in-use'
+  /** 进程事实读不到（powershell/ps 不可用等）：运行状态未知，拒绝在未知状态下做破坏性操作。 */
+  | 'facts-unavailable'
   /** 未知的 bundle 模板名。 */
   | 'unknown-template'
   /** 不是由 dsh 以 profile 方式启动，官方跨环境通道拿不到 installAnchor。 */
@@ -209,7 +211,7 @@ export interface ScanRunsOptions {
   readonly fresh?: boolean
 }
 
-let runCache: { readonly at: number; readonly value: ReadonlyMap<string, readonly EnvironmentRun[]> } | null = null
+let runCache: { readonly at: number; readonly facts: ProcessFacts } | null = null
 
 /** 丢弃进程扫描缓存。启停成功后调用，让下一次读取立刻看到变化。 */
 export function resetRunCache(): void {
@@ -225,10 +227,7 @@ export function resetRunCache(): void {
 export function scanRuns(options: ScanRunsOptions = {}): ReadonlyMap<string, readonly EnvironmentRun[]> {
   const now = options.now?.() ?? Date.now()
   const ttl = options.ttlMs ?? SCAN_RUNS_TTL_MS
-  if (options.fresh !== true && runCache !== null && now - runCache.at < ttl) return runCache.value
-  const value = scanRunsNow(options)
-  runCache = { at: now, value }
-  return value
+  return processFacts(options).runs
 }
 
 /**
@@ -241,10 +240,30 @@ export function scanRuns(options: ScanRunsOptions = {}): ReadonlyMap<string, rea
  * @param options - 注入选项。
  * @returns 环境名到运行实例列表的映射。
  */
-export function scanRunsNow(options: ScanRunsOptions = {}): Map<string, readonly EnvironmentRun[]> {
-  const lines = (options.reader ?? defaultProcessLines)()
+/**
+ * 一次进程事实读取的结果。
+ *
+ * `readable: false` 与「读到了、但一个实例都没在跑」是**两件事**（审计 W-19）：
+ * 旧实现把失败折叠成空表，调用方只能看到「这台机器上没有实例」，于是把不知道说成了知道。
+ * 不可读时调用方必须如实说「运行状态未知」，破坏性操作必须拒绝。
+ */
+export interface ProcessFacts {
+  /** 环境名 → 运行实例；不可读时为空 Map（**不要据此判断「没在运行」**）。 */
+  readonly runs: ReadonlyMap<string, readonly EnvironmentRun[]>
+  /** 进程事实是否读到。 */
+  readonly readable: boolean
+  /** 不可读的原因（面向用户）。 */
+  readonly reason?: string
+}
+
+/** 读一次进程事实（不经缓存，含可读性）。 */
+function readProcessFacts(options: ScanRunsOptions): ProcessFacts {
+  const read: ProcessLines = options.reader !== undefined
+    ? { lines: options.reader() }
+    : defaultProcessLines()
+  if (read.reason !== undefined) return { runs: new Map(), readable: false, reason: read.reason }
   const out = new Map<string, EnvironmentRun[]>()
-  for (const line of parseProcessLines(lines)) {
+  for (const line of parseProcessLines(read.lines)) {
     const run = parseRun(line)
     if (run === null) continue
     const entry: EnvironmentRun = { pid: line.pid, port: run.port, command: line.command }
@@ -252,7 +271,42 @@ export function scanRunsNow(options: ScanRunsOptions = {}): Map<string, readonly
     if (list === undefined) out.set(run.name, [entry])
     else list.push(entry)
   }
-  return out
+  return { runs: out, readable: true }
+}
+
+/**
+ * 立即读取进程事实（含「读不到」这个状态），并写入缓存。
+ *
+ * @param options - 注入选项。
+ * @returns 事实与可读性。
+ */
+export function processFactsNow(options: ScanRunsOptions = {}): ProcessFacts {
+  return readProcessFacts(options)
+}
+
+/**
+ * 读取进程事实（带缓存）。
+ *
+ * @param options - 缓存与注入选项。
+ * @returns 事实与可读性。
+ */
+export function processFacts(options: ScanRunsOptions = {}): ProcessFacts {
+  const now = options.now?.() ?? Date.now()
+  const ttl = options.ttlMs ?? SCAN_RUNS_TTL_MS
+  if (options.fresh !== true && runCache !== null && now - runCache.at < ttl) return runCache.facts
+  const facts = readProcessFacts(options)
+  runCache = { at: now, facts }
+  return facts
+}
+
+/**
+ * 立即扫描进程表，不经缓存（只要实例映射；可读性请用 processFactsNow）。
+ *
+ * @param options - 注入选项。
+ * @returns 环境名到运行实例列表的映射。
+ */
+export function scanRunsNow(options: ScanRunsOptions = {}): Map<string, readonly EnvironmentRun[]> {
+  return new Map(readProcessFacts(options).runs)
 }
 
 /** 把进程表输出切成 pid + 命令行。 */
@@ -437,31 +491,53 @@ function procProcessLines(): string[] | null {
   return lines
 }
 
-/** POSIX 降级路径：ps -eo pid=,args=。 */
-function psProcessLines(): string[] {
+/** 一次进程表读取的结果：行，或「读不到 + 原因」。 */
+interface ProcessLines {
+  readonly lines: readonly string[]
+  /** 读不到时的原因（面向用户）；读到时为 undefined。 */
+  readonly reason?: string
+}
+
+/**
+ * POSIX 降级路径：ps -eo pid=,args=。
+ *
+ * 与旧行为的差别（审计 W-19）：失败**不再折叠成空表**——空表和「这台机器上没有实例」
+ * 在旧实现里完全不可区分，而调用方据此会说「未运行」。官方 process-inspector 的先例是
+ * 对不支持的平台直接 throw：失败必须能被区分。
+ */
+function psProcessLines(): ProcessLines {
   try {
-    return execFileSync('ps', ['-eo', 'pid=,args='], {
-      encoding: 'utf8', timeout: 15_000, maxBuffer: 16 * 1024 * 1024,
-    }).split('\n')
-  } catch {
-    return []
+    return {
+      lines: execFileSync('ps', ['-eo', 'pid=,args='], {
+        encoding: 'utf8', timeout: 15_000, maxBuffer: 16 * 1024 * 1024,
+      }).split('\n'),
+    }
+  } catch (error) {
+    return { lines: [], reason: 'ps 不可用（' + messageOf(error) + '）' }
   }
 }
 
-/** Windows 路径：powershell CIM 查询进程表。 */
-function windowsProcessLines(): string[] {
+/**
+ * Windows 路径：powershell CIM 查询进程表。
+ *
+ * 两处与旧行为不同：① 不再用 `-match 'dsh'` 预筛（审计 W-05：命令行里没写 dsh 的包装进程
+ * 会被漏掉，而真正的判据是 parseRun；代价是输出更大、更慢，正确性优先）；
+ * ② 失败带上原因（W-19），不返回空表。
+ */
+function windowsProcessLines(): ProcessLines {
   try {
     const script = [
       'Get-CimInstance Win32_Process',
-      "| Where-Object { $_.CommandLine -and $_.CommandLine -match 'dsh' }",
       '| ForEach-Object { $_.ProcessId.ToString() + [char]9 + $_.CommandLine }',
     ].join(' ')
-    return execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', script], {
-      encoding: 'utf8', timeout: 15_000, maxBuffer: 16 * 1024 * 1024,
-      stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true,
-    }).split(/\r?\n/)
-  } catch {
-    return []
+    return {
+      lines: execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', script], {
+        encoding: 'utf8', timeout: 15_000, maxBuffer: 16 * 1024 * 1024,
+        stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true,
+      }).split(/\r?\n/),
+    }
+  } catch (error) {
+    return { lines: [], reason: 'powershell CIM 不可用（' + messageOf(error) + '）：无法读取进程表' }
   }
 }
 
@@ -473,9 +549,12 @@ function windowsProcessLines(): string[] {
  *
  * @returns 进程表行。
  */
-function defaultProcessLines(): readonly string[] {
+function defaultProcessLines(): ProcessLines {
   if (process.platform === 'win32') return windowsProcessLines()
-  return procProcessLines() ?? psProcessLines()
+  const proc = procProcessLines()
+  // proc 返回 null 只表示「这台机器没有 /proc」，那是**降级**信号，不是失败；
+  // 真正的失败（ps 也没有）由 psProcessLines 的 reason 带出来。
+  return proc === null ? psProcessLines() : { lines: proc }
 }
 
 /**
@@ -825,8 +904,13 @@ export async function renameEnvironment(
   if (sameEnvironment(current, from) || sameEnvironment(current, to)) {
     return failure('current', current + ' 是当前正在运行的环境，不能重命名')
   }
-  // 改名不可逆：不拿 3s 陈旧缓存当依据，用即时扫描。
-  const busy = runsForName(scanRuns({ fresh: true }), from)
+  // 改名不可逆：不拿 3s 陈旧缓存当依据，用即时读取，并要求事实**可读**。
+  const facts = processFacts({ fresh: true })
+  if (!facts.readable) {
+    return failure('facts-unavailable', from + ' 的运行状态未知：进程事实读不到（'
+      + String(facts.reason) + '）。拒绝在未知状态下重命名环境。')
+  }
+  const busy = runsForName(facts.runs, from)
   if (busy.length > 0) {
     return failure('running', from + ' 正在运行（pid ' + busy.map((run) => run.pid).join(', ') + '），请先停止再重命名')
   }
@@ -865,8 +949,13 @@ export async function removeEnvironment(
   if (sameEnvironment(current, name)) {
     return failure('current', name + ' 是当前正在运行的环境，不能删除（要删请先停止本进程）')
   }
-  // 删除不可逆：不拿 3s 陈旧缓存当依据，用即时扫描。
-  const busy = runsForName(scanRuns({ fresh: true }), name)
+  // 删除不可逆：不拿 3s 陈旧缓存当依据，用即时读取，并要求事实**可读**。
+  const facts = processFacts({ fresh: true })
+  if (!facts.readable) {
+    return failure('facts-unavailable', name + ' 的运行状态未知：进程事实读不到（'
+      + String(facts.reason) + '）。拒绝在未知状态下删除环境。')
+  }
+  const busy = runsForName(facts.runs, name)
   if (busy.length > 0) {
     return failure('running', name + ' 正在运行（pid ' + busy.map((run) => run.pid).join(', ') + '），请先停止再删除')
   }
@@ -975,7 +1064,10 @@ export async function startEnvironment(
   if (problem !== null) return failure('invalid-name', problem)
   const dir = environmentDir(name)
   if (!existsSync(join(dir, 'package.json'))) return failure('not-found', '环境不存在：' + name)
-  const running = runsForName(scanRuns(), name)
+  const facts = processFacts()
+  // 不可读时**不**假装「没在运行」：照常允许启动（启动不是破坏性操作），但把事实如实带出去。
+  const factsNote = facts.readable ? '' : '\n注意：进程表不可读（' + String(facts.reason) + '），本次未做重复实例检查。'
+  const running = runsForName(facts.runs, name)
   if (running.length > 0) {
     const ports = running.map((run) => run.port).filter((port): port is number => port !== null)
     return failure('running', name + ' 已经在运行'
@@ -1018,12 +1110,12 @@ export async function startEnvironment(
     }
   }
   if (status === null) {
-    return failure('timeout', startTimeoutMessage(name, port, spec, outcome, options) + retryNote)
+    return failure('timeout', startTimeoutMessage(name, port, spec, outcome, options) + retryNote + factsNote)
   }
   // 新实例立刻可见：丢弃陈旧缓存。
   resetRunCache()
   // 回退过一次的话，成功文案也要说清楚（用户需要知道第一次为什么没成）。
-  return success(startedMessage(name, port, status, spec, outcome) + retryNote)
+  return success(startedMessage(name, port, status, spec, outcome) + retryNote + factsNote)
 }
 
 /**
@@ -1280,7 +1372,9 @@ function authenticatedUrlFromLog(logPath: string): string | null {
  *
  * 三件事：
  *  1. 单行截断（启动日志里可能有很长的堆栈，REST 响应不该被它撑爆）；
- *  2. token 脱敏（token 只允许出现在那份 0600 日志与 startEnvironment 的成功返回里）；
+ *  2. token 脱敏（token 只允许出现在那份「仅本用户可读」的启动日志与 startEnvironment 的
+ *     成功返回里）—— 注意「仅本用户可读」在 Linux 上靠 0600，在 Windows 上权限位不生效、
+ *     只受目录 ACL 保护（审计 W-12），所以这是**说辞**不是保证；失败文案必须脱敏正是因为如此；
  *  3. **编码如实**（独立复验 N-04）：Node 自己写的是 UTF-8，但 cmd/powershell 的本地化报错按
  *     控制台代码页写入，按 utf8 读会得到替换字符。这里去掉控制字符，并把「是否含无法解码
  *     片段」交给调用方标注 —— 不让乱码冒充可读信息。
@@ -1413,6 +1507,8 @@ async function spawnBackground(spec: LaunchSpec, note?: string): Promise<LaunchO
   const logPath = operationLogPath(spec.dir, 'start')
   let failure: string | null = null
   try {
+    // Linux：目录 0700 / 文件 0600；Windows：权限位**不生效**（审计 W-12），
+    // 只受继承的目录 ACL 保护。所以这里按「尽力而为」写权限，不把它当安全承诺。
     mkdirSync(dirname(logPath), { recursive: true, mode: 0o700 })
     const fd = openSync(logPath, 'a', 0o600)
     try {
@@ -1662,8 +1758,16 @@ export async function stopEnvironment(
   }
   // 缓存先看（Windows 全表扫描可达数秒）；缓存里没有时用即时扫描复核一次，免得把
   // 刚起来的实例判成没起、或把刚停的实例当成还在跑。
-  let runs = runsForName(scanRuns(), name)
-  if (runs.length === 0) runs = runsForName(scanRunsNow(), name)
+  let factsUpd = processFacts()
+  let runs = runsForName(factsUpd.runs, name)
+  if (runs.length === 0 && factsUpd.readable) {
+    factsUpd = processFacts({ fresh: true })
+    runs = runsForName(factsUpd.runs, name)
+  }
+  if (!factsUpd.readable) {
+    return failure('facts-unavailable', name + ' 的运行状态未知：进程事实读不到（'
+      + String(factsUpd.reason) + '）。拒绝在未知状态下停止实例。')
+  }
   if (runs.length === 0) return failure('not-running', name + ' 没有运行中的实例')
 
   const killed: number[] = []
