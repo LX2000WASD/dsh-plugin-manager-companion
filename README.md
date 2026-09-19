@@ -84,7 +84,7 @@ dsh plugin --profile <name> add dsh-plugin-manager-companion@latest
 
 ## 命令行
 
-`dshpmc` 提供与界面同样的能力，主要用途是**环境起不来时的逃生口**——界面打不开时仍可诊断：
+`dshpmc` 提供与界面等价的能力，用在三种场合：脚本与 CI、偏好终端、以及**界面打不开时的逃生口**。
 
 ```sh
 dshpmc analyze --profile <name>   # 五层体检；有问题退出码 1
@@ -92,8 +92,14 @@ dshpmc list    --profile <name>   # 层栈、依赖、本插件装过的技能�
 dshpmc install | remove | update | mount | uninstall-kind
 ```
 
+`update <name>` 把 specifier 重写为 `@latest` 后重装——不带版本号的 `dsh plugin add` 不会升级已声明的范围，
+`pnpm update` 也只在已声明的范围内重解析，跨版本升级必须重写 specifier。整个升级过程与界面点击走同一条受保护链路。
+
 `analyze` 不依赖运行中的实例：它只读磁盘，因此配置文件写坏、启动失败的环境同样能给出根因与文件行号。
 关键层没有查完时，它会说明本次结论不完整，而不是报健康。
+
+运行在宿主进程内的 agent 不通过命令行做插件写操作：守卫会把裸的 `dsh plugin` / `pnpm` 变更命令拒绝，
+并指向官方的 `plugin_manager` 工具。`dshpmc` 走的是与官方工具同一条 pnpm 通道，因此不在拦截范围内。
 
 ## 平台支持
 

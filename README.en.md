@@ -89,7 +89,8 @@ The skills and presets page manages the `SKILL.md` files and agent presets insta
 
 ## Command line
 
-`dshpmc` exposes the same capabilities without the UI. Its main use is the escape hatch when an environment cannot start:
+`dshpmc` exposes the same capabilities as the UI, for three situations: scripts and CI, terminal-first use, and the escape hatch
+when the UI cannot open.
 
 ```sh
 dshpmc analyze --profile <name>   # five-layer health check; exit code 1 when issues are found
@@ -97,8 +98,15 @@ dshpmc list    --profile <name>   # layer stack, dependencies, installed skills 
 dshpmc install | remove | update | mount | uninstall-kind
 ```
 
+`update <name>` rewrites the specifier to `@latest` and reinstalls: `dsh plugin add` without a version does not upgrade an already
+declared range, and `pnpm update` only re-resolves inside that range, so crossing versions requires rewriting the specifier.
+The whole upgrade goes through the same protected path as a click in the UI.
+
 `analyze` does not need a running instance: it reads from disk, so an environment whose configuration is broken still gets a root cause
 with file and line. When a key layer could not run, it says the conclusion is incomplete instead of reporting health.
+
+An agent running inside the host does not use the command line for plugin writes: the guard rejects bare `dsh plugin` / `pnpm`
+mutation commands and points at the official `plugin_manager` tool. `dshpmc` uses the same pnpm channel as that tool, so it is not intercepted.
 
 ## Platform support
 
