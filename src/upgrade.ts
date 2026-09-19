@@ -996,16 +996,22 @@ export async function runUpgradeCanary(
 }
 
 /**
- * 造一个"让候选成为新装"的官方运行器。
+ * 观察试装环境里的官方通道调用，留下**层栈激活证据**。
  *
- * 官方通道取不到时**不在这里抛**：把这个失败推迟到真正调用那一刻（即试装引擎装候选时），
- * 让它走试装引擎原有的 `cannot-trial` 路径——"没验证"要如实报成没验证，
- * 而不是在跑金丝雀之前先抛一个看起来像别的问题的异常。
+ * 职责分工（task-84 之后）：
+ *   · **让候选成为"新装"由试装引擎自己负责**（envManager 的 detachCandidate，走同一条官方
+ *     remove 通道）。金丝雀因此不再自己卸包——两处各卸一次是重复机制，而重复的机制迟早会分叉。
+ *   · 这里只**观察**：装完之后测试环境的 `dsh.profile.bundles` 里到底有没有候选。
+ *     为什么还需要它：试装执行器是**可注入**的，注入替身时引擎那条守卫根本没跑，
+ *     所以金丝雀要能自己读一次盘，才谈得上"不信任上游给的 passed"。
+ *
+ * 官方通道取不到时**不在这里抛**：把失败推迟到真正调用那一刻，让它走试装引擎原有的
+ * `cannot-trial` 路径——"没验证"要如实报成没验证。
  *
  * @param environment - 真实环境名。
  * @param spec - 候选 spec。
  * @param deps - 共享依赖。
- * @returns 包装后的运行器与证据句柄。
+ * @returns 透传的运行器与证据句柄。
  */
 function activationFor(
   environment: string, spec: string, deps: UpgradeEngineDeps,
@@ -1022,24 +1028,27 @@ function activationFor(
   const name = canaryPackageName(spec)
   let captured: CanaryActivation | null = null
   let removedFirst = false
-  let removeNote = '没有先卸包：候选不在测试环境的依赖里，装它本来就是"新装"'
+  let removeNote = '候选不在测试环境的依赖里，装它本来就是"新装"'
   const run: PluginCommandRunner = async (context, args, options) => {
     const runner = await resolveInner()
-    // 只拦 add（物化快照那一步的 install 原样透传）。
-    if (args[0] !== 'add' || name === null) return await runner(context, args, options)
-    const dir = context.dir ?? environmentDir(target)
-    if (dependencySpecs(dir)[name] !== undefined) {
-      const removal = await runner(context, ['remove', name], options)
+    // remove 是引擎在摘候选（task-84）：记下来，供报告里如实说"确实先卸了"。
+    if (args[0] === 'remove') {
+      const removal = await runner(context, args, options)
       removedFirst = removal.exitCode === 0
       removeNote = removal.exitCode === 0
-        ? '已先走官方通道卸掉 ' + name + '，使候选成为"新装"（否则官方 reconcile 会跳过既有依赖，候选进不了层栈）'
-        : '官方卸包失败（退出码 ' + String(removal.exitCode) + '），候选可能仍被当作既有依赖：'
+        ? '已先走官方通道卸掉 ' + String(args[1]) + '，使候选成为"新装"'
+          + '（否则官方 reconcile 会跳过"既有依赖"，候选进不了层栈）'
+        : '官方卸包失败（退出码 ' + String(removal.exitCode) + '），候选可能仍被当作"既有依赖"：'
           + removal.output.trim().slice(-200)
+      return removal
     }
     const result = await runner(context, args, options)
-    // 装完立刻读盘：层栈里有没有它，是这次验证成不成立的唯一判据。
-    const bundles = readEnvironmentManifest(dir).bundles
-    captured = { name, bundles: [...bundles], activated: bundles.includes(name), removedFirst, removeNote }
+    if (args[0] === 'add' && name !== null) {
+      // 装完立刻读盘：层栈里有没有它，是这次验证成不成立的唯一判据。
+      const dir = context.dir ?? environmentDir(target)
+      const bundles = readEnvironmentManifest(dir).bundles
+      captured = { name, bundles: [...bundles], activated: bundles.includes(name), removedFirst, removeNote }
+    }
     return result
   }
   return { run, read: () => captured }

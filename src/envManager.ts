@@ -3130,6 +3130,12 @@ export interface TrialInstallResult {
   readonly escalated: boolean
   /** 浅快照不给力的原因（升级时给出，取失败判定的第一行）。 */
   readonly escalationReason?: string
+  /** 卸包那一步的说明（task-84：让候选成为"新装"，做了/没做/失败都如实写）。 */
+  readonly detached?: string
+  /**
+   * 候选的激活事实（进没进层栈）。拿到就带上，供调用方与界面判断"这次到底验证到了没有"。
+   */
+  readonly activation?: TrialActivationFact
 }
 
 /**
@@ -3173,12 +3179,79 @@ function candidateName(spec: string): string | undefined {
   return at > 0 ? bare.slice(0, at) : bare
 }
 
+/**
+ * 候选在试装环境里的激活事实（"装上了"不等于"验证到了"的判据，可下发给界面）。
+ */
+export interface TrialActivationFact {
+  /** 候选包名；认不出来时 undefined。 */
+  readonly name: string | undefined
+  /** 装完之后测试环境的层栈（dsh.profile.bundles）。 */
+  readonly bundles: readonly string[]
+  /** 候选是否真的进了层栈（false = 挂载期不会加载它，这次验证不作数）。 */
+  readonly activated: boolean
+  /** 是否为了让候选成为"新装"而先走了官方 remove。 */
+  readonly removedFirst: boolean
+  /** 卸包那一步的说明（做了/没做/失败，都如实写）。 */
+  readonly detachNote: string
+}
+
 /** 试装环境里"候选是否真的进入了组合层栈"的核对结果。 */
 interface TrialActivation {
   /** 核对通过（候选确实进了层栈，挂载期会加载它）。 */
   readonly ok: boolean
   /** 不通过时的可读原因（面向用户）。 */
   readonly detail: string
+  /** 盘上事实（成功与失败都带，供结果与界面使用）。 */
+  readonly fact: TrialActivationFact
+}
+
+/**
+ * 把候选从**测试环境**的依赖里摘掉，使它成为"新装"，从而被官方 reconcile 真正写进层栈。
+ *
+ * 为什么必须有这一步（真机缺陷，task-84 阻断级）：官方 reconcile **跳过 `beforeDeps` 里已有的依赖**
+ * （lib/types/operations.js 的 reconcile：`if (beforeDeps.has(name)) continue`）。而试装快照是从
+ * **源环境**物化的，`SNAPSHOT_FILES` 含 `package.json`——当候选已经在源环境里时（gatedInstall
+ * 的顺序是"先 installBundle 落进源环境、再试装"；升级场景更是天然如此），候选在物化那一刻
+ * **就已经在测试环境的 dependencies 里**。于是试装那次 add 无事可做（pnpm 日志里没有候选那一行），
+ * reconcile 跳过它 → 它进不了 `dsh.profile.bundles` → 挂载期不加载它 → 旧代码照样启动成功。
+ *
+ * 后果是阻断级的：试装开 + block（两个默认档）时**任何安装都被拦下**，而 `candidate-broken`
+ * 变得不可达——质量门第二步从"验证"退化成"永远拦下"。
+ *
+ * 所以"让候选成为新装"是试装成立的前提，不是可选的优化。走的是**同一条官方通道** `remove`
+ * （绝不自己调 pnpm）；卸不掉也不阻断——那时层栈事实会如实反映"它没进层栈"，由守卫报 cannot-trial。
+ *
+ * @param runner - 官方运行器。
+ * @param context - 官方 operations 调用参数（测试环境）。
+ * @param options - 输出与取消策略。
+ * @param target - 测试环境名。
+ * @param spec - 候选 spec。
+ * @returns 是否真的卸掉了，以及面向用户的说明。
+ */
+async function detachCandidate(
+  runner: PluginCommandRunner, context: PackageOperationContext, options: CrossEnvironmentOptions,
+  target: string, spec: string,
+): Promise<{ readonly removed: boolean; readonly note: string }> {
+  const name = candidateName(spec)
+  if (name === undefined) {
+    return { removed: false, note: '认不出候选包名（' + spec + '）：没有先卸包，装它时按"新装"处理。' }
+  }
+  if (trialDependencies(target).includes(name)) {
+    const removal = await runPackageOperation(runner, context, ['remove', name], options)
+    if (removal.exitCode === 0) {
+      return {
+        removed: true,
+        note: '已先走官方通道卸掉 ' + name + '，使候选成为"新装"'
+          + '（否则官方 reconcile 会跳过"既有依赖"，候选进不了层栈，这次试装等于什么都没验证）。',
+      }
+    }
+    return {
+      removed: false,
+      note: '官方卸包失败（退出码 ' + String(removal.exitCode) + '），候选可能仍被当作"既有依赖"：'
+        + removal.output.trim().slice(-200),
+    }
+  }
+  return { removed: false, note: '候选本来就不在测试环境的依赖里，装它天然是"新装"。' }
 }
 
 /**
@@ -3192,22 +3265,35 @@ interface TrialActivation {
  *
  * 所以"装上了"不等于"验证到了"：这里以**盘上的层栈事实**为准，没进层栈就不许算通过。
  *
+ * 与 {@link detachCandidate} 的分工：那一步负责**让正常路径走通**（把候选变成新装），
+ * 这一条负责**兜住任何仍然没进层栈的情况**（摘不掉、候选不声明 dsh.bundle、测试环境有残留…）。
+ * 两者都要有：只修顺序会漏掉"候选本来就不声明 bundle"这类，只留守卫则正常安装全被误拦。
+ *
  * @param target - 测试环境名。
  * @param beforeDeps - 装候选包之前的依赖名集合。
  * @param spec - 候选包 spec（用于在依赖里认出它）。
+ * @param detached - 是否已先卸包（卸过就不该再判成"既有的"）。
  * @returns 核对结果；不通过时带原因。
  */
-function trialActivation(target: string, beforeDeps: readonly string[], spec: string): TrialActivation {
+function trialActivation(
+  target: string, beforeDeps: readonly string[], spec: string, detached: { readonly removed: boolean; readonly note: string },
+): TrialActivation {
+  const candidate = candidateName(spec)
   let manifest: { dependencies?: Record<string, unknown>; dsh?: { profile?: { bundles?: readonly string[] } } }
   try {
     manifest = readProfileManifest(OUR_PACKAGE_NAME, environmentDir(target)) as typeof manifest
   } catch (error) {
-    return { ok: false, detail: '读不到测试环境的 package.json（' + messageOf(error) + '）。' }
+    return {
+      ok: false,
+      detail: '读不到测试环境的 package.json（' + messageOf(error) + '）。',
+      fact: { name: candidate, bundles: [], activated: false, removedFirst: detached.removed, detachNote: detached.note },
+    }
   }
   const bundles = manifest.dsh?.profile?.bundles ?? []
   const deps = Object.keys(manifest.dependencies ?? {})
+  const fact = (activated: boolean): TrialActivationFact =>
+    ({ name: candidate, bundles: [...bundles], activated, removedFirst: detached.removed, detachNote: detached.note })
   const added = deps.filter((name) => !beforeDeps.includes(name))
-  const candidate = candidateName(spec)
   const suspects = added.length > 0
     ? added
     : candidate === undefined ? [] : deps.filter((name) => name === candidate)
@@ -3216,10 +3302,11 @@ function trialActivation(target: string, beforeDeps: readonly string[], spec: st
       ok: false,
       detail: '装完候选包后，测试环境的 dependencies 里没有出现它（装前 ' + String(beforeDeps.length)
         + ' 项，装后 ' + String(deps.length) + ' 项）：这次试装没有验证到任何东西。',
+      fact: fact(false),
     }
   }
   const active = suspects.filter((name) => bundles.includes(name))
-  if (active.length > 0) return { ok: true, detail: '' }
+  if (active.length > 0) return { ok: true, detail: '', fact: fact(true) }
   const stale = suspects.every((name) => beforeDeps.includes(name))
   return {
     ok: false,
@@ -3227,7 +3314,9 @@ function trialActivation(target: string, beforeDeps: readonly string[], spec: st
       + '（dsh.profile.bundles = ' + JSON.stringify(bundles) + '）——挂载期不会加载它。'
       + (stale
         ? '原因：它在本轮之前就已经是测试环境的依赖，官方 reconcile 会跳过"既有的"依赖。'
+          + (detached.removed ? '（已先卸过包，但候选仍被当作既有的——见上面的卸包说明。）' : '')
         : '原因：官方 reconcile 没有把它写进层栈（它可能没有声明 dsh.bundle）。'),
+    fact: fact(false),
   }
 }
 
@@ -3328,24 +3417,29 @@ export async function runTrialInstall(
     return done('cannot-trial', '无法试装：官方 pnpm 通道不可用（' + messageOf(error) + '）。这不等于通过。',
       { baseline })
   }
-  const installArgs = options.allowNetwork === false ? ['add', '--offline', spec] : ['add', spec]
   // 装之前记下依赖清单：reconcile 会跳过"既有的"依赖，这份事实是下面那条守卫的判据。
   const beforeDeps = trialDependencies(target)
+  // 让候选成为"新装"（task-84 阻断级修复）：候选已在测试环境依赖里时先卸掉它，否则官方
+  // reconcile 跳过既有依赖 → 进不了层栈 → 挂载期不加载它 → 这次试装什么都没验证到。
+  const detached = await detachCandidate(runner, context, options, target, spec)
+  const installArgs = options.allowNetwork === false ? ['add', '--offline', spec] : ['add', spec]
   const installed = await runPackageOperation(runner, context, installArgs, options)
   if (installed.exitCode !== 0) {
     const reason = options.allowNetwork === false
       ? '已禁用联网，且本地 store 里没有这个包'
       : '官方安装失败（exitCode=' + String(installed.exitCode) + '）'
     return done('cannot-trial', '无法试装：' + reason + '。\n'
-      + installed.output.trim().slice(-800) + '\n这不等于通过。', { baseline })
+      + installed.output.trim().slice(-800) + '\n这不等于通过。', { baseline, detached: detached.note })
   }
 
   // 兜底守卫（task-80）：装上了不等于验证到了。候选没进层栈 → 这次试装什么都没验证到，
   // 一律 cannot-trial，**任何情况下都不许 passed**（假通过的整类问题在这里被掐断）。
-  const activation = trialActivation(target, beforeDeps, spec)
+  // 正常顺序下（上面刚把候选摘成"新装"）这条不该触发——它兜的是摘不掉、候选不声明
+  // dsh.bundle、测试环境有残留这些真实情况。
+  const activation = trialActivation(target, beforeDeps, spec, detached)
   if (!activation.ok) {
     return done('cannot-trial', '无法试装：' + activation.detail + '\n这不等于通过。',
-      { baseline, depth, escalated, escalationReason })
+      { baseline, depth, escalated, escalationReason, activation: activation.fact })
   }
 
   const after = await verify(target)
@@ -3370,7 +3464,8 @@ export async function runTrialInstall(
   lines.push('构建：' + describeBuild(build))
   return done(conclusion, lines.join('\n'), {
     baseline, candidate: after.verdict, sourceFingerprintAfter, changedDuringTrial,
-    depth, escalated, ...escalationReason === undefined ? {} : { escalationReason },
+    depth, escalated, detached: detached.note, activation: activation.fact,
+    ...escalationReason === undefined ? {} : { escalationReason },
   })
 }
 

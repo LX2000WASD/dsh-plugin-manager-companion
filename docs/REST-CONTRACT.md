@@ -305,6 +305,28 @@ job 的失败只体现在后续 `job` op 的轮询结果里，把"少给一个�
   过了 1 小时自动恢复。
 - `refresh: true`（手动）**无视**开关、TTL 与负缓存，永远可用。
 
+### 试装顺序：候选必须先成为"新装"（task-84，阻断级）
+
+官方 reconcile **跳过 `beforeDeps` 里已有的依赖**（`lib/types/operations.js`）。而试装快照是从
+**源环境**物化的，`SNAPSHOT_FILES` 含 `package.json`——只要候选已经在源环境里，它在物化那一刻
+就已经在测试环境的 `dependencies` 里，于是试装那次 `add` 无事可做、reconcile 跳过它、
+它进不了 `dsh.profile.bundles`、挂载期不加载它。
+
+**这不是优化，是前提**：试装开 + `onFailure:block`（两个默认档）时，任何安装都会被判
+`cannot-trial` 并回滚（市场页 / 官方通道 / 修复安装三边同时失效），而 `candidate-broken`
+不可达——质量门第二步从"验证"退化成"永远拦下"。
+
+修法：试装引擎在官方 `add` 之前先走**同一条官方通道** `remove` 掉候选（`detachCandidate`），
+使它成为"新装"，reconcile 才会把它写进层栈。三条纪律：
+
+- 候选**不在**测试环境依赖里时**不发** `remove`（全新安装不必白跑一次 pnpm）；
+- `remove` 失败**不阻断**：层栈事实会如实反映"它没进层栈"，由守卫报 `cannot-trial`；
+- task-80 的守卫**保留作兜底**（摘不掉、候选不声明 `dsh.bundle`、测试环境有残留…），
+  正常顺序下它不该触发。
+
+结果里带 `trial.activation`（`activated` / `bundles` / `removedFirst` / `detachNote`）与
+`trial.detached`：界面据此能说清"这次到底验证到了没有"。
+
 ### 金丝雀（`upgrade` 的 canary 字段）
 
 `canary.ran === false` 时必须读 `canary.skippedReason`：试装总开关关着时文案是

@@ -407,61 +407,95 @@ test('试装总开关关闭：不跑金丝雀，但必须如实说明"未验证�
  *   · 同一条路走一次卸包（activationFor 做的）→ 候选成为"新装"，层栈里真的出现它 → passed。
  * 两者只差"有没有先 remove"，所以它同时证明了修复有效、且守卫没有被绕过。
  */
-test('金丝雀验证升级：候选先卸再装才进层栈（否则官方 reconcile 跳过既有依赖 = 假通过）', async () => {
-  const spec = 'probe-plugin@1.1.0'
-  /** 造一个"装完候选之后层栈里有它"的官方运行器替身（模拟官方 reconcile 的激活语义）。 */
-  const reconcileRunner = (calls) => ({
-    calls,
-    run: async (context, args) => {
-      calls.push([...args])
-      const dir = context.dir
-      const manifestPath = join(dir, 'package.json')
-      const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
-      const deps = manifest.dependencies ?? {}
-      if (args[0] === 'remove') {
-        delete deps[args[1]]
-        manifest.dependencies = deps
-        writeFileSync(manifestPath, JSON.stringify(manifest, undefined, 2) + String.fromCharCode(10))
-        return { exitCode: 0, output: 'removed', truncated: false, logPath: '/dev/null' }
-      }
-      // add：写进 dependencies，并模拟官方 reconcile——只有**新装**的包才进层栈。
-      const before = new Set(Object.keys(deps))
-      deps['probe-plugin'] = '1.1.0'
+/**
+ * 造一个模拟**官方 reconcile 语义**的官方运行器替身：
+ *   · `remove` 把包从 dependencies 与 bundles 一起摘掉；
+ *   · `add` 写进 dependencies，且**只有"新装"的包才进层栈**（既有依赖被跳过）。
+ *
+ * 这就是官方 lib/types/operations.js 里 reconcile 的真实行为，也是 task-84 的机制所在。
+ */
+function reconcileRunner(calls) {
+  return async (context, args) => {
+    calls.push([...args])
+    const dir = context.dir
+    const manifestPath = join(dir, 'package.json')
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+    const deps = manifest.dependencies ?? {}
+    const bundles = manifest.dsh?.profile?.bundles ?? []
+    if (args[0] === 'remove') {
+      const name = args[1]
+      delete deps[name]
       manifest.dependencies = deps
-      const bundles = manifest.dsh?.profile?.bundles ?? []
-      if (!before.has('probe-plugin') && !bundles.includes('probe-plugin')) bundles.push('probe-plugin')
-      manifest.dsh = { ...manifest.dsh, profile: { ...manifest.dsh?.profile, bundles } }
+      manifest.dsh = { ...manifest.dsh, profile: { ...manifest.dsh?.profile, bundles: bundles.filter((n) => n !== name) } }
       writeFileSync(manifestPath, JSON.stringify(manifest, undefined, 2) + String.fromCharCode(10))
-      const pkgDir = join(dir, 'node_modules', 'probe-plugin')
-      mkdirSync(pkgDir, { recursive: true })
-      writeFileSync(join(pkgDir, 'package.json'), JSON.stringify({ name: 'probe-plugin', version: '1.1.0' }) + String.fromCharCode(10))
-      return { exitCode: 0, output: 'added', truncated: false, logPath: '/dev/null' }
-    },
-  })
+      return { exitCode: 0, output: 'removed', truncated: false, logPath: '/dev/null' }
+    }
+    const before = new Set(Object.keys(deps))
+    deps['probe-plugin'] = '1.1.0'
+    manifest.dependencies = deps
+    if (!before.has('probe-plugin') && !bundles.includes('probe-plugin')) bundles.push('probe-plugin')
+    manifest.dsh = { ...manifest.dsh, profile: { ...manifest.dsh?.profile, bundles } }
+    writeFileSync(manifestPath, JSON.stringify(manifest, undefined, 2) + String.fromCharCode(10))
+    const pkgDir = join(dir, 'node_modules', 'probe-plugin')
+    mkdirSync(pkgDir, { recursive: true })
+    writeFileSync(join(pkgDir, 'package.json'), JSON.stringify({ name: 'probe-plugin', version: '1.1.0' }) + String.fromCharCode(10))
+    return { exitCode: 0, output: 'added', truncated: false, logPath: '/dev/null' }
+  }
+}
 
-  // 方向一：候选已是测试环境的依赖、但**不在层栈里**（装了没启用的形态）→ 不卸包它
-  // 就永远进不了层栈 → cannot-trial。这就是 task-80 守卫的判据，也是"升级必然落
-  // cannot-trial"的机制（官方 reconcile 跳过既有依赖）。
+test('试装引擎自己摘候选（task-84）：候选已在测试环境依赖里时先卸再装，才进层栈', async () => {
+  const spec = 'probe-plugin@1.1.0'
+  const mounted = async () => ({ verdict: { kind: 'mounted' }, elapsedMs: 1, stderr: '', exitCode: 0, build: {} })
+
+  // 形态 A：候选已在测试环境 deps 里、但不在层栈（**gatedInstall 的顺序造成的原始形态**：
+  // 候选先落进源环境 → 快照把它带进测试环境 → reconcile 跳过既有依赖）。
+  // 引擎必须先把它摘掉，否则这次试装什么都没验证到。
   makeEnv('act-stale', { bundles: [], dependencies: { 'probe-plugin': '^1.0.0' }, installed: { 'probe-plugin': '1.0.0' } })
   const staleCalls = []
   const stale = await env.runTrialInstall(spec, 'act-stale', {
-    installAnchor: '/anchor/package.json',
-    runCommand: reconcileRunner(staleCalls).run,
-    verify: async () => ({ verdict: { kind: 'mounted' }, elapsedMs: 1, stderr: '', exitCode: 0, build: {} }),
+    installAnchor: '/anchor/package.json', runCommand: reconcileRunner(staleCalls), verify: mounted,
   })
-  assert.equal(stale.conclusion, 'cannot-trial', '候选没进层栈就必须是 cannot-trial（不许假通过）')
-  assert.match(stale.output, /没有进入组合层栈|没有出现它/)
-  assert.deepEqual(staleCalls, [['add', spec]], '没卸包：只发了 add（这正是它进不了层栈的原因）')
+  assert.deepEqual(staleCalls, [['remove', 'probe-plugin'], ['add', spec]], '必须先卸再装')
+  assert.equal(stale.conclusion, 'passed', stale.output)
+  assert.equal(stale.activation.activated, true, '摘过之后候选才真的进层栈')
+  assert.equal(stale.activation.removedFirst, true)
+  assert.match(stale.detached, /使候选成为"新装"/)
+  assert.ok(stale.activation.bundles.includes('probe-plugin'), JSON.stringify(stale.activation.bundles))
 
-  // 方向二：走升级引擎的金丝雀（activationFor 会先 remove）→ 候选成为新装 → 层栈里真的有它 → passed。
+  // 形态 B：候选既在 deps 也在层栈（**升级场景**：已装且已启用）。同一条路。
+  makeEnv('act-live', { bundles: ['probe-plugin'], dependencies: { 'probe-plugin': '^1.0.0' }, installed: { 'probe-plugin': '1.0.0' } })
+  const liveCalls = []
+  const live = await env.runTrialInstall(spec, 'act-live', {
+    installAnchor: '/anchor/package.json', runCommand: reconcileRunner(liveCalls), verify: mounted,
+  })
+  assert.deepEqual(liveCalls, [['remove', 'probe-plugin'], ['add', spec]], '升级场景同样要先卸再装')
+  assert.equal(live.conclusion, 'passed', live.output)
+  assert.equal(live.activation.activated, true)
+
+  // 形态 C：候选本来就不在测试环境里（**全新安装**）→ 不该多发一次 remove（那会白跑一次 pnpm）。
+  makeEnv('act-fresh', { bundles: [], dependencies: {} })
+  const freshCalls = []
+  const fresh = await env.runTrialInstall(spec, 'act-fresh', {
+    installAnchor: '/anchor/package.json', runCommand: reconcileRunner(freshCalls), verify: mounted,
+  })
+  assert.deepEqual(freshCalls, [['add', spec]], '不在依赖里就不卸包')
+  assert.equal(fresh.conclusion, 'passed', fresh.output)
+  assert.equal(fresh.activation.removedFirst, false)
+})
+
+test('金丝雀验证升级：走真引擎，候选先卸再装才进层栈（否则官方 reconcile 跳过既有依赖 = 假通过）', async () => {
+  const spec = 'probe-plugin@1.1.0'
+  const mounted = async () => ({ verdict: { kind: 'mounted' }, elapsedMs: 1, stderr: '', exitCode: 0, build: {} })
+
+  // 走升级引擎的金丝雀（真试装引擎 + 真官方通道替身）→ 候选成为新装 → 层栈里真的有它 → passed。
   makeEnv('act-live', { bundles: ['probe-plugin'], dependencies: { 'probe-plugin': '^1.0.0' }, installed: { 'probe-plugin': '1.0.0' } })
   makeEnv('act-live-dpmc', { bundles: ['probe-plugin'], dependencies: { 'probe-plugin': '^1.0.0' }, installed: { 'probe-plugin': '1.0.0' } })
   const liveCalls = []
   const canary = await up.runUpgradeCanary('act-live', spec, configWith({ trial: CANARY_ON }), {
     installAnchor: '/anchor/package.json',
-    runCommand: reconcileRunner(liveCalls).run,
+    runCommand: reconcileRunner(liveCalls),
     // 注入"永远挂载成功"：这条测试验的是**层栈激活**，不是启动器（真启动另有真机证据）。
-    verify: async () => ({ verdict: { kind: 'mounted' }, elapsedMs: 1, stderr: '', exitCode: 0, build: {} }),
+    verify: mounted,
     log: () => {},
   })
   assert.equal(canary.ran, true)

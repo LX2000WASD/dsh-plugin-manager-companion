@@ -939,6 +939,72 @@ test('task-80 假通过守卫：候选没进层栈一律 cannot-trial（绝不�
   assert.match(noActivate.output, /没有进入组合层栈/)
 });
 
+test('task-84 正常顺序不误拦：引擎先摘候选，已装候选也能真的验证到（task-80 守卫保留作兜底）', async () => {
+  const build = env.buildIdentity()
+  const mounted = async () => ({ verdict: { kind: 'mounted' }, elapsedMs: 1, stderr: '', exitCode: 1, build })
+
+  /**
+   * 忠实的官方 reconcile 替身：**只有"新装"的依赖才进层栈**，既有依赖被跳过；
+   * `remove` 同时摘掉 deps 与层栈。这就是 lib/types/operations.js 里 reconcile 的行为。
+   */
+  const reconcileRunner = (calls) => async (context, args) => {
+    calls.push([...args])
+    const path = join(context.dir, 'package.json')
+    const manifest = JSON.parse(readFileSync(path, 'utf8'))
+    const deps = manifest.dependencies ?? {}
+    const bundles = manifest.dsh?.profile?.bundles ?? []
+    const name = args[0] === 'remove' ? args[1] : 'probe-reconcile'
+    if (args[0] === 'remove') {
+      delete deps[name]
+      manifest.dependencies = deps
+      manifest.dsh = { ...manifest.dsh, profile: { ...manifest.dsh?.profile, bundles: bundles.filter((item) => item !== name) } }
+      writeFileSync(path, JSON.stringify(manifest, undefined, 2) + '\n')
+      return { exitCode: 0, output: 'removed', truncated: false, logPath: '/dev/null' }
+    }
+    const before = new Set(Object.keys(deps))
+    deps[name] = 'link:/fixture/' + name
+    manifest.dependencies = deps
+    if (!before.has(name) && !bundles.includes(name)) {
+      manifest.dsh = { ...manifest.dsh, profile: { ...manifest.dsh?.profile, bundles: [...bundles, name] } }
+    }
+    writeFileSync(path, JSON.stringify(manifest, undefined, 2) + '\n')
+    return { exitCode: 0, output: 'added', truncated: false, logPath: '/dev/null' }
+  }
+
+  // 候选已在源环境 dependencies 里（**gatedInstall 的正常顺序**：先 installBundle 落进源环境，
+  // 试装快照再从源环境物化，于是候选在物化那刻已在测试环境 deps 里）。
+  // 引擎必须先摘掉它，否则官方 reconcile 跳过既有依赖 → 进不了层栈 → 整条安装被误拦。
+  // 候选目录必须**真实存在**：认包名要读它的 package.json（读不到就认不出包名，
+  // 引擎会如实跳过卸包——那是诚实的降级，不是我们要测的正常路径）。
+  const fixture = join(HOME, 'fixtures', 'probe-reconcile')
+  mkdirSync(fixture, { recursive: true })
+  writeFileSync(join(fixture, 'package.json'), JSON.stringify({ name: 'probe-reconcile', version: '1.0.0' }) + '\n')
+  const spec = 'link:' + fixture
+  const src = makeEnv('ok-src', { bundles: ['@deepseek-ai/dsh-base'], dependencies: { 'probe-reconcile': spec } })
+  void src
+  const calls = []
+  const trial = await env.runTrialInstall(spec, 'ok-src', {
+    installAnchor: '/anchor/package.json', depth: 'shallow', runCommand: reconcileRunner(calls), verify: mounted,
+  })
+  assert.deepEqual(calls, [['remove', 'probe-reconcile'], ['add', spec]],
+    '已装候选必须先摘再装（否则它永远进不了层栈）')
+  assert.equal(trial.conclusion, 'passed', '正常顺序下不许误拦：' + trial.output)
+  assert.equal(trial.activation.activated, true, '证据：候选真的进了层栈')
+  assert.equal(trial.activation.removedFirst, true)
+  assert.match(trial.detached, /使候选成为"新装"/)
+
+  // 对照：同样的输入，但引擎**不摘候选**（模拟旧顺序）→ 必然 cannot-trial。
+  // 这一条守的是"顺序"本身：改回去就会红。
+  const keepDirty = async () => ({ exitCode: 0, output: 'ok', truncated: false, logPath: '/dev/null' })
+  const stale = makeEnv('stale-src2', { bundles: ['@deepseek-ai/dsh-base'], dependencies: { 'probe-reconcile': spec } })
+  void stale
+  const blocked = await env.runTrialInstall(spec, 'stale-src2', {
+    installAnchor: '/anchor/package.json', depth: 'shallow', runCommand: keepDirty, verify: mounted,
+  })
+  assert.equal(blocked.conclusion, 'cannot-trial', '候选没进层栈仍然必须是 cannot-trial（兜底守卫保留）')
+  assert.equal(blocked.activation.activated, false)
+})
+
 // ── task-50 试装引擎（第一段：命名 / 指纹 / 三态判定 / 结论映射）──────────────
 // ── task-50 第二段：快照物化 / 删除纪律 / 清理计划 ──────────────────────────
 test('深度以启动为判据：shallow 明确失败→升级 full；两次都不行才 baseline-broken；undetermined 不升级', async () => {
