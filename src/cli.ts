@@ -22,7 +22,7 @@
  * bin 名刻意用 dshpmc（旧包用 dshpm），两个包共存期间不会互相抢 bin。
  */
 
-import { existsSync } from 'node:fs'
+import { existsSync, realpathSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
@@ -765,7 +765,7 @@ async function runAnalyze(options: CliOptions, deps: CliDependencies, out: { std
     for (const blocker of judgement.blockers) out.stdout('  - ' + blocker + nl)
   }
   if (judgement.verdict === 'incomplete') {
-    out.stdout(nl + 'INCOMPLETE: 这次没能完成关键核对——issues=0 **不代表环境健康**。' + nl)
+    out.stdout(nl + 'INCOMPLETE: 这次没能完成关键核对——issues=0 不代表环境健康。' + nl)
     for (const reason of judgement.incomplete) out.stdout('  - ' + reason + nl)
     for (const blocker of judgement.blockers) {
       if (!judgement.incomplete.some(reason => reason.includes(blocker))) out.stdout('  - 未提升为问题的根因：' + blocker + nl)
@@ -939,9 +939,32 @@ async function readVersion(): Promise<string> {
  * 作为 bin 直接运行时的入口。
  *
  * 只有在被当作可执行文件跑时才设退出码（被 import 时 main 是普通函数）。
+ *
+ * ## 判据必须是"这个文件是不是入口"，而不是"argv[1] 长什么样"
+ *
+ * 原先判据是 `argv[1]` 以 `cli.js` 结尾。它有一个**静默失效**形态：npm 把 bin 装成
+ * `node_modules/.bin/dshpmc` 这个**符号链接**（Linux/macOS），Windows 上是同名 shim，
+ * 两种情况下 `argv[1]` 都不以 `cli.js` 结尾 —— 于是 `main()` 从不执行：
+ * **进程静默退出、退出码 0、没有任何输出**（真机实测：0.1.0/0.1.1/0.1.2 都是这样，
+ * 用户敲 `dshpmc` 会以为命令什么都没做）。
+ *
+ * 现在按真实路径比对：把 `argv[1]` 与**本模块自身**都解析成 realpath 再比。
+ * 这样软链、shim、直接 `node dist/cli.js`、以及 tsx 跑 `src/cli.ts` 四种形态都成立，
+ * 而"被 import 时不自动执行"这条约束仍然保住（此时 argv[1] 是别的文件）。
  */
-const invokedPath = process.argv[1]
-if (invokedPath !== undefined && /(?:^|[\\/])cli\.(?:js|ts|mjs)$/.test(invokedPath)) {
-  const code = await main(process.argv.slice(2))
-  process.exitCode = code
+const entryArgv = process.argv[1]
+if (entryArgv !== undefined && entryArgv !== '') {
+  const selfPath = fileURLToPath(import.meta.url)
+  // realpath 失败（路径已不存在等）时退回原路径比较：不因为解析不了就静默不执行。
+  const realOrSelf = (value: string): string => {
+    try {
+      return realpathSync(value)
+    } catch {
+      return value
+    }
+  }
+  if (realOrSelf(entryArgv) === realOrSelf(selfPath)) {
+    const code = await main(process.argv.slice(2))
+    process.exitCode = code
+  }
 }

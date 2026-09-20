@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-manager-companion",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Companion to the official DSH plugin manager: pre-install quality gate, deep environment diagnostics, plugin marketplace, and skills/presets management.",
   "keywords": [
     "deepseek",

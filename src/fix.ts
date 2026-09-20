@@ -222,7 +222,7 @@ async function removeDanglingModuleFallbackLinks(deps: FixDependencies): Promise
     if (result.skipReasons.length > 0) lines.push("", "跳过原因：", ...result.skipReasons.map(r => "  - " + r))
     if (result.failures.length > 0) lines.push("", "失败：", ...result.failures.map(r => "  - " + r))
     if (scan.stale.length > 0) {
-      lines.push("", "完好但过时的 " + String(scan.stale.length) + " 条**没有动**（目标还在，按约定只报不删）")
+      lines.push("", "完好但过时的 " + String(scan.stale.length) + " 条没有动（目标还在，按约定只报不删）")
     }
     void envDir
     return { ok: result.failed === 0, action, status: result.failed === 0 ? "executed" : "failed", output: lines.join(String.fromCharCode(10)) }

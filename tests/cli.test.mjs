@@ -12,7 +12,9 @@
 
 import { describe, it, before, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { spawn } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DEFAULT_PROFILE, USAGE, judgeAnalyze, loadAnalyzer, main, parseArgs } from '../dist/cli.js'
@@ -461,5 +463,50 @@ describe('cli：文案契约（删掉的教学句 / 分工解释不许回来）'
     assert.match(err, /allowBuilds/)
     assert.match(err, /pnpm-workspace\.yaml/)
     assert.doesNotMatch(err, literal('git-hosted plugins build on install'))
+  })
+})
+
+describe('cli · bin 入口判据（task-106）', () => {
+  it('经 .bin 符号链接调用时必须真的执行（修前是静默退出、退出码 0、零输出）', async () => {
+    // 这条钉的是一个**静默失效**：npm 把 bin 装成 node_modules/.bin/dshpmc 这个符号链接，
+    // 旧判据看 argv[1] 是否以 cli.js 结尾 —— 软链形态下不以它结尾，于是 main() 从不执行：
+    // 进程退出码 0、没有任何输出。用户敲 dshpmc 会以为命令什么都没做（0.1.0/0.1.1/0.1.2 实测如此）。
+    //
+    // 判据落在**真实进程**上（子进程 + 软链），而不是断言源码里的正则 ——
+    // 因为失效形态只在被符号链接调用时出现，进程内无法复现。
+    const linkDir = await mkdtemp(join(tmpdir(), 'dshpmc-bin-'))
+    const cliPath = fileURLToPath(new URL('../dist/cli.js', import.meta.url))
+    const link = join(linkDir, 'dshpmc')
+    await symlink(cliPath, link)
+    const run = (args) => new Promise((done) => {
+      const child = spawn(process.execPath, [link, ...args], { stdio: ['ignore', 'pipe', 'pipe'] })
+      let out = ''
+      let err = ''
+      child.stdout.on('data', (chunk) => { out += chunk })
+      child.stderr.on('data', (chunk) => { err += chunk })
+      child.on('close', (code) => { done({ code, out, err }) })
+    })
+    const help = await run(['help'])
+    assert.equal(help.code, 0, 'help 必须退出码 0：' + help.err)
+    assert.ok(help.out.includes('Usage: dshpmc'),
+      '经符号链接调用必须有输出（静默零输出正是这个缺陷的形态）：实际 ' + JSON.stringify(help.out.slice(0, 120)))
+    const version = await run(['version'])
+    assert.match(version.out.trim(), /^\d+\.\d+\.\d+$/, 'version 必须打印版本号：' + JSON.stringify(version.out))
+    await rm(linkDir, { recursive: true, force: true })
+  })
+
+  it('被 import 时不得自动执行 main（bin 入口的另一半约束）', async () => {
+    // 上面那条把该执行时必须执行钉住了；这条钉住反面：库形态 import 不能带副作用。
+    // 判据同样落在真实子进程上：import 之后 stdout 必须干净（自动执行会打印 USAGE）。
+    const cliPath = fileURLToPath(new URL('../dist/cli.js', import.meta.url))
+    const script = 'await import(' + JSON.stringify(cliPath) + ')'
+    const run = await new Promise((done) => {
+      const child = spawn(process.execPath, ['--input-type=module', '-e', script], { stdio: ['ignore', 'pipe', 'pipe'] })
+      let out = ''
+      child.stdout.on('data', (chunk) => { out += chunk })
+      child.on('close', (code) => { done({ code, out }) })
+    })
+    assert.equal(run.code, 0)
+    assert.equal(run.out, '', '被 import 时不许有任何输出（自动执行会打印 USAGE）：' + JSON.stringify(run.out.slice(0, 120)))
   })
 })

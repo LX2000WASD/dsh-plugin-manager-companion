@@ -9,7 +9,7 @@
 import { describe, it, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
-import { readFileSync } from 'node:fs'
+import { readFileSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import {
@@ -31,6 +31,8 @@ let crossPlainLine
 let crossSecondLine
 let bootBlocking
 let noiseDir
+/** 兜底目录三类文案的 fixture（task-105：让 module-fallback 文案真的进入护栏的检查集合）。 */
+let fallbackDir
 
 /** reverse profile 的 patch 里某片段的行号（1 起）。 */
 function reversePatchLine(needle) {
@@ -180,6 +182,34 @@ before(async () => {
     '      disabled: true',
     '',
   ].join('\n'))
+
+  // ── 兜底目录 fixture（task-105）────────────────────────────────────────────
+  //
+  // 为什么要造它：task-55 的文案护栏是"遍历 report.issues 逐条断言"，而它原先跑在 brokenDir 上——
+  // 那份 fixture **不产出任何 module-fallback 发现**，于是本轮新增的三条文案
+  // （断链 / 过时 / 私有层断链）从未进入被检查集合，字面星号因此漏网并随 0.1.2 发到 npm。
+  // 这里把三类场景都造出来，让护栏真的覆盖它们（对应三个 issue code）——
+  //   · module-fallback-dangling-link          —— 共享层断链（自动删那类）
+  //   · module-fallback-stale-link             —— 共享层"目标在但不在闭包里"（只报不删那类）
+  //   · profile-module-fallback-dangling-link  —— 私有层断链（官方漏清那类）
+  fallbackDir = join(profiles, 'fallback')
+  await writeJson(join(fallbackDir, 'package.json'), {
+    name: 'dsh-profile-fallback', private: true, dependencies: {}, dsh: { profile: { bundles: [] } },
+  })
+  await writeText(join(fallbackDir, 'cordis.patch.yml'), '- insert:\n')
+  // 共享层（profiles/node_modules）就是上面写好的那个（cordis 在里面）。
+  // ① 断链：指向一个不存在的目标。
+  symlinkSync(join(profiles, 'node_modules', 'no-such-target-dangling'),
+    join(profiles, 'node_modules', 'dangling-pkg'))
+  // ② 过时：目标存在（真目录），但包名不在当前安装闭包里 -> 进 stale。
+  await writeJson(join(profiles, 'node_modules', 'stale-pkg', 'package.json'),
+    { name: 'stale-pkg', version: '1.0.0' })
+  symlinkSync(join(profiles, 'node_modules', 'stale-pkg'),
+    join(profiles, 'node_modules', 'stale-link'))
+  // ③ 私有层断链（<profile>/.dsh-module-fallback/node_modules）。
+  const privateFallback = join(fallbackDir, '.dsh-module-fallback', 'node_modules')
+  await mkdir(privateFallback, { recursive: true })
+  symlinkSync(join(fallbackDir, 'node_modules', 'react'), join(privateFallback, 'react'))
 
   // 安装锚点：官方包与 bundle 本体由**安装侧**提供，profile 的 node_modules 里没有它们。
   // 只有把它纳入解析根，这些行才不会被判成孤儿（实测干净环境 163 条 orphan-row 全是这么来的）。
@@ -994,6 +1024,36 @@ describe('diagnostics · 文案不留未渲染的 Markdown（task-55）', () => 
     for (const item of report.skipped) {
       assert.ok(!item.reason.includes('**'), item.check + ' 的 reason 里有未渲染的 Markdown 加粗：' + item.reason)
     }
+  })
+
+  it('护栏覆盖：兜底目录三类文案都真的进入了检查集合（task-105）', async () => {
+    // 这条是 0.1.2 漏网的直接补救：原护栏只在 brokenDir 上跑，那份 fixture 不产出任何
+    // module-fallback 发现，于是三条新文案从未被检查（字面星号因此发到 npm）。
+    // 判据分两步：① 三类 issue 真的产出；② 它们的文案里不含未渲染的星号。
+    const config = { ...CONFIG, diagnostics: { ...CONFIG.diagnostics, ecosystem: true } }
+    const env = { name: 'fallback', dir: fallbackDir, current: false, builtin: false, bundles: [], dependencies: [], runs: [], installAnchor }
+    const report = await analyzeEnvironment(makeCtx({ profileContext: {} }), env, config)
+    const codes = report.issues.map(i => i.code)
+    for (const code of ['module-fallback-dangling-link', 'module-fallback-stale-link', 'profile-module-fallback-dangling-link']) {
+      assert.ok(codes.includes(code),
+        'fixture 必须产出 ' + code + '（否则下面的文案断言空转）：实际 ' + JSON.stringify(codes))
+    }
+    // 逐条断言这三类的文案（与上面那条同型，但作用在真的产出了它们的 fixture 上）。
+    for (const issue of report.issues) {
+      for (const [field, value] of Object.entries({ title: issue.title, detail: issue.detail })) {
+        assert.ok(!value.includes('**'),
+          issue.code + ' 的 ' + field + ' 里有未渲染的 Markdown 加粗：' + value)
+      }
+    }
+  })
+
+  it('变异验证：兜底目录文案里加回星号 → 上面那条必须报红（证明覆盖真的到位）', () => {
+    // 与既有那条同型的本地变异：证明这一条断言能抓住星号，而不是又一轮空转。
+    const mutated = { code: 'profile-module-fallback-dangling-link', detail: '官方**有**清理机制' }
+    assert.throws(() => {
+      assert.ok(!mutated.detail.includes('**'),
+        mutated.code + ' 的 detail 里有未渲染的 Markdown 加粗：' + mutated.detail)
+    }, '把星号加回去后必须报红')
   })
 
   it('变异验证：把星号加回去 → 上面那条断言必须报红', () => {

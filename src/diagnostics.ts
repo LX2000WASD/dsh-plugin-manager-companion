@@ -842,9 +842,9 @@ function moduleFallbackIssues(facts: ModuleFallbackFacts): DiagnosticIssue[] {
       code: 'profile-module-fallback-dangling-link',
       title: '这个环境的私有兜底层里有 ' + String(facts.profileScan.dangling.length) + ' 条断开的链接',
       detail: '它们指向的包已经不存在了（多半是卸载插件后留下的）。'
-        + '私有兜底层由官方维护，官方**有**清理机制，所以出现断链是官方没清掉——'
+        + '私有兜底层由官方维护，官方本来就有清理机制，所以出现断链是官方没清掉——'
         + '这不影响当前运行（解析不读断掉的链接），但它是磁盘上的残留，值得知道。'
-        + '本项目**不自动删**它：这个目录归官方管，我们只如实报出来。',
+        + '本项目不自动删它：这个目录归官方管，我们只如实报出来。',
       subjects: preview.map(link => link.name),
       scope: 'profile/.dsh-module-fallback',
       evidence: preview.map(link => ({
@@ -865,7 +865,7 @@ function moduleFallbackIssues(facts: ModuleFallbackFacts): DiagnosticIssue[] {
       title: '依赖兜底目录里有 ' + String(scan.stale.length) + ' 条链接不在当前安装的依赖闭包里',
       detail: '这些链接的目标还在磁盘上，但它们不在当前 dsh 安装的依赖闭包里——'
         + '多半是别的版本留下的。当前版本不从这个目录解析，所以它们不影响运行；'
-        + '我们**不自动删**（目标还在，可能是有意保留的），只报出来供你判断。'
+        + '我们不自动删（目标还在，可能是有意保留的），只报出来供你判断。'
         + '不想要这类提示可以在设置里关掉。'
         + (scan.stale.length > PREVIEW ? '（下面只列前 ' + String(PREVIEW) + ' 条，共 ' + String(scan.stale.length) + ' 条。）' : ''),
       subjects: preview.map(link => link.name),
