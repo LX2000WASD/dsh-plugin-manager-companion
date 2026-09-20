@@ -17,7 +17,7 @@
  *
  * 断言（共 16 条，自动判定，任一失败即退出码 1）：
  *   1  app-shell               应用能打开（非错误页）
- *   2  settings-sections       设置面板八个分区名齐全且顺序正确（含本插件三个）
+ *   2  settings-sections       设置面板九个分区名齐全且顺序正确（含本插件四个）
  *   3  page-插件市场/环境控制台/技能与预设   三个一级页面内容区非空
  *   4  console-report          环境控制台落地即渲染体检报告（空白页 P0 的回归闸）
  *   5  console-体检/环境/设置    三个子页非空（阈值更严）
@@ -287,8 +287,14 @@ async function shot(tab, name, note) {
 
 // ── 主流程 ─────────────────────────────────────────────────────────────────
 
-/** 期望的设置分区顺序（官方五 + 本插件三）。 */
-const EXPECTED_SECTIONS = ['通用设置', '模型', '内置插件', '插件市场', '环境控制台', 'Agent 预设', '技能与预设', '已归档会话']
+/**
+ * 期望的设置分区顺序（官方五 + 本插件四）。
+ *
+ * 本插件四个：插件市场（order 16）、环境控制台（17）、技能与预设（22）、关于（100）。
+ * 关于页是后加的（task-95），本清单必须跟着长——写死"八个"会在加分区时**静默过时**
+ * （2026-09-20 实测：本脚本 15/16，唯一失败就是这一条，而它不是本轮改动引起的）。
+ */
+const EXPECTED_SECTIONS = ['通用设置', '模型', '内置插件', '插件市场', '环境控制台', 'Agent 预设', '技能与预设', '已归档会话', '关于']
 
 /** 跑完整个 e2e。 */
 async function run() {
@@ -343,7 +349,7 @@ async function run() {
     await shot(tab, '00-app', '首屏')
     if (!shellUp) throw new EnvironmentError('应用外壳没渲染出来，后续断言无意义')
 
-    // 断言 2：设置面板八个分区名与顺序
+    // 断言 2：设置面板九个分区名与顺序
     const opened = await clickLeaf(tab, '设置', 'body')
     const dialogUp = opened === 'CLICKED' && await waitFor(tab, '!!document.querySelector("[role=dialog]")')
     const nav = JSON.parse(await evaluate(tab, '(function(){var dlg=document.querySelector("[role=dialog]");if(!dlg)return "[]";'
@@ -351,7 +357,7 @@ async function run() {
       + 'return JSON.stringify(rows.map(function(b){return (b.innerText||"").trim()}))})()').catch(() => '[]'))
     const expected = EXPECTED_SECTIONS.join('|')
     const actual = nav.join('|')
-    check('settings-sections', '设置面板八个分区齐全且顺序正确',
+    check('settings-sections', '设置面板九个分区齐全且顺序正确',
       dialogUp && actual === expected,
       actual === expected ? actual : ('期望 [' + expected + '] 实际 [' + actual + ']'))
     await shot(tab, '10-settings', '设置面板：' + actual)
