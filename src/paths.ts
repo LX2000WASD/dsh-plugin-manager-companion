@@ -18,6 +18,15 @@ import type { ManifestField } from './types.ts'
 /** 本包名（用于行 id、缓存目录、自识别）。 */
 export const OUR_PACKAGE_NAME = 'dsh-plugin-manager-companion'
 
+/**
+ * 官方 DSH 运行时包名（用于按 `name` 字段认包，**不看路径**）。
+ *
+ * 为什么要有这个常量：包的身份写在 package.json 的 `name` 里。monorepo（`apps/cli/`）、
+ * workspace 链接、pnpm 虚拟 store 下的真实路径各不相同，用路径字符串认包会误判
+ * （0.1.1 修复的真机缺陷：官方 monorepo 下 DSH 版本显示未知）。
+ */
+export const DSH_PACKAGE_NAME = '@deepseek-ai/dsh'
+
 /** 本插件的 Loader 行 id。**绝不用 'plugin-manager'**——官方 base bundle 已占用该 id。 */
 export const OUR_ROW_ID = 'dsh-plugin-manager-companion'
 

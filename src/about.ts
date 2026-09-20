@@ -21,7 +21,8 @@
 
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import { dirname, join } from 'node:path'
-import { OUR_PACKAGE_NAME, dshHome } from './paths.ts'
+import { fileURLToPath } from 'node:url'
+import { DSH_PACKAGE_NAME, OUR_PACKAGE_NAME, dshHome } from './paths.ts'
 import { registryCachePath } from './registry.ts'
 
 /**
@@ -110,20 +111,48 @@ function locateInstallAnchor(injected: string | undefined): string | undefined {
 /**
  * 从锚点文件推出官方 dsh 的 package.json 路径。
  *
- * 锚点**就是**那个 package.json（官方 `installAnchor` 的语义），所以这里只做一次校验：
- * 路径以 `@deepseek-ai/dsh/package.json` 结尾就认；否则如实报"锚点看起来不是官方包的 package.json"，
- * 而不是硬读一个可能不存在的文件。
+ * **判据是文件里的 `name` 字段，不是路径字符串**（真机缺陷修复，0.1.1）。
+ *
+ * 为什么改：原实现看路径后缀是否等于 `@deepseek-ai/dsh/package.json`。在官方 monorepo 里
+ * 那份文件的实际路径是 `apps/cli/package.json`——**内容完全正确**（`name` 就是 `@deepseek-ai/dsh`、
+ * version 也对），却因为路径不匹配被判成"不像官方包"，DSH 版本显示未知。
+ * 而它的退路 `apps/cli/node_modules/@deepseek-ai/dsh/package.json` 在 monorepo 里根本不存在。
+ *
+ * 用路径认包 = 用代理代替事实（DESIGN §12.10）。包的身份写在 `name` 里，就该读 `name`。
+ *
+ * 顺序：
+ *   1. 锚点自身是 package.json 且 `name === '@deepseek-ai/dsh'` → 认；
+ *   2. 否则按安装根拼一个候选（锚点可能是安装目录），候选同样要 `name` 对得上；
+ *   3. 都不成立 → undefined（如实报"锚点不是官方包"，不硬读一个可能不存在的文件）。
  *
  * @param anchor - 锚点路径。
  * @returns 官方 dsh 的 package.json 路径；不像时 undefined。
  */
 function dshManifestFrom(anchor: string): string | undefined {
-  const normalized = anchor.replace(/\\/g, '/')
-  if (normalized.endsWith('@deepseek-ai/dsh/package.json')) return anchor
-  // 锚点也可能是安装根（含 node_modules 的目录）：那种情况下拼一个候选出来，
-  // 但**只在它真的存在时**才用——不存在就走 unknown。
+  if (isDshManifest(anchor)) return anchor
+  // 锚点也可能是安装根（含 node_modules 的目录）：拼一个候选，仍以 name 为准。
   const candidate = join(dirname(anchor), 'node_modules', '@deepseek-ai', 'dsh', 'package.json')
-  return existsSync(candidate) ? candidate : undefined
+  return isDshManifest(candidate) ? candidate : undefined
+}
+
+/**
+ * 一个路径是不是官方 dsh 的 package.json。
+ *
+ * 判据只有一条：文件里的 `name` 字段等于官方包名（读不到或不是 JSON 时为 false）。
+ * **不看路径**：monorepo、workspace 链接、pnpm 虚拟 store 下的真实路径各不相同，
+ * 路径字符串不是包的身份。
+ *
+ * @param path - 候选路径。
+ * @returns 是官方 dsh 的 manifest 时 true。
+ */
+function isDshManifest(path: string): boolean {
+  if (!existsSync(path)) return false
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8')) as { name?: unknown }
+    return parsed.name === DSH_PACKAGE_NAME
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -140,7 +169,9 @@ function dshManifestFrom(anchor: string): string | undefined {
  */
 function readOwnVersion(): AboutFact<string> {
   try {
-    const here = dirname(new URL(import.meta.url).pathname)
+    // 必须走 fileURLToPath：`new URL(...).pathname` 在 Windows 上返回 `/D:/…`（前导斜杠），
+    // join 之后变成 `\\D:\…`，包根再也找不到，版本显示未知（真机缺陷，0.1.1）。
+    const here = dirname(fileURLToPath(import.meta.url))
     const candidate = join(here, '..', 'package.json')
     return readJsonField(candidate, 'version', '本插件版本')
   } catch (error) {
