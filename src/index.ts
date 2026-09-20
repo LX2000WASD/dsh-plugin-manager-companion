@@ -439,12 +439,27 @@ async function runTrialStep(
  * @param head - 这段结论自己要说清的话（面向用户）。
  * @returns 面向用户的结论叙述。
  */
+/**
+ * 快照深度 → 用户能读的标签（§12.9 R3：shallow / full 是内部代号）。
+ *
+ * 抽成模块级函数的原因（task-89 实测）：**两处都在拼这句**，一处改了一处没改——
+ * 安装叙述那处漏了映射，于是 `实际深度 full` 直接上了屏（trial-gate 的用例抓到的）。
+ * 两个调用点共用一份映射，才不会再次漂移。
+ *
+ * @param depth - 引擎给的深度值。
+ * @returns 面向用户的标签；读不懂的值原样返回（不编一个说法）。
+ */
+function trialDepthLabel(depth: string | undefined): string {
+  if (depth === "shallow") return "轻量副本"
+  if (depth === "full") return "完整副本"
+  return depth ?? "未建立副本"
+}
 function trialNarrative(result: TrialInstallResult, head: readonly string[]): string {
   const chain = result.baseline !== null && result.baseline.kind === "failed" ? result.baseline.chain : []
   // R2：原来写成「实际深度：shallow（由 shallow 升级：原因）」——冒号套冒号。
   // 改成分行：第一行给深度，升级原因另起一行缩进。
   // R3：'shallow' 是内部代号（引擎的 depth 值），换成用户语言。
-  const depthLabel = result.depth === "shallow" ? "轻量副本" : result.depth === "full" ? "完整副本" : String(result.depth)
+  const depthLabel = trialDepthLabel(result.depth)
   const depthLine = "实际深度：" + depthLabel
     + (result.escalated ? "\n  由轻量副本升级为完整副本，原因：" + String(result.escalationReason) : "")
     + "｜验证耗时 " + String(result.elapsedMs) + "ms"
@@ -745,7 +760,8 @@ export async function gatedInstall(
   const warned = gate.issues.length === 0 ? "" : `（质量门有 ${gate.issues.length} 条提示，按 warn 模式放行）`
   const trialLine = trial === undefined ? "" : trial.policy === "warned"
     ? `（${TRIAL_LABEL[trial.conclusion]}，按 warn 模式照常安装 —— 它在验证启动里没通过，环境起不来时先移除它）`
-    : `（${TRIAL_LABEL[trial.conclusion]}；实际深度 ${trial.depth ?? "未建立副本"}，耗时 ${trial.elapsedMs}ms）`
+    // R3：这里的深度同样要走映射（原来直接插 trial.depth，于是 "实际深度 full" 上了屏）。
+    : `（${TRIAL_LABEL[trial.conclusion]}；实际深度 ${trialDepthLabel(trial.depth)}，耗时 ${trial.elapsedMs}ms）`
   return {
     ok: true, output: `已安装并启用 ${packageName}${warned}${trialLine}`,
     packageName, gateIssues: gate.issues,

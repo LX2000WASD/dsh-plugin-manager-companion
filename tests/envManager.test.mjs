@@ -525,7 +525,7 @@ test('createEnvironment 用官方模板；renameEnvironment 的拒绝面', async
   // task-71：成功回执留；「目录：…」与卡片已渲染的 dir 重复 → 删；层栈名字卡片只有计数 → 必须留。
   assert.match(created.output, /已创建环境 fresh/)
   assert.doesNotMatch(created.output, /目录：/)
-  assert.match(created.output, /bundle 层栈：/)
+  assert.match(created.output, /组合层：/, '组合层名字必须留（卡片只显示计数）')
   assert.match(created.output, /@deepseek-ai\/dsh-web-app/)
 
   // 省略模板 = 官方 web 模板（能起得来），不是官方 base-only 默认
@@ -1025,14 +1025,14 @@ test('深度以启动为判据：shallow 明确失败→升级 full；两次都�
   assert.equal(esc.depth, 'full', '升级后实际用的是 full')
   assert.equal(esc.escalated, true)
   assert.match(String(esc.escalationReason), /Cannot find package @fake\/missing/, '要带浅快照为什么不给力')
-  assert.match(esc.output, /由 shallow 升级/)
+  assert.match(esc.output, /从轻量副本升级/)
 
   // ② 两次都失败 → baseline-broken，且文案写明两种快照都试过
   const alwaysFails = async () => ({ verdict: failed, elapsedMs: 1, stderr: '', exitCode: 1, build })
   const both = await env.runTrialInstall('@fake/pkg', 'esc-src', { ...base, verify: alwaysFails })
   assert.equal(both.conclusion, 'baseline-broken')
   assert.equal(both.escalated, true)
-  assert.match(both.output, /浅快照与完整快照都试过/)
+  assert.match(both.output, /轻量副本与完整副本都试过/)
   assert.match(both.output, /不是 @fake\/pkg 的问题/)
 
   // ③ undetermined 不升级：判不出来就是无法试装，不许悄悄换成 full
@@ -1074,7 +1074,7 @@ test('四步编排：基线坏不赖候选包 / 候选坏给根因 / 无法试�
   const secondCallFails = async () => (++calls === 1 ? mounted() : failed())
   const candidate = await env.runTrialInstall('@fake/pkg', 'trial-src', { ...base, verify: secondCallFails })
   assert.equal(candidate.conclusion, 'candidate-broken')
-  assert.match(candidate.output, /候选包导致挂载失败/)
+  assert.match(candidate.output, /候选包导致启动失败/)
   assert.match(candidate.output, /Error: boom/)
 
   // ③ 无法试装：禁用联网 + 冷包 → 明确失败，且不算通过
@@ -1374,7 +1374,7 @@ test('浅快照真的浅：清掉上一次物化留下的 node_modules 与陈旧
   assert.equal(existsSync(join(targetDir, 'pnpm-workspace.yaml')), true, '骨架文件必须留着')
   assert.equal(existsSync(join(targetDir, 'cordis.patch.yml')), true, '骨架文件必须留着')
   assert.match(snapshot.output, /清掉了上一次物化留下的/)
-  assert.match(snapshot.output, /浅快照不含依赖/)
+  assert.match(snapshot.output, /轻量副本不含依赖/)
   // 骨架与源环境有的清单仍要在（测试环境要能起来）
   assert.equal(existsSync(join(targetDir, 'package.json')), true)
   assert.equal(readFileSync(join(targetDir, 'cordis.yml'), 'utf8'), '# root\n')
@@ -1460,7 +1460,7 @@ test('试装文案：不带字面星号、不写空承诺、判不出来不说�
     // 空承诺：我们从不发这条诊断，写出来就是骗人。
     assert.doesNotMatch(result.output, /应当升级成一条诊断/, label + '：不许写"应当升级成一条诊断"这类空承诺')
   }
-  assert.match(broken.output, /快照基线本身就起不来/)
+  assert.match(broken.output, /环境副本的基线本身就起不来/)
   assert.match(broken.output, /根因：/)
   // 判不出来是"不知道"，不是"基线坏了"——两句话不许混。
   assert.match(unclear.output, /这次验证没有给出判定/)

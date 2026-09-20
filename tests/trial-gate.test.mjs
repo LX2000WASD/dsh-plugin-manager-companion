@@ -257,7 +257,8 @@ test('试装通过：照常安装，结果里带结论与深度', async () => {
   assert.equal(result.trial.depth, 'full')
   assert.equal(result.trial.escalated, true)
   assert.match(result.output, /试装通过/)
-  assert.match(result.output, /实际深度 full/)
+  assert.match(result.output, /实际深度 完整副本/,
+    '上屏用用户语言（§12.9 R3：full 是内部代号）；result.depth 字段仍是 full')
   assert.equal(calls[0].realName, 'pass-env', '快照源必须是包真正落地的那个环境')
   assert.equal(calls[0].options.depth, 'auto')
   assert.equal(calls[0].options.baseline, true)

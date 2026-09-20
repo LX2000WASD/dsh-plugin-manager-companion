@@ -55,7 +55,7 @@ const HOST_SOURCES = ['src/envManager.ts', 'src/index.ts', 'src/upgrade.ts']
  * 为什么不是整个 HOST_SOURCES：§12.9 的落地要求是"覆盖范围如实登记"——
  * 未纳入的部分要**点名**，不能默认它干净。
  */
-const R_COVERED_HOST_SOURCES = ['src/index.ts', 'src/upgrade.ts']
+const R_COVERED_HOST_SOURCES = ['src/index.ts', 'src/upgrade.ts', 'src/envManager.ts']
 
 /**
  * §12.9 **未纳入**的 host 源文件（每条必须写明原因与当时的命中数）。
@@ -83,15 +83,10 @@ const R_COVERED_HOST_SOURCES = ['src/index.ts', 'src/upgrade.ts']
  *   · 数源码行会把一条文案拆成多行（`'甲' +` 换行 `'乙'`）；
  *   · 只数"含代号"会漏掉 R2 那一类（它们不含任何代号，但同样是用户可见的坏行）。
  */
-const R_UNCOVERED_HOST_SOURCES = [
-  {
-    file: 'src/envManager.ts',
-    hits: 28,
-    why: '本轮该文件由另一个在跑的写任务持有（task-80 正在改试装那一段），同时改同一批行必然冲突；'
-      + '它的命中集中在试装/副本那一组文案上，与该任务的改动面重叠。已请 Lead 裁决：'
-      + 'Lead 已开 task-89，阻塞在 task-80 之后（不塞给 task-80，避免污染那条阻断级修复的验证边界）。',
-  },
-]
+// task-89（2026-09-20）已把 src/envManager.ts 清干净并挪进 R_COVERED_HOST_SOURCES，
+// 所以这张表**现在是空的**。结构保留（不是删掉）：下一个"暂时不能纳入"的文件照这个形状登记，
+// 那条"命中数一变就红"的自报警断言也照旧生效（见下面 R1–R7 的覆盖面用例）。
+const R_UNCOVERED_HOST_SOURCES = []
 
 /**
  * 以模拟模块表启动产物，取它注册的字典。
@@ -487,7 +482,14 @@ function breaksLine(between) {
   for (let i = 0; i < between.length; i += 1) {
     const ch = between[i]
     if (ch === '(' || ch === '[' || ch === '{') { depth += 1; continue }
-    if (ch === ')' || ch === ']') { depth -= 1; continue }
+    // `Math.max(0, …)` 不能省（task-89 实测的缺陷）：区间是两个字面量**之间**的片段，
+    // 开括号常常落在前一个字面量**之前**，于是这里先遇到一个"无配对"的 `)`，depth 变成 -1；
+    // 而下面所有断开判据都带 `depth !== 0 → continue`，于是**整个区间一条都判不出来**，
+    // 两条独立的 `lines.push('甲')` / `lines.push('乙')` 被错接成一行 → **假阳性**。
+    // 实例：`lines.push('日志：' + p)` 与下一行 `lines.push('命令：' + c)` 被拼成一句，
+    // 护栏报"同一行两个冒号"（R2），而真实渲染是两行——报的是一处**不存在的违规**。
+    // 夹到 0 之后，判据只会**更多**地识别出断开，方向是单调的（只会减少假拼接）。
+    if (ch === ')' || ch === ']') { depth = Math.max(0, depth - 1); continue }
     if (depth !== 0) continue
     // 顶层逗号 = 数组元素/参数分隔 → 两行；顶层 ? : = 互斥分支 → 只会渲染其中一个。
     if (ch === ',') return true
@@ -1426,16 +1428,25 @@ describe('UI 文案标准（DESIGN §12）', () => {
   })
 
   it('R1–R7：覆盖面如实登记（未纳入的文件必须点名，不许把"已纳入"读成"全仓覆盖"）', () => {
-    // §12.9 的落地要求：覆盖范围如实登记。`src/envManager.ts` 也在 §12.9 点名的三个 host 文件里，
-    // 但**本轮没纳入**——它当时由另一个在跑的写任务持有（task-80 正在改试装那一段），
-    // 同时改同一批行必然冲突。所以这里把"没纳入"写成一条**可断言的登记**：
-    //   · 已纳入的文件里必须零命中（上面那条）；
-    //   · 未纳入的文件必须出现在这张表里，且必须写明原因与它当时还有多少处。
-    // 这样"漏了一整个文件"不会静默通过：要么补上，要么改这张表并写下理由。
-    assert.deepEqual(R_COVERED_HOST_SOURCES, ['src/index.ts', 'src/upgrade.ts'],
+    // §12.9 的落地要求：覆盖范围如实登记。
+    //
+    // 历史（task-88 → task-89）：`src/envManager.ts` 也是 §12.9 点名的三个 host 文件之一，
+    // task-88 那一轮**没纳入**（它当时由另一个在跑的写任务持有）。当时把"没纳入"写成一条
+    // **可断言的登记**——命中数一变就红，逼后来人处理。task-89 把它清干净并挪进来了，
+    // 那条登记也随之清空（这张表保留结构，供下一个"暂时不能纳入"的文件用）。
+    //
+    // 三条断言各自的用途：
+    //   · 已纳入的文件里必须零命中（上面那条用例）；
+    //   · 已纳入清单必须逐字写死（**防"悄悄多纳一个"或"悄悄少纳一个"**）；
+    //   · 未纳入的必须写明原因与命中数，且那个数**必须仍然对得上**。
+    assert.deepEqual(R_COVERED_HOST_SOURCES, ['src/index.ts', 'src/upgrade.ts', 'src/envManager.ts'],
       '已纳入的 host 文件清单变了；变了就要同时更新 R_UNCOVERED_HOST_SOURCES 的说明')
+    // §12.9 点名的三个 host 文件必须**全部**已纳入（task-89 之后这就是事实）。
+    // 这条把"还剩谁没纳入"从注释变成断言：新增 host 文件却忘了登记时，这里会红。
+    assert.deepEqual([...R_COVERED_HOST_SOURCES].sort(), ['src/envManager.ts', 'src/index.ts', 'src/upgrade.ts'],
+      '§12.9 点名的三个 host 文件必须都在已纳入清单里')
     const notCovered = R_UNCOVERED_HOST_SOURCES.map(item => item.file)
-    assert.deepEqual(notCovered, ['src/envManager.ts'], '未纳入清单必须点名 envManager.ts（§12.9 的三个 host 文件之一）')
+    assert.deepEqual(notCovered, [], 'task-89 之后未纳入清单应为空（新文件要挂进来时改这条）')
     for (const item of R_UNCOVERED_HOST_SOURCES) {
       assert.ok(item.why.trim().length > 0, item.file + ' 没写"为什么没纳入"')
       assert.ok(Number.isInteger(item.hits) && item.hits > 0,

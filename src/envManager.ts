@@ -886,7 +886,7 @@ export async function createEnvironment(name: string, template?: string): Promis
     }
     // 目录不写：环境卡片每一行都渲染 dir（ConsolePage 的环境行），这里是①（重复屏幕已有信息）。
     // 层栈名字必须留：卡片只显示「N 个组合包」计数，名字在别处看不见。
-    return success('已创建环境 ' + name + '\nbundle 层栈：\n  ' + bundles.join('\n  '))
+    return success('已创建环境 ' + name + '\n组合层：\n  ' + bundles.join('\n  '))
   })
 }
 
@@ -1148,8 +1148,8 @@ export async function startEnvironment(
  */
 function noWebLayerMessage(name: string, layers: readonly string[]): string {
   const suggestion = officialWebAppBundles()
-  return name + ' 的 bundle 层栈里没有任何能提供 web 服务的层，启动它不会得到可访问的网页。\n'
-    + '当前层栈：' + (layers.length === 0 ? '（空）' : layers.join(', ')) + '\n'
+  return name + ' 的组合层里没有任何能提供 web 服务的层，启动它不会得到可访问的网页。\n'
+    + '当前组合层：' + (layers.length === 0 ? '（空）' : layers.join(', ')) + '\n'
     + '请二选一：\n'
     + '  1. 在官方插件页给它启用 web 层（'
     + (suggestion.length === 0 ? '官方 web 模板里的 app 层' : suggestion.join(', ')) + '）；\n'
@@ -1546,7 +1546,11 @@ async function spawnBackground(spec: LaunchSpec, note?: string): Promise<LaunchO
     failure = messageOf(error)
   }
   if (failure !== null) {
-    return { ok: false, mode: 'background', logPath, detail: '无法启动：' + failure + '（命令：' + spec.display + '）' }
+    return {
+      ok: false, mode: 'background', logPath,
+      // R2（§12.9）：原因与命令各占一行，不把命令塞进括号里当从句（那会变成同一行两个冒号）。
+      detail: '无法启动：' + failure + '\n命令：' + spec.display,
+    }
   }
   return {
     ok: true, mode: 'background', logPath,
@@ -2086,7 +2090,8 @@ export async function copyPlugins(
       const source = typeof raw === 'string' && raw.length > 0 ? raw : name
       const resolved = resolveInstallSpec(source, fromDir)
       if (resolved === null) {
-        outputs.push('# ' + name + ' -> ' + to + '：跳过（本地来源已不存在：' + source + '）')
+        // R2（§12.9）：一行只说一件事——结论一行，原因另起一行缩进。
+        outputs.push('# ' + name + ' -> ' + to + '：跳过\n  本地来源已不存在：' + source)
         ok = false
         continue
       }
@@ -2307,7 +2312,7 @@ export function judgeBootStderr(stderr: string): BootVerdict {
       // `throw new Error(\`${binName}: …`)` 当成了第一行原因，用户读到的是一行源码）。
       .filter((line) => !isChainNoise(line))
       .slice(0, 8)
-    const reason = chain[0] ?? lines[0] ?? '未知挂载失败'
+    const reason = chain[0] ?? lines[0] ?? '未知启动失败'
     return { kind: 'failed', reason, chain }
   }
   // 层解析不到：明确的失败（不是「判不出来」）。升级 full 的判据靠它。
@@ -2568,8 +2573,8 @@ export async function materializeSnapshot(
   if (depth === 'shallow') {
     return {
       depth, copied, cleared, installed: false,
-      output: '已物化浅快照（复制 ' + (copied.length === 0 ? '无' : copied.join(', ')) + clearedNote
-        + '）：浅快照不含依赖，层栈全部由安装锚点提供',
+      output: '已建立轻量环境副本（复制 ' + (copied.length === 0 ? '无' : copied.join(', ')) + clearedNote
+        + '）：轻量副本不含依赖，组合层全部由 dsh 安装位置提供',
     }
   }
   let runner: PluginCommandRunner
@@ -2586,11 +2591,11 @@ export async function materializeSnapshot(
   const result = await runPackageOperation(runner, context, ['install', '--prefer-offline'], options)
   if (result.exitCode !== 0) {
     throw new EnvironmentError('package-operation-failed',
-      '真实快照的官方安装失败（exitCode=' + String(result.exitCode) + '）：' + result.output.trim().slice(-500))
+      '完整环境副本的官方安装失败（exitCode=' + String(result.exitCode) + '）：' + result.output.trim().slice(-500))
   }
   return {
     depth, copied, cleared, installed: true,
-    output: '已物化真实快照（复制 ' + (copied.length === 0 ? '无' : copied.join(', ')) + clearedNote
+    output: '已建立完整环境副本（复制 ' + (copied.length === 0 ? '无' : copied.join(', ')) + clearedNote
       + '；官方 install --prefer-offline 成功）',
   }
 }
@@ -2622,13 +2627,13 @@ export async function createTrialEnvironment(
   const exists = existsSync(join(environmentDir(target), 'package.json'))
   const created = exists ? success('测试环境已存在：' + target) : await createEnvironment(target, 'headless')
   if (!created.ok) return created
-  if (options.materialize === false) return success(created.output + '\n（未物化快照）')
+  if (options.materialize === false) return success(created.output + '\n（未建立环境副本）')
   try {
     const snapshot = await materializeSnapshot(realName, target, options.snapshot ?? {})
     return success(created.output + '\n' + snapshot.output)
   } catch (error) {
     return failure(error instanceof EnvironmentError ? error.code : 'io-failed',
-      '测试环境已建立但物化快照失败：' + messageOf(error))
+      '测试环境已建立，但建立环境副本失败：' + messageOf(error))
   }
 }
 /** removeTrialEnvironment 的选项。 */
@@ -3308,7 +3313,7 @@ function trialActivation(
   return {
     ok: false,
     detail: '这次试装没有验证到新版本：候选包装上了，但环境的启动列表里没有它，'
-      + '所以启动验证根本没有加载它。'
+      + '所以启动验证根本没有加载它。\n'
       + (stale
         ? '原因：它本来就已经装在这个环境里，重复安装不会让它被重新加载'
           + (detached.removed ? '（本次已先把它移除，但仍没被重新加载。）' : '')
@@ -3379,7 +3384,7 @@ export async function runTrialInstall(
       depth = 'full'
       materialized = await materialize(depth)
       if (!materialized.ok) {
-        return done('cannot-trial', '无法试装：浅快照基线失败后升级为完整快照，但重新物化失败（'
+        return done('cannot-trial', '无法试装：轻量副本基线失败后改用完整副本，但重新建立失败（'
           + String(materialized.code) + '）。\n' + materialized.output + '\n这不等于通过。',
           { depth, escalated, escalationReason })
       }
@@ -3389,18 +3394,19 @@ export async function runTrialInstall(
     if (baseline.kind !== 'mounted') {
       // 三种形态各说各的话：判不出来 ≠ 基线坏了（下面这两句以前共用一条"基线起不来"，是错误归因）。
       const head = baseline.kind === 'undetermined'
-        ? '这次验证没有给出判定（既没挂载成功，也没报挂载失败）—— 这不是 ' + spec + ' 的问题，试装无法判断它。\n'
+        ? '这次验证没有给出判定（既没启动成功，也没报启动失败）—— 这不是 ' + spec + ' 的问题，试装无法判断它。\n'
         : escalated
-          ? '快照基线本身就起不来（浅快照与完整快照都试过，两次都没挂载起来）—— 这不是 ' + spec + ' 的问题。\n'
-            + '浅快照为什么不给力：' + String(escalationReason) + '\n'
-          : '快照基线本身就起不来 —— 这不是 ' + spec + ' 的问题，试装无法判断它。\n'
+          ? '环境副本的基线本身就起不来（轻量副本与完整副本都试过，两次都没起来）—— 这不是 ' + spec + ' 的问题。\n'
+            + '轻量副本为什么不给力：' + String(escalationReason) + '\n'
+          : '环境副本的基线本身就起不来 —— 这不是 ' + spec + ' 的问题，试装无法判断它。\n'
       const detail = baseline.kind === 'failed'
         ? '根因：' + baseline.reason + '\n' + baseline.chain.join('\n')
         : '判不出来：' + baseline.reason
       // failed → baseline-broken；undetermined → cannot-trial（判不出来就是无法试装，不许算通过）。
       return done(judgeTrialOutcome(baseline, null),
         head + detail + '\n'
-        + '实际深度：' + depth + (escalated ? '（由 shallow 升级）' : '') + '\n'
+        // R3（§12.9）：shallow / full 是内部深度代号，说成"轻量副本 / 完整副本"。
+        + '实际深度：' + depthLabel(depth) + (escalated ? '（由轻量副本升级）' : '') + '\n'
         + '构建：' + describeBuild(build), { baseline, depth, escalated, escalationReason })
     }
   }
@@ -3450,9 +3456,9 @@ export async function runTrialInstall(
     + '（验证耗时 ' + String(after.elapsedMs) + 'ms）']
   if (after.verdict.kind === 'failed') lines.push('根因链：\n' + after.verdict.chain.join('\n'))
   if (after.verdict.kind === 'undetermined') lines.push('判不出来：' + after.verdict.reason)
-  lines.push('实际深度：' + depth + (escalated
-    ? '（由 shallow 升级：浅快照基线失败 —— ' + String(escalationReason) + '）'
-    : ''))
+  // R2 + R3（§12.9）：深度一行；升级原因另起一行，且不用 shallow / 浅快照 这类内部代号。
+  lines.push('实际深度：' + depthLabel(depth))
+  if (escalated) lines.push('（从轻量副本升级，因为基线失败 —— ' + String(escalationReason) + '）')
   lines.push('源环境指纹：' + sourceFingerprint.hash + '（试装前）')
   if (changedDuringTrial) {
     lines.push('注意：试装期间 ' + realName + ' 的环境又变过（指纹 ' + sourceFingerprintAfter.hash
@@ -3473,15 +3479,29 @@ function describeBuild(build: BuildIdentity): string {
     + (build.gitHead === null ? '（读不到 git HEAD）' : ' head=' + build.gitHead.slice(0, 12))
 }
 
+/**
+ * 快照深度 → 用户能读的标签（§12.9 R3：shallow / full 是内部代号）。
+ *
+ * 为什么必须有这个映射：代号表里那六个词都是**中文**，而 shallow / full 是**拉丁词**——
+ * 它们不会触发中文清单，于是"实际深度：full"这种行会从护栏下溜过去（task-89 实测发现）。
+ * 说明：`depth` 这个值本身仍留在 `result.depth` 字段里（机器可读，供排查与断言），
+ * 只有**上屏那一句**换成人话。
+ *
+ * @param depth - 快照深度。
+ * @returns 面向用户的标签。
+ */
+function depthLabel(depth: SnapshotDepth): string {
+  return depth === 'shallow' ? '轻量副本' : '完整副本'
+}
 /** 三种结论各自的措辞（§5.2：各有措辞、不得混）。 */
 function describeConclusion(conclusion: TrialConclusion, spec: string, target: string): string {
   switch (conclusion) {
     case 'passed':
-      return '试装通过：' + spec + ' 装进 ' + target + ' 后仍能正常挂载'
+      return '试装通过：' + spec + ' 装进 ' + target + ' 后仍能正常启动'
     case 'baseline-broken':
-      return '快照基线就起不来：这不是 ' + spec + ' 的问题'
+      return '环境副本的基线就起不来：这不是 ' + spec + ' 的问题'
     case 'candidate-broken':
-      return '候选包导致挂载失败：' + spec + ' 装进 ' + target + ' 之后树挂不起来'
+      return '候选包导致启动失败：' + spec + ' 装进 ' + target + ' 之后树起不来'
     default:
       return '无法试装：这次没有得到有效判定（不等于通过）'
   }
@@ -3674,14 +3694,14 @@ export async function backupRestore(
         const restored = await restoreBundles(targetDir, backup.bundles, context.installAnchor)
         skippedBundles = restored.skipped
         outputs.push(restored.written === null
-          ? '# bundle 层栈：没有可补回的层'
-          : '# bundle 层栈：已补回 -> ' + restored.written)
+          ? '# 组合层：没有可补回的层'
+          : '# 组合层：已补回 -> ' + restored.written)
         if (skippedBundles.length > 0) {
-          outputs.push('# bundle 层栈：未补回 ' + skippedBundles.join(', ')
+          outputs.push('# 组合层：未补回 ' + skippedBundles.join(', ')
             + '（目标环境既找不到它，它也没声明自己是一个组合包；照写会让环境下次启动失败）')
         }
       } catch (error) {
-        outputs.push('# bundle 层栈：失败 ' + messageOf(error))
+        outputs.push('# 组合层：失败 ' + messageOf(error))
         ok = false
       }
     }
@@ -3707,7 +3727,7 @@ function describeDiff(diff: EnvironmentBackupDiff): string {
     + (diff.missing.length === 0 ? '（无）' : '\n  ' + diff.missing.map((entry) => entry.name + ' <- ' + entry.source).join('\n  '))]
   lines.push('已装 ' + String(diff.already.length) + ' 项'
     + (diff.already.length > 0 ? '：' + diff.already.join(', ') : ''))
-  if (diff.bundlesMissing.length > 0) lines.push('待补回 bundle：' + diff.bundlesMissing.join(', '))
+  if (diff.bundlesMissing.length > 0) lines.push('待补回的组合层：' + diff.bundlesMissing.join(', '))
   if (diff.unrestorable.length > 0) lines.push('不可恢复：\n  ' + diff.unrestorable.join('\n  '))
   return lines.join('\n')
 }
