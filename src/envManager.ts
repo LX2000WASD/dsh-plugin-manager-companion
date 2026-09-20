@@ -27,7 +27,7 @@
 import { execFileSync, spawn, spawnSync } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import {
-  accessSync, appendFileSync, closeSync, constants, copyFileSync, existsSync, mkdirSync, openSync, readdirSync,
+  accessSync, appendFileSync, chmodSync, closeSync, constants, copyFileSync, existsSync, mkdirSync, openSync, readdirSync,
   readFileSync, renameSync,
   rmSync, statSync,
 } from 'node:fs'
@@ -978,7 +978,8 @@ export async function removeEnvironment(
   }
   return enqueueMutation(async () => {
     try {
-      await retryFs(() => rmSync(dir, { recursive: true, force: true }))
+      // 走 Windows 只读兜底：环境目录里 node_modules 可能有只读文件，force 在 Windows 上删不掉。
+      await retryFs(async () => { await removeTreeWithReadonlyFallback(dir) })
     } catch (error) {
       return failure('io-failed', '删除失败 ' + name + '：' + messageOf(error))
     }
@@ -2547,7 +2548,7 @@ export async function materializeSnapshot(
     const path = join(targetDir, stale)
     if (!existsSync(path)) continue
     try {
-      rmSync(path, { recursive: true, force: true })
+      await removeTreeWithReadonlyFallback(path)
     } catch (error) {
       throw new EnvironmentError('snapshot-not-shallow',
         '试装环境里还留着上一次试装的依赖文件，这次删不掉（' + messageOf(error)
@@ -2682,7 +2683,8 @@ export async function removeTrialEnvironment(
   }
   return enqueueMutation(async () => {
     try {
-      await retryFs(() => rmSync(dir, { recursive: true, force: true }))
+      // 走 Windows 只读兜底：环境目录里 node_modules 可能有只读文件，force 在 Windows 上删不掉。
+      await retryFs(async () => { await removeTreeWithReadonlyFallback(dir) })
     } catch (error) {
       return failure('io-failed', '删除测试环境失败 ' + name + '：' + messageOf(error))
     }
@@ -3812,6 +3814,117 @@ async function officialBundlePredicate(installAnchor: string): Promise<BundlePre
  * @param operation - 要执行的文件操作。
  * @param attempts - 尝试次数上限。
  */
+/**
+ * Windows 删除兜底：第一次失败后清掉只读属性，再重试一次。
+ *
+ * ## 为什么需要它
+ *
+ * Node 文档明确：`rmSync` 的 `force` 选项**在 Windows 上不覆盖只读属性**（POSIX 上 force 会直接删）。
+ * 我们删的是**整个环境目录**，里面 `node_modules` 可能有只读文件（pnpm 装的包、`.bin` shim、
+ * 或用户手工设过只读）→ **Windows 上删除会永远失败**，而用户不知道为什么。
+ * （`retryFs` 重试同一个操作没有用：只读位不会因为等待而消失。）
+ *
+ * ## 纪律（三条）
+ *
+ * 1. **只在删除这个明确意图下清只读，且只在第一次失败后做**——不是无差别预清。
+ *    先按现状删；删不掉才动属性，避免给正常路径增加副作用。
+ * 2. **只对 win32 做这一步**——POSIX 上 force 本来就够，多一步是无谓的副作用。
+ * 3. **仍失败就如实报错**——带上原始错误（EPERM/EBUSY 原文）、我们做了什么、以及它仍然失败。
+ *    不许静默降级，不许假装删成功。
+ *
+ * ## 清只读的做法
+ *
+ * `chmodSync(path, 0o666)`：Windows 上 Node 用它清只读位（POSIX 语义下 0o666 只是去掉写保护位）。
+ * 必须**递归**——只读的可能是 `node_modules` 里某个深层文件，只清顶层目录没用。
+ * 清属性本身失败（比如某个路径已经不存在了）不单独报错：继续清其余的，
+ * 真正的判据是**重试删除**的结果。
+ *
+ * @param dir - 要删的目录。
+ * @param options - 注入点（测试用；生产路径用真实 fs 与 process.platform）。
+ * @returns 删除完成（成功时 resolve；仍失败时抛原始错误）。
+ */
+export async function removeTreeWithReadonlyFallback(
+  dir: string,
+  options: {
+    /** 删除操作（默认 rmSync recursive+force）。 */
+    readonly remove?: (path: string) => void
+    /** 清只读（默认 chmodSync 0o666）。 */
+    readonly clearReadonly?: (path: string) => void
+    /** 列出子项（默认 readdirSync；用于递归清只读）。 */
+    readonly list?: (path: string) => readonly string[]
+    /** 平台（默认 process.platform）；只有 win32 才走清只读那一步。 */
+    readonly platform?: string
+  } = {},
+): Promise<void> {
+  const remove = options.remove ?? ((path: string) => { rmSync(path, { recursive: true, force: true }) })
+  const clearReadonly = options.clearReadonly ?? ((path: string) => { chmodSync(path, 0o666) })
+  const list = options.list ?? ((path: string) => readdirSync(path))
+  const platform = options.platform ?? process.platform
+  try {
+    remove(dir)
+    return
+  } catch (error) {
+    // 纪律 2：非 Windows 不折腾属性——POSIX 上 force 本来就够。
+    if (platform !== 'win32') throw error
+    const first = error
+    // 纪律 1：到这里说明第一次真的失败了，才清只读。
+    clearReadonlyRecursive(dir, { clearReadonly, list })
+    try {
+      // 重试**一次**。
+      remove(dir)
+      return
+    } catch (retryError) {
+      // 纪律 3：如实报错——原始错误 + 我们做了什么 + 仍然失败。
+      // 文案按 §12.9 的 R2 规则写成**树状**（一层一个因果，每行最多一个冒号）：
+      // 结论 → 原始错误 → 我们做了什么 → 仍然失败的原因。
+      throw new Error([
+        '删除失败，Windows 只读属性兜底也没能删掉',
+        '  原始错误 ' + describeError(first),
+        '    → 已递归清除只读属性，并重试了一次',
+        '      → 仍然失败 ' + describeError(retryError),
+      ].join(String.fromCharCode(10)))
+    }
+  }
+}
+
+/**
+ * 递归清掉一棵树的只读属性（best-effort）。
+ *
+ * 为什么递归：只读的可能是 `node_modules` 里某个深层文件；只清顶层目录没有用。
+ * 单个路径失败不中断——继续清其余的，让**重试删除**去给出最终判据。
+ *
+ * @param root - 根路径。
+ * @param deps - 注入的 fs 操作。
+ */
+function clearReadonlyRecursive(
+  root: string,
+  deps: { readonly clearReadonly: (path: string) => void; readonly list: (path: string) => readonly string[] },
+): void {
+  const walk = (path: string): void => {
+    try {
+      deps.clearReadonly(path)
+    } catch {
+      // 清不掉就往下走：最终判据是重试删除的结果，不是这里。
+    }
+    let children: readonly string[]
+    try {
+      children = deps.list(path)
+    } catch {
+      // 读不到子项（可能是文件，或已不存在）：到此为止。
+      return
+    }
+    for (const child of children) walk(join(path, child))
+  }
+  walk(root)
+}
+
+/** 错误文本（带 code，便于用户排查）。 */
+function describeError(error: unknown): string {
+  const code = (error as NodeJS.ErrnoException).code
+  const text = error instanceof Error ? error.message : String(error)
+  return code === undefined ? text : code + '（' + text + '）'
+}
+
 async function retryFs(operation: () => void, attempts = 5): Promise<void> {
   const sleep = (ms: number): Promise<void> => new Promise((done) => { setTimeout(done, ms) })
   for (let attempt = 0; ; attempt += 1) {

@@ -602,6 +602,24 @@ test('scope 清理只认 @scope 形态的一级真目录：符号链接与普通
   assert.equal(lstatSync(join(dir, '@alink')).isSymbolicLink(), true, '符号链接不许碰（它不是目录）')
 })
 
+test('钉住语义：readdirSync(withFileTypes) 的 isDirectory() **不跟随**符号链接', () => {
+  // 为什么单独一条（Lead 在 task-101 复核时指出）：
+  // 本模块让「以 @ 开头的符号链接」落进 isDirectory()===false 那一支，靠的是 Node 这个语义。
+  // 变异验证（M4）把「不限定真目录」判为空变异，正是因为改掉那行行为等价——
+  // 说明这份保护**完全依赖 Node 的实现细节**。将来 Node 若改成跟随链接，
+  // 我们会**静默**失去保护（一个指向目录的 @ 链接会被当成空目录删掉）。
+  // 所以把「靠 Node 行为」变成「被测试钉住」：一条断言的成本远低于将来排查。
+  const dir = makeDir(home, 'dirent-semantics', 'node_modules')
+  const src = makeDir(home, 'dirent-semantics-src')
+  symlinkSync(makePackage(src, 'dirlink'), join(dir, '@link-to-dir'))
+  const dirent = readdirSync(dir, { withFileTypes: true }).find(entry => entry.name === '@link-to-dir')
+  assert.ok(dirent !== undefined, '前提：条目存在')
+  assert.equal(dirent.isSymbolicLink(), true, '前提：它确实是符号链接')
+  assert.equal(dirent.isDirectory(), false,
+    'withFileTypes 的 isDirectory() 必须**不跟随**符号链接——若 Node 改了这行为，'
+    + '本模块「不碰 @ 开头的链接」就静默失效了（指向目录的链接会被当成空目录删掉）')
+})
+
 test('scope 清理幂等：再跑一次不报错、不重复删', () => {
   const dir = makeDir(home, 'scope-idem', 'node_modules')
   makeDir(dir, '@empty-one')

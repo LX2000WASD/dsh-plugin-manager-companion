@@ -1006,6 +1006,115 @@ test('task-84 正常顺序不误拦：引擎先摘候选，已装候选也能真
   assert.equal(blocked.activation.activated, false)
 })
 
+// ── Windows 删除兜底（task-103）─────────────────────────────────────────────
+
+/**
+ * 造一个假的「删除一棵树」环境：记录调用序列，按脚本决定成功/失败。
+ *
+ * 为什么要注入：真机上没法稳定造出「Windows 只读属性导致 rmSync 失败」这个形态
+ * （Linux 上 force 会直接删掉只读文件）。所以判据落在**行为**上：
+ * 第一次失败后有没有清只读、有没有重试一次、仍失败时有没有如实报错。
+ *
+ * @param failures - 前 N 次删除抛错（用给定 code）。
+ * @returns 注入面与调用记录。
+ */
+function makeRemoveHarness(failures = 1, code = 'EPERM') {
+  const calls = { remove: 0, cleared: [], listed: [] }
+  const remove = () => {
+    calls.remove += 1
+    if (calls.remove <= failures) {
+      const error = new Error('EPERM: operation not permitted, unlink ...')
+      error.code = code
+      throw error
+    }
+  }
+  const clearReadonly = (path) => { calls.cleared.push(path) }
+  // 有限的树：根有两个子项，子项是叶子（返回空数组）——否则递归会无限展开。
+  const list = (path) => {
+    calls.listed.push(path)
+    return path === '/some/env' ? ['node_modules', 'cordis.yml'] : []
+  }
+  return { calls, options: { remove, clearReadonly, list, platform: 'win32' } }
+}
+
+test('Windows 兜底：第一次失败 → 清只读 → 重试一次 → 成功', async () => {
+  const { calls, options } = makeRemoveHarness(1)
+  await env.removeTreeWithReadonlyFallback('/some/env', options)
+  assert.equal(calls.remove, 2, '必须重试一次（第一次失败 + 重试成功 = 2 次）')
+  assert.ok(calls.cleared.length > 0, '重试前必须清过只读属性')
+  assert.ok(calls.cleared.includes('/some/env'), '根路径要清')
+  assert.ok(calls.cleared.includes(join('/some/env', 'node_modules')),
+    '要**递归**清子路径（只清顶层没用：只读的可能是深层文件）：' + JSON.stringify(calls.cleared))
+})
+
+test('Windows 兜底：两次都失败 → 如实报错，四要素齐全（结论/原始错误/做了什么/仍失败）', async () => {
+  const { calls, options } = makeRemoveHarness(2)
+  await assert.rejects(
+    () => env.removeTreeWithReadonlyFallback('/some/env', options),
+    (error) => {
+      const message = String(error.message)
+      // 四要素逐条断言。为什么要这么细（变异 M7/M8 的教训）：
+      // 只断言 /EPERM/ 与 /只读/ 的话，把「原始错误」或「我们做了什么」那两行**删掉**仍然全绿——
+      // 而用户排查时最需要的恰恰是这两条。判据必须落到**具体那一行**，不是「文案里出现过这些词」。
+      assert.match(message, /删除失败/, '① 结论：说清失败了')
+      assert.match(message, /原始错误 EPERM/, '② 原始错误：带码 + 原文（M7 变异删掉它时这里会红）')
+      assert.match(message, /已递归清除只读属性，并重试了一次/, '③ 我们做了什么（M8 变异删掉它时这里会红）')
+      assert.match(message, /仍然失败 EPERM/, '④ 仍然失败：说清重试也没成功，且带原因')
+      // 逐行检查：结论行之外，每一条都要有自己的因果（§12.9 R2 的树状要求）
+      const lines = message.split(String.fromCharCode(10))
+      assert.ok(lines.length >= 4, '必须是树状多行，不是一行挤完：' + JSON.stringify(lines))
+      for (const line of lines) {
+        assert.ok((line.match(/：/g) ?? []).length <= 1, '每行最多一个冒号（R2）：' + line)
+      }
+      return true
+    },
+  )
+  assert.equal(calls.remove, 2, '只重试一次，不无限重试')
+  assert.ok(calls.cleared.length > 0, '失败路径同样要清只读（那正是它该做的事）')
+})
+
+test('Windows 兜底：非 win32 平台**不触发**清只读（POSIX 上 force 本来就够）', async () => {
+  for (const platform of ['linux', 'darwin']) {
+    const { calls, options } = makeRemoveHarness(2)
+    await assert.rejects(() => env.removeTreeWithReadonlyFallback('/some/env', { ...options, platform }))
+    assert.equal(calls.remove, 1, platform + '：不该重试')
+    assert.deepEqual(calls.cleared, [], platform + '：不该清只读（那是无谓的副作用）')
+  }
+})
+
+test('Windows 兜底：第一次就成功时**不清只读**（不是无差别预清）', async () => {
+  const { calls, options } = makeRemoveHarness(0)
+  await env.removeTreeWithReadonlyFallback('/some/env', options)
+  assert.equal(calls.remove, 1, '成功就不该重试')
+  assert.deepEqual(calls.cleared, [], '成功路径不该动属性（纪律：只在第一次失败后清）')
+})
+
+test('Windows 兜底：清只读本身失败不中断（继续清其余的，判据是重试结果）', async () => {
+  const calls = { remove: 0, cleared: [] }
+  const options = {
+    remove: () => {
+      calls.remove += 1
+      if (calls.remove === 1) { const e = new Error('EPERM'); e.code = 'EPERM'; throw e }
+    },
+    // 根路径清不掉，子路径能清掉：不该因为第一个失败就放弃整棵树
+    clearReadonly: (path) => { calls.cleared.push(path); if (path === '/some/env') throw new Error('清不掉根') },
+    list: (path) => (path === '/some/env' ? ['node_modules'] : []),
+    platform: 'win32',
+  }
+  await env.removeTreeWithReadonlyFallback('/some/env', options)
+  assert.equal(calls.remove, 2, '仍然重试了')
+  assert.ok(calls.cleared.includes(join('/some/env', 'node_modules')),
+    '根清不掉也要继续清子路径：' + JSON.stringify(calls.cleared))
+})
+
+test('Windows 兜底：EBUSY（杀毒/索引占用）同样走兜底路径', async () => {
+  const { calls, options } = makeRemoveHarness(1, 'EBUSY')
+  await env.removeTreeWithReadonlyFallback('/some/env', options)
+  assert.equal(calls.remove, 2)
+  assert.ok(calls.cleared.length > 0)
+})
+
+
 // ── task-50 试装引擎（第一段：命名 / 指纹 / 三态判定 / 结论映射）──────────────
 // ── task-50 第二段：快照物化 / 删除纪律 / 清理计划 ──────────────────────────
 test('深度以启动为判据：shallow 明确失败→升级 full；两次都不行才 baseline-broken；undetermined 不升级', async () => {
