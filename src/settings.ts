@@ -32,6 +32,13 @@ export interface DiagnosticsConfig {
   readonly consistency: boolean
   /** 生态层（市场索引的更新与风险）。需要网络。 */
   readonly ecosystem: boolean
+  /**
+   * 是否上报「完好但过时」的依赖兜底链接（`$DSH_HOME/profiles/node_modules`）。
+   *
+   * 默认 **true**（上报）。关掉只影响这一类提示：**断链的上报与清理不受它控制**——
+   * 断链是旧版本残骸、默认自动删，属于"管理器该做的事"，不该被一个提示开关顺手关掉。
+   */
+  readonly reportStaleModuleFallbackLinks: boolean
 }
 
 /** 安装前质量门的配置。 */
@@ -232,6 +239,8 @@ export const DEFAULT_CONFIG: CompanionConfig = {
     consistency: true,
     // 生态层要联网，默认关闭——诊断页在用户显式开启后才访问网络。
     ecosystem: false,
+    // 「完好但过时」默认上报：用户要知道磁盘上有什么（用户裁决：报但不删）。
+    reportStaleModuleFallbackLinks: true,
   },
   qualityGate: { enabled: true, mode: 'block', allowlist: [] },
   marketplace: { enabled: true, cacheTtlMinutes: 1440, timeoutMs: 15_000, indexUrl: '' },
@@ -276,6 +285,7 @@ export const ConfigSchema = z.object({
     runtime: z.boolean().default(true),
     consistency: z.boolean().default(true),
     ecosystem: z.boolean().default(false),
+    reportStaleModuleFallbackLinks: z.boolean().default(true),
   }).default({ ...DEFAULT_CONFIG.diagnostics }),
   qualityGate: z.object({
     enabled: z.boolean().default(true),

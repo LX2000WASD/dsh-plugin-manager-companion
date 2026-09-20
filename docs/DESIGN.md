@@ -713,3 +713,75 @@ UI 必须如实告知——它是"点一下会发生什么"的一部分。
 `.panel { display: flex }` 把 HTML 的 `hidden` 压掉（断言全绿而图上两个面板叠着，且 hidden 子树 `innerText` 照样读得到）。
 这类"跨不过渲染"的接线，用**源码级断言**钉。
 
+
+## 13. 依赖兜底目录的陈旧链接（2026-09-20，用户反馈 + 实测）
+
+**用语纪律（用户 2026-09-20 指出）**：这个目录**不许用用户的自称来称呼**——那个词既不是本项目用语，
+也不是官方用语，本仓库文档/注释/issue code/用户可见文案里一律不出现。
+官方用语是 **module fallback**（`healProfilesModuleFallback`）；本项目文档用**依赖兜底目录**，
+必要时括注路径 `$DSH_HOME/profiles/node_modules`。代码标识符沿用官方语义（`moduleFallback*`）。
+
+### 13.1 机制（实测核对，不是推测）
+
+`$DSH_HOME/profiles/node_modules` 是官方为所有 profile 铺的**共享依赖兜底层**。两个事实叠起来产生残骸：
+
+1. **只增不删**：判据 `moduleFallbackCurrent = entries.every(...)` 只问「该有的到位没」，
+   不问「有没有多出来的」；写入路径 `healProfilesModuleFallbackLocked` 只遍历 `entries`，
+   **没有 readdir、没有 unlink**。上游测试把它钉成契约（`retains current links while repairing a missing sibling`）。
+2. **0.1.6-alpha.2 默认根本不写它**：默认 `resolutionMode = "runtime"`（`apps/cli/src/profile-boot.ts:263`），
+   runtime 走 `createProfileResolutionGeneration` → `materialize: false`。
+   用全新临时 HOME 起实例实测：链接数 **0**。
+
+⇒ 现存链接是 **≤0.1.5 时代的残骸**，且**已不参与解析**。这不是解析缺陷，是磁盘上的过期产物。
+真机（2026-09-20）：516 条符号链接（含 scope 一层），**全部断链**，目录 mtime 停在 9 月 15 日。
+
+### 13.2 三分类与处置（用户裁决）
+
+| 类别 | 判据 | 处置 |
+|---|---|---|
+| **断链** | `lstatSync().isSymbolicLink()` 为真但目标不存在 | **默认自动删**（旧时代产物，管理器该做的事）|
+| **完好但过时** | 目标存在，但不在**当前安装闭包**里 | **报但不删**（用户要知道在哪，可手动管）|
+| **正常** | 目标存在且在闭包里 | 不动 |
+
+闭包从 `healProfilesModuleFallback({ installAnchor, materialize: false })` 取——**复用官方实现**，
+不自己复刻依赖遍历（复刻就会与官方漂移）。
+
+⚠ **锚点必须先 `realpath`**：传 `node_modules/@deepseek-ai/dsh/package.json` 这种符号链接路径时，
+官方用 `createRequire(anchor).resolve.paths` 逐层向上找，从链接所在层开始会找不到兄弟依赖，
+闭包只剩锚点自己那一条（**实测 463 → 1**）。这是静默错，有专门测试钉住。
+
+### 13.3 清理纪律（三条，缺一不可）
+
+1. **只删符号链接**：每条都先 `lstatSync().isSymbolicLink()` 确认（`lstat` 不跟随链接，
+   确认的是「这个条目本身是链接」）。**绝不递归删目录**——即使目录看起来是空的。
+2. **逐条重核**：扫描到删除之间目录可能被别的进程动过，删除前**重新**判一次断链；
+   目标恢复了就跳过并说明。不做「按扫描结果批量 rm」。
+3. **结果如实**：删了几条 / 跳过几条 / 为什么跳过 / 哪几条失败，逐条报出来。
+
+### 13.4 私有层（`<profile>/.dsh-module-fallback`）——官方漏了
+
+共享层只增不删，但**私有层官方有反向差集清理**（`healProfileModuleFallback` 里的
+`for (const packageName of ownedPackageNames(ownedModulesDir)) if (!links.has(packageName)) removeProfileSymlink(...)`）。
+所以私有层出现断链是**官方没清掉**，属于另一类问题。
+
+真机实测（2026-09-20）：`~/.dsh/profiles/web/.dsh-module-fallback/node_modules` 里有 **2 条断链**
+（`react`、`loose-envify`，都指向已不存在的 `<profile>/node_modules/<name>`），官方清理没有移除它们。
+同类另有 3 条（`@deepseek-ai/dsh-experimental-*`）目标都在，正常。
+
+**处置**：单独报一条 `profile-module-fallback-dangling-link`（`report-only`，**没有 fix**）——
+这个目录归官方管，本项目只如实报出来，不代它清理。
+
+### 13.5 护栏与实现要点
+
+`tests/moduleFallback.test.mjs`（22 例）+ `src/moduleFallback.ts`。几处容易写错、已用测试钉住的点：
+
+- **共享层与私有层各自独立**：共享层目录不存在（或闭包算不出来）**不该连累私有层**。
+  真机 `web` profile 正是这个形态：共享层不存在，私有层却有 2 条断链。
+- **闭包算不出来时断链照样查**：断链的判据是「目标在不在」，与闭包无关。
+  整份返回空会把**能查的断链一起丢掉**——而断链正是要自动清理的那一类。
+  此时只把「过时」这一类标成没查，且**不带 `layers`**（带了会被界面画成整层「没查」，
+  把已经查出来的断链一起抹掉）。
+- **只下探 scope 一层**：`@scope` 本身是真目录（官方 `mkdirSync(dirname(link))` 建的），
+  不是链接。不递归——多下一层就可能扫到并删掉不该碰的东西。
+- **开关只静音「过时」**：`diagnostics.reportStaleModuleFallbackLinks`（默认 true）。
+  **断链不受它管**——断链默认自动删，不该被一个提示开关顺手关掉。

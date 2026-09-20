@@ -1003,7 +1003,10 @@ export function normalizeKindList(raw: unknown): KindListResult | undefined {
  * 这一层只在"官方 settings 文档残缺"时兜底——正式来源仍是官方 settings 服务。
  */
 const CLIENT_DEFAULTS: ClientConfig = {
-  diagnostics: { dependency: true, composition: true, runtime: true, consistency: true, ecosystem: false },
+  diagnostics: {
+    dependency: true, composition: true, runtime: true, consistency: true, ecosystem: false,
+    reportStaleModuleFallbackLinks: true,
+  },
   qualityGate: { enabled: true, mode: 'block', allowlist: [] },
   marketplace: { enabled: true, cacheTtlMinutes: 1440, timeoutMs: 15_000, indexUrl: '' },
   // 与 host 侧 DEFAULT_TRIAL_CONFIG 逐字段一致（试装默认关：它会在用户机器上真实装包并执行对方代码）。
@@ -1071,6 +1074,8 @@ export function normalizeConfig(raw: unknown): NormalizedConfig | undefined {
       runtime: read(diagnostics, 'diagnostics.runtime', flag(diagnostics['runtime'], defaults.diagnostics.runtime)),
       consistency: read(diagnostics, 'diagnostics.consistency', flag(diagnostics['consistency'], defaults.diagnostics.consistency)),
       ecosystem: read(diagnostics, 'diagnostics.ecosystem', flag(diagnostics['ecosystem'], defaults.diagnostics.ecosystem)),
+      reportStaleModuleFallbackLinks: read(diagnostics, 'diagnostics.reportStaleModuleFallbackLinks',
+        flag(diagnostics['reportStaleModuleFallbackLinks'], defaults.diagnostics.reportStaleModuleFallbackLinks)),
     },
     qualityGate: {
       enabled: read(qualityGate, 'qualityGate.enabled', flag(qualityGate['enabled'], defaults.qualityGate.enabled)),

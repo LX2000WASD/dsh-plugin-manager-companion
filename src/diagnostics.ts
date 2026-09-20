@@ -40,7 +40,12 @@ import { createRequire, isBuiltin } from 'node:module'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Context } from '@deepseek-ai/cordis'
-import { profilesRoot, readEnvironmentManifest, type EnvironmentManifest } from './paths.ts'
+import { dshHome, profilesRoot, readEnvironmentManifest, type EnvironmentManifest } from './paths.ts'
+import {
+  cleanupDanglingLinks, moduleFallbackDir, readModuleFallbackClosure, scanModuleFallback,
+  scanProfileModuleFallback,
+  type ModuleFallbackScan, type ProfileModuleFallbackScan,
+} from './moduleFallback.ts'
 import { readRuntimeInventory } from './official.ts'
 import type { CompanionConfig, DiagnosticsConfig } from './settings.ts'
 import type {
@@ -243,11 +248,18 @@ export async function analyzeEnvironment(
     })
   }
 
+  // 依赖兜底目录（$DSH_HOME/profiles/node_modules）的陈旧链接检查。
+  //
+  // 为什么在这里算（而不是放进 collectStaticFacts）：它要调**异步**的官方闭包算法。
+  // 层的 run() 是同步契约（其余四层都不需要 IO 之外的等待），为它把整条链改成异步
+  // 会把四层的调用点全部牵动——所以在进入层循环前算好，作为事实传进依赖层。
+  const moduleFallback = await readModuleFallbackFacts(env, diagnostics, skipped)
+
   const layers: readonly {
     readonly layer: DiagnosticLayer
     readonly run: () => DiagnosticIssue[]
   }[] = [
-    { layer: 'dependency', run: () => dependencyLayer(env, facts, composition) },
+    { layer: 'dependency', run: () => dependencyLayer(env, facts, composition, moduleFallback) },
     { layer: 'composition', run: () => compositionLayer(env, facts, composition, skipped) },
     { layer: 'runtime', run: () => runtimeLayer(env, facts, composition, runtime) },
     { layer: 'consistency', run: () => consistencyLayer(env, facts, composition, runtime) },
@@ -549,10 +561,84 @@ function collectStaticFacts(
 // ── L1 依赖层 ───────────────────────────────────────────────────────────
 
 /** L1：import 图 × 声明 × loader 提供项。 */
+/** 依赖兜底目录的扫描事实（依赖层用；扫描本身是异步的，在进层循环前算好）。 */
+interface ModuleFallbackFacts {
+  readonly scan: ModuleFallbackScan
+  /** 这个 profile 的私有兜底层（`<profile>/.dsh-module-fallback`）扫描结果。 */
+  readonly profileScan: ProfileModuleFallbackScan
+  /** 配置里关掉了"完好但过时"的上报。 */
+  readonly staleMuted: boolean
+}
+
+/**
+ * 扫一遍依赖兜底目录（`$DSH_HOME/profiles/node_modules`）。
+ *
+ * 目录不存在、闭包算不出来都**不是"没问题"**：如实记 skipped，让界面画成"没查"，
+ * 而不是画成 0（DESIGN：不允许用"没有标记"表达状态）。
+ *
+ * @param env - 被诊断环境（用它的 installAnchor 算闭包）。
+ * @param skipped - 跳过记录收集器。
+ * @returns 依赖层用的事实。
+ */
+async function readModuleFallbackFacts(
+  env: DiagnosticTargetEnvironment,
+  config: DiagnosticsConfig,
+  skipped: DiagnosticSkip[],
+): Promise<ModuleFallbackFacts> {
+  const dir = moduleFallbackDir(dshHome())
+  if (!existsSync(dir)) {
+    // 共享层不存在 ≠ 没得查：**私有层是每个 profile 自己的**，仍然要扫。
+    // 这条 skipped 只说共享层没扫到，措辞不能写成"这台机器上没有可检查的陈旧链接"——
+    // 那会让下面私有层查出来的问题看起来自相矛盾（真机 web profile 就是这样：共享层不存在，
+    // 私有层却有 2 条断链）。
+    skipped.push({
+      check: 'module-fallback',
+      layers: ['dependency'],
+      reason: '共享依赖兜底目录不存在（' + dir + '）：这一类没有可检查的内容。',
+    })
+    return {
+      scan: scanModuleFallback(dir, { ok: false, reason: '目录不存在' }),
+      profileScan: scanProfileModuleFallback(env.dir),
+      staleMuted: staleMutedIn(config),
+    }
+  }
+  const closure = await readModuleFallbackClosure(env.installAnchor, dshHome())
+  if (!closure.ok) {
+    // 注意：这**不是**"这一层整层没查"——断链的判据与闭包无关，照常产出（scanModuleFallback 已处理）。
+    // 所以只说清"过时这一类没查"，并且**不带 layers**：带 layers 会被界面画成整层"没查"，
+    // 那会把已经查出来的断链一起抹掉。
+    skipped.push({
+      check: 'module-fallback-stale',
+      reason: '依赖兜底目录的当前闭包算不出来（' + closure.reason + '）：'
+        + '本次没有判定"完好但过时"这一类（断链仍照常检查）。',
+    })
+  }
+  return {
+    scan: scanModuleFallback(dir, closure),
+    profileScan: scanProfileModuleFallback(env.dir),
+    staleMuted: staleMutedIn(config),
+  }
+}
+
+/**
+ * 「完好但过时」是否被配置静音。
+ *
+ * 判据是 `=== false` 而不是 `!value`：这份配置可能来自只写了几个字段的旧配置文件
+ * （诊断测试与调用方都可能传部分对象），缺字段必须按**默认上报**处理——
+ * 用 `!value` 会把"没写"读成"关掉"，正好把默认值反过来。
+ *
+ * @param config - 诊断配置（可能缺字段）。
+ * @returns 是否静音。
+ */
+function staleMutedIn(config: DiagnosticsConfig): boolean {
+  return config.reportStaleModuleFallbackLinks === false
+}
+
 function dependencyLayer(
   env: EnvironmentInfo,
   facts: StaticFacts,
   composition: CompositionFacts,
+  moduleFallback: ModuleFallbackFacts,
 ): DiagnosticIssue[] {
   const issues: DiagnosticIssue[] = []
   const envDir = facts.envDir
@@ -692,6 +778,107 @@ function dependencyLayer(
     }
     issues.push(...peerIssues(name, manifest, facts))
   }
+  issues.push(...moduleFallbackIssues(moduleFallback))
+  return issues
+}
+
+/**
+ * 依赖兜底目录的陈旧链接 → 两条发现（断链 / 完好但过时）。
+ *
+ * ## 为什么它归依赖层
+ *
+ * 它说的是"模块从哪来"这件事：这个目录是官方为所有 profile 铺的共享解析层。
+ *
+ * ## 文案必须说清的两件事
+ *
+ * 1. **它已不参与解析**——官方 0.1.6-alpha.2 默认 `resolutionMode = "runtime"`，
+ *    runtime 走 `materialize: false`，根本不写这个目录，解析也不读它。
+ *    不说这句，用户会以为删了会坏。
+ * 2. **断链与过时的处置不同**：断链默认自动删（旧代际残骸），完好但过时只报不删
+ *    （目标还在，用户可能有意保留）。
+ *
+ * @param facts - 扫描事实。
+ * @returns 发现清单（没有问题时为空数组）。
+ */
+function moduleFallbackIssues(facts: ModuleFallbackFacts): DiagnosticIssue[] {
+  const { scan } = facts
+  const issues: DiagnosticIssue[] = []
+  const PREVIEW = 20
+
+  // 共享层与私有层**各自独立**：共享层没扫到（目录不存在）不该连累私有层。
+  // 真机就是这样：共享层不存在，而 web profile 的私有层有 2 条断链。
+  if (scan.scanned && scan.dangling.length > 0) {
+    const preview = scan.dangling.slice(0, PREVIEW)
+    issues.push(makeIssue({
+      layer: 'dependency',
+      severity: 'safe-fix',
+      code: 'module-fallback-dangling-link',
+      title: '依赖兜底目录里有 ' + String(scan.dangling.length) + ' 条断开的链接',
+      detail: '这些链接指向的包已经不在磁盘上了（旧版本留下的残骸）。'
+        + '当前版本默认不写这个目录、也不从它解析（官方 0.1.6-alpha.2 的 runtime 解析模式），'
+        + '所以删掉它们不会影响任何东西的运行。'
+        + '修复只删符号链接本身，不递归删目录、不碰其它条目。'
+        + (scan.dangling.length > PREVIEW ? '（下面只列前 ' + String(PREVIEW) + ' 条，共 ' + String(scan.dangling.length) + ' 条。）' : ''),
+      subjects: preview.map(link => link.name),
+      scope: 'profiles/node_modules',
+      evidence: preview.map(link => ({
+        kind: 'file' as const,
+        at: link.name,
+        note: '断链，指向 ' + (link.target ?? '（读不到目标）'),
+      })),
+      fix: {
+        action: 'remove-dangling-module-fallback-links',
+        summary: '删除这 ' + String(scan.dangling.length) + ' 条断链（只删符号链接）',
+      },
+      id: 'module-fallback-dangling-link',
+    }))
+  }
+
+  if (facts.profileScan.dangling.length > 0) {
+    const preview = facts.profileScan.dangling.slice(0, PREVIEW)
+    issues.push(makeIssue({
+      layer: 'dependency',
+      severity: 'report-only',
+      code: 'profile-module-fallback-dangling-link',
+      title: '这个环境的私有兜底层里有 ' + String(facts.profileScan.dangling.length) + ' 条断开的链接',
+      detail: '它们指向的包已经不存在了（多半是卸载插件后留下的）。'
+        + '私有兜底层由官方维护，官方**有**清理机制，所以出现断链是官方没清掉——'
+        + '这不影响当前运行（解析不读断掉的链接），但它是磁盘上的残留，值得知道。'
+        + '本项目**不自动删**它：这个目录归官方管，我们只如实报出来。',
+      subjects: preview.map(link => link.name),
+      scope: 'profile/.dsh-module-fallback',
+      evidence: preview.map(link => ({
+        kind: 'file' as const,
+        at: '.dsh-module-fallback/node_modules/' + link.name,
+        note: '断链，指向 ' + (link.target ?? '（读不到目标）'),
+      })),
+      id: 'profile-module-fallback-dangling-link',
+    }))
+  }
+
+  if (scan.scanned && scan.stale.length > 0 && !facts.staleMuted) {
+    const preview = scan.stale.slice(0, PREVIEW)
+    issues.push(makeIssue({
+      layer: 'dependency',
+      severity: 'report-only',
+      code: 'module-fallback-stale-link',
+      title: '依赖兜底目录里有 ' + String(scan.stale.length) + ' 条链接不在当前安装的依赖闭包里',
+      detail: '这些链接的目标还在磁盘上，但它们不在当前 dsh 安装的依赖闭包里——'
+        + '多半是别的版本留下的。当前版本不从这个目录解析，所以它们不影响运行；'
+        + '我们**不自动删**（目标还在，可能是有意保留的），只报出来供你判断。'
+        + '不想要这类提示可以在设置里关掉。'
+        + (scan.stale.length > PREVIEW ? '（下面只列前 ' + String(PREVIEW) + ' 条，共 ' + String(scan.stale.length) + ' 条。）' : ''),
+      subjects: preview.map(link => link.name),
+      scope: 'profiles/node_modules',
+      evidence: preview.map(link => ({
+        kind: 'file' as const,
+        at: link.name,
+        note: '不在当前闭包里，指向 ' + (link.target ?? '（读不到目标）'),
+      })),
+      id: 'module-fallback-stale-link',
+    }))
+  }
+
   return issues
 }
 

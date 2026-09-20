@@ -9,12 +9,14 @@
  *   改为如实回 needs-manual —— 见 applyFix 的 JSDoc。
  */
 
-import { existsSync } from "node:fs"
+import { existsSync, unlinkSync } from "node:fs"
 import { rm } from "node:fs/promises"
 import { join } from "node:path"
 import type { Context } from "@deepseek-ai/cordis"
-import { environmentDir } from "./paths.ts"
+import { dshHome, environmentDir } from "./paths.ts"
 import { requireManager } from "./official.ts"
+import { cleanupDanglingLinks, moduleFallbackDir, readModuleFallbackClosure, scanModuleFallback } from "./moduleFallback.ts"
+import { readInstallAnchor } from "./diagnostics.ts"
 import type { CompanionConfig } from "./settings.ts"
 
 /**
@@ -124,6 +126,9 @@ export async function applyFix(
         if (target === undefined) return failed(action, "缺少 target（包名）")
         return await removeOfficialCopy(target, deps)
 
+      case "remove-dangling-module-fallback-links":
+        return await removeDanglingModuleFallbackLinks(deps)
+
       default:
         return { ok: false, action, status: "failed", output: "未知修复动作：" + action }
     }
@@ -160,6 +165,65 @@ function manualOutcome(action: string, target: string | undefined): FixOutcome {
 /** 构造一条 failed 结果。 */
 function failed(action: string, output: string, target?: string): FixOutcome {
   return { ok: false, action, ...(target === undefined ? {} : { target }), status: "failed", output }
+}
+
+/**
+ * 删掉依赖兜底目录（`$DSH_HOME/profiles/node_modules`）里的**断链**。
+ *
+ * 为什么这条修复自己动手删、而不找官方通道：官方**没有**清理这个目录的通道——
+ * `healProfilesModuleFallback` 只增不删（判据 `entries.every(...)` 只问"该有的到位没"，
+ * 写入路径只遍历 entries、无 readdir/unlink）。旧代际留下的断链因此永远不会自己消失。
+ *
+ * 安全边界（三条，代码里逐条落实）：
+ * 1. **只删符号链接**：每条都 `lstatSync().isSymbolicLink()` 确认；绝不递归删目录。
+ * 2. **只删断链**：删除前重新确认目标仍不存在（扫描到删除之间可能被别的进程动过）。
+ * 3. **结果如实**：删了几条 / 跳过几条 / 为什么 / 哪几条失败，逐条写进 output。
+ *
+ * 这不是 profile 的组合写入，所以不需要官方文件锁：它不碰 package.json、不碰 cordis.patch.yml，
+ * 删的只是共享兜底层里指向已消失目标的链接。
+ *
+ * @param deps - 修复依赖（需要 ctx 拿 DSH home 与安装锚点）。
+ * @returns 执行结果。
+ */
+async function removeDanglingModuleFallbackLinks(deps: FixDependencies): Promise<FixOutcome> {
+  const action = "remove-dangling-module-fallback-links"
+  try {
+    const home = dshHome()
+    const dir = moduleFallbackDir(home)
+    const envDir = environmentDir(deps.environmentName() ?? "")
+    const anchor = readInstallAnchor(deps.ctx)
+    const closure = await readModuleFallbackClosure(anchor, home)
+    const scan = scanModuleFallback(dir, closure)
+    if (!scan.scanned) {
+      return {
+        ok: false, action, status: "failed",
+        output: "没有扫到可清理的依赖兜底目录（" + dir + "）："
+          + (scan.exists ? "当前安装的依赖闭包算不出来（" + String(scan.closureReason ?? "原因未知") + "）" : "目录不存在"),
+      }
+    }
+    if (scan.dangling.length === 0) {
+      return {
+        ok: true, action, status: "executed",
+        output: "依赖兜底目录里没有断链，未做任何改动"
+          + (scan.stale.length > 0 ? "（另有 " + String(scan.stale.length) + " 条完好但过时的链接，按约定不自动删）" : ""),
+      }
+    }
+    const result = cleanupDanglingLinks(dir, scan, path => { unlinkSync(path) })
+    const lines = [
+      "依赖兜底目录：" + dir,
+      "断链 " + String(scan.dangling.length) + " 条 → 已删 " + String(result.removed)
+        + " 条，跳过 " + String(result.skipped) + " 条，失败 " + String(result.failed) + " 条",
+    ]
+    if (result.skipReasons.length > 0) lines.push("", "跳过原因：", ...result.skipReasons.map(r => "  - " + r))
+    if (result.failures.length > 0) lines.push("", "失败：", ...result.failures.map(r => "  - " + r))
+    if (scan.stale.length > 0) {
+      lines.push("", "完好但过时的 " + String(scan.stale.length) + " 条**没有动**（目标还在，按约定只报不删）")
+    }
+    void envDir
+    return { ok: result.failed === 0, action, status: result.failed === 0 ? "executed" : "failed", output: lines.join(String.fromCharCode(10)) }
+  } catch (error) {
+    return failed(action, error instanceof Error ? error.message : String(error))
+  }
 }
 
 /**

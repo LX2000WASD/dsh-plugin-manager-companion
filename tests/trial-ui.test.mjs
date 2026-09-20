@@ -626,6 +626,22 @@ describe('试装开关真的会生效（verify2 补的交互护栏）', () => {
     assert.equal(face.hooks.config.getSnapshot().dirty, true, '改了字段必须变脏（否则保存按钮永远不可用）')
   })
 
+  it('task-98 的「提示过期的依赖兜底链接」开关也真的生效（走组件自己的 onChange）', () => {
+    const { entry, face, t, captured } = bootWithSwitch({
+      diagnostics: { dependency: true, composition: true, runtime: true, consistency: true, ecosystem: false, reportStaleModuleFallbackLinks: true },
+    })
+    renderConsoleSettings(entry, face, t)
+    const toggle = captured.find(props => props.label === '提示过期的依赖兜底链接')
+    assert.ok(toggle !== undefined, '这个开关必须被渲染：' + JSON.stringify(captured.map(p => p.label)))
+    assert.equal(toggle.checked, true, '默认是开（上报）')
+    assert.equal(typeof toggle.onChange, 'function', '开关必须有 onChange')
+
+    toggle.onChange(false)
+    assert.equal(face.hooks.config.getSnapshot().draft?.diagnostics?.reportStaleModuleFallbackLinks, false,
+      '点开关后草稿里必须是新值（丢弃新值 = 用户点了没反应）')
+    assert.equal(face.hooks.config.getSnapshot().dirty, true, '改了字段必须变脏')
+  })
+
   it('其余三个开关同样真的生效（任一丢弃即红）', () => {
     const { entry, face, t, captured } = bootWithSwitch({})
     renderConsoleSettings(entry, face, t)

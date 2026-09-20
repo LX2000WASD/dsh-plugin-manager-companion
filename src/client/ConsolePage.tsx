@@ -1374,6 +1374,19 @@ export function ConfigPanel({ t, useConfig, useTrial, actions, trialActions }: C
             />
           </div>
         ))}
+        {/*
+          这一项管的是「完好但过时的依赖兜底链接」要不要上报（用户裁决：报，但不自动删）。
+          它不在 LAYER_ORDER 里，因为**它不是一层**——它是依赖层里的一个子检查。
+          断链不受这个开关管：断链默认自动删，不该被一个提示开关顺手关掉。
+        */}
+        <div className={css.fieldRow}>
+          <span className={css.metaLabel}>{t('config.diagnostics.reportStaleModuleFallbackLinks')}</span>
+          <Switch
+            checked={draft.diagnostics.reportStaleModuleFallbackLinks}
+            label={t('config.diagnostics.reportStaleModuleFallbackLinks')}
+            onChange={(next) => { actions.editConfigField(['diagnostics', 'reportStaleModuleFallbackLinks'], next) }}
+          />
+        </div>
       </fieldset>
 
       <fieldset className={css.group} disabled={!writable}>
