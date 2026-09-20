@@ -14,15 +14,27 @@
   color: var(--dsw-alias-label-primary);
 }
 
-/* 升级行：与官方详情页的 section 同量级的独立一块（官方 chrome 画标题与图标）。 */
+/*
+  升级行。**不画卡片**（task-99 的判断，依据是官方自己的渲染上下文）：
+
+  官方插件页的详情页是"分节 + 行列表"语法，不是设置页的内嵌面板语法——
+    · 容器：`detailSections { display:flex; gap:32px }`，我们的 slot 落在它下面的
+      `detailSection { display:flex; gap:12px }` 里（PluginManagerPage.tsx:466-471）；
+    · 行列表：`.row { padding:12px 2px; border-bottom:0.5px }` —— 无边框卡片；
+    · 官方**自己的**四个配置页（ui-settings-plugins 的 BashCard 等）用的是
+      `.field { padding:12px 0 }` + `.field + .field { border-top:0.5px }` —— **靠分隔线分组**。
+
+  也就是说：外层的间距与分节已经由官方容器给了。我们再套一层
+  `border + border-radius + background` 的卡片，是**设置页的语法**，
+  在这里就是多余的一层容器（真机几何实测：改前 boxBorder=1px / boxRadius=10px /
+  boxBackground=rgb(255,255,255)，而官方自己的表单一个边框都没有）。
+
+  所以这一块只负责"内容怎么排"：容器装饰留给官方。
+*/
 .upgrade {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  padding: 10px 12px;
-  border: 0.5px solid var(--dsw-alias-border-l2);
-  border-radius: 10px;
-  background: var(--dsw-alias-bg-layer-2);
 }
 
 .upgradeHead {
