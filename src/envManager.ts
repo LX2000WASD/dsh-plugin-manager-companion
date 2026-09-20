@@ -3815,14 +3815,33 @@ async function officialBundlePredicate(installAnchor: string): Promise<BundlePre
  * @param attempts - 尝试次数上限。
  */
 /**
- * Windows 删除兜底：第一次失败后清掉只读属性，再重试一次。
+ * 删除一棵树的兜底：第一次失败后（Windows 上）清掉只读属性，再重试一次。
  *
- * ## 为什么需要它
+ * ## 这条兜底真正守的是什么
  *
- * Node 文档明确：`rmSync` 的 `force` 选项**在 Windows 上不覆盖只读属性**（POSIX 上 force 会直接删）。
- * 我们删的是**整个环境目录**，里面 `node_modules` 可能有只读文件（pnpm 装的包、`.bin` shim、
- * 或用户手工设过只读）→ **Windows 上删除会永远失败**，而用户不知道为什么。
- * （`retryFs` 重试同一个操作没有用：只读位不会因为等待而消失。）
+ * **不是只读属性**——见下「修正说明」。它守的是两件与平台无关的事：
+ *
+ * 1. **失败后重试一次**：对**瞬时**失败有效（文件被别的进程短暂占用、索引/杀毒尚未释放、
+ *    `EBUSY`/`EPERM` 那一类会自己消失的原因）。这是真实世界里最常见的删除失败形态。
+ * 2. **三层如实报错**：原始错误 + 我们做了什么 + 仍然失败。**这一条才是真正的交付**——
+ *    删除失败时用户能看到「为什么」，而不是一个裸 EPERM。
+ *    （变异 M7/M8 钉的正是这两行：删掉它们测试当场红。）
+ *
+ * ## 修正说明（2026-09-20，理由改过，实现保留）
+ *
+ * 本函数原先的理由是「Windows 上 `rmSync` 的 force 不覆盖只读属性 → 删除会永远失败」。
+ * **那个论断是错的**：
+ *   · 那句话**不在 Node 文档里**（v16/v18/v20/v22/v24 的 doc/api/fs.md 逐版 grep 零命中）；
+ *   · 底层 libuv 的 `fs__unlink_rmdir`（`src/win/fs.c`）**主动带**
+ *     `FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE`（Win10 1607+），老系统 fallback 也自己先清只读。
+ * ⇒ 只读属性在 libuv 那一层就已经被处理掉了，挡不住删除。
+ *
+ * 所以**清只读那一步降级为冗余保险**：不指望它救场，保留只因为成本极低、
+ * 且与 Node 自己的 `rimraf` 做法一致（`lib/internal/fs/rimraf.js` 的 `fixWinEPERM`：
+ * unlink 报 EPERM 时 Windows 上先 `chmod(path, 0o666)` 再重试，且把 chmod 失败当作可接受）。
+ *
+ * **没有真机证据**：POSIX 上造不出这个形态，Windows 上 libuv 已处理——两边都取不到。
+ * 判据因此落在行为上（测试用注入的假 fs）。
  *
  * ## 纪律（三条）
  *
@@ -3832,12 +3851,12 @@ async function officialBundlePredicate(installAnchor: string): Promise<BundlePre
  * 3. **仍失败就如实报错**——带上原始错误（EPERM/EBUSY 原文）、我们做了什么、以及它仍然失败。
  *    不许静默降级，不许假装删成功。
  *
- * ## 清只读的做法
+ * ## 清只读的做法（冗余保险）
  *
- * `chmodSync(path, 0o666)`：Windows 上 Node 用它清只读位（POSIX 语义下 0o666 只是去掉写保护位）。
+ * `chmodSync(path, 0o666)`：与 Node 的 `fixWinEPERM` 同一个值（POSIX 语义下 0o666 只是去掉写保护位）。
  * 必须**递归**——只读的可能是 `node_modules` 里某个深层文件，只清顶层目录没用。
  * 清属性本身失败（比如某个路径已经不存在了）不单独报错：继续清其余的，
- * 真正的判据是**重试删除**的结果。
+ * 真正的判据是**重试删除**的结果（与 Node 自己的取舍一致）。
  *
  * @param dir - 要删的目录。
  * @param options - 注入点（测试用；生产路径用真实 fs 与 process.platform）。

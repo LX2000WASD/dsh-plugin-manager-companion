@@ -1006,14 +1006,17 @@ test('task-84 正常顺序不误拦：引擎先摘候选，已装候选也能真
   assert.equal(blocked.activation.activated, false)
 })
 
-// ── Windows 删除兜底（task-103）─────────────────────────────────────────────
+// ── 删除兜底（task-103 实现；task-104 修正了理由）───────────────────────────
 
 /**
  * 造一个假的「删除一棵树」环境：记录调用序列，按脚本决定成功/失败。
  *
- * 为什么要注入：真机上没法稳定造出「Windows 只读属性导致 rmSync 失败」这个形态
- * （Linux 上 force 会直接删掉只读文件）。所以判据落在**行为**上：
- * 第一次失败后有没有清只读、有没有重试一次、仍失败时有没有如实报错。
+ * 为什么要注入：**两边都取不到真机证据**——POSIX 上造不出「删除失败」这个形态，
+ * 而 Windows 上 libuv 已主动忽略只读属性（task-104 复核 libuv 源码确认），
+ * 所以也不会有「被只读挡住」的失败。判据因此只能落在**行为**上：
+ * 第一次失败后有没有重试一次、有没有清只读（冗余保险）、仍失败时有没有如实报错。
+ *
+ * 注意：这些用例**不声称**「Windows 上验证过只读场景」——它们验的是兜底的**控制流**。
  *
  * @param failures - 前 N 次删除抛错（用给定 code）。
  * @returns 注入面与调用记录。
@@ -1037,7 +1040,7 @@ function makeRemoveHarness(failures = 1, code = 'EPERM') {
   return { calls, options: { remove, clearReadonly, list, platform: 'win32' } }
 }
 
-test('Windows 兜底：第一次失败 → 清只读 → 重试一次 → 成功', async () => {
+test('删除兜底：第一次失败 → 清只读（冗余保险）→ 重试一次 → 成功', async () => {
   const { calls, options } = makeRemoveHarness(1)
   await env.removeTreeWithReadonlyFallback('/some/env', options)
   assert.equal(calls.remove, 2, '必须重试一次（第一次失败 + 重试成功 = 2 次）')
@@ -1047,7 +1050,7 @@ test('Windows 兜底：第一次失败 → 清只读 → 重试一次 → 成功
     '要**递归**清子路径（只清顶层没用：只读的可能是深层文件）：' + JSON.stringify(calls.cleared))
 })
 
-test('Windows 兜底：两次都失败 → 如实报错，四要素齐全（结论/原始错误/做了什么/仍失败）', async () => {
+test('删除兜底：两次都失败 → 如实报错，四要素齐全（结论/原始错误/做了什么/仍失败）', async () => {
   const { calls, options } = makeRemoveHarness(2)
   await assert.rejects(
     () => env.removeTreeWithReadonlyFallback('/some/env', options),
@@ -1070,10 +1073,10 @@ test('Windows 兜底：两次都失败 → 如实报错，四要素齐全（结�
     },
   )
   assert.equal(calls.remove, 2, '只重试一次，不无限重试')
-  assert.ok(calls.cleared.length > 0, '失败路径同样要清只读（那正是它该做的事）')
+  assert.ok(calls.cleared.length > 0, '失败路径同样要清只读（冗余保险；真正的主因是重试）')
 })
 
-test('Windows 兜底：非 win32 平台**不触发**清只读（POSIX 上 force 本来就够）', async () => {
+test('删除兜底：非 win32 平台**不触发**清只读（POSIX 上 force 本来就够）', async () => {
   for (const platform of ['linux', 'darwin']) {
     const { calls, options } = makeRemoveHarness(2)
     await assert.rejects(() => env.removeTreeWithReadonlyFallback('/some/env', { ...options, platform }))
@@ -1082,14 +1085,14 @@ test('Windows 兜底：非 win32 平台**不触发**清只读（POSIX 上 force 
   }
 })
 
-test('Windows 兜底：第一次就成功时**不清只读**（不是无差别预清）', async () => {
+test('删除兜底：第一次就成功时**不清只读**（不是无差别预清）', async () => {
   const { calls, options } = makeRemoveHarness(0)
   await env.removeTreeWithReadonlyFallback('/some/env', options)
   assert.equal(calls.remove, 1, '成功就不该重试')
   assert.deepEqual(calls.cleared, [], '成功路径不该动属性（纪律：只在第一次失败后清）')
 })
 
-test('Windows 兜底：清只读本身失败不中断（继续清其余的，判据是重试结果）', async () => {
+test('删除兜底：清只读本身失败不中断（继续清其余的，判据是重试结果）', async () => {
   const calls = { remove: 0, cleared: [] }
   const options = {
     remove: () => {
@@ -1107,7 +1110,7 @@ test('Windows 兜底：清只读本身失败不中断（继续清其余的，判
     '根清不掉也要继续清子路径：' + JSON.stringify(calls.cleared))
 })
 
-test('Windows 兜底：EBUSY（杀毒/索引占用）同样走兜底路径', async () => {
+test('删除兜底：EBUSY（杀毒/索引占用）同样走兜底路径', async () => {
   const { calls, options } = makeRemoveHarness(1, 'EBUSY')
   await env.removeTreeWithReadonlyFallback('/some/env', options)
   assert.equal(calls.remove, 2)

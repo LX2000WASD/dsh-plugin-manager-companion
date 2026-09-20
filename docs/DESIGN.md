@@ -847,7 +847,7 @@ UI 必须如实告知——它是"点一下会发生什么"的一部分。
 - **开关只静音「过时」**：`diagnostics.reportStaleModuleFallbackLinks`（默认 true）。
   **断链不受它管**——断链默认自动删，不该被一个提示开关顺手关掉。
 
-## 14. 删除操作的跨平台兜底（2026-09-20，用户提问驱动）
+## 14. 删除操作的跨平台兜底（2026-09-20，用户提问驱动；§14.2–14.4 于同日修正理由）
 
 **用户提问**：「我们的删除操作依赖不同系统的删除命令，有考虑兼容性吗？」
 
@@ -856,25 +856,85 @@ UI 必须如实告知——它是"点一下会发生什么"的一部分。
 三处删除**全走 Node `fs`**，不依赖 `rm` / `del` 等系统命令。我们调用系统命令的地方只有两处，
 且**都不是删除**：`ps` / `powershell`（读进程事实）、`taskkill`（仅 Windows，结束进程）。
 
-### 14.2 但有一个真风险：Windows 上 `force` 不覆盖只读属性
+### 14.2 起因：一个**判断错了**的风险假设（2026-09-20 修正）
 
-Node 文档明确：`rmSync` 的 `force` 选项**在 Windows 上不覆盖只读属性**（POSIX 上 force 会直接删）。
-我们三处 `rmSync(dir, {recursive:true, force:true})` 都用于删**整个环境目录**：
+⚠ **本节原先写着**：「Node 文档明确：`rmSync` 的 `force` 在 Windows 上不覆盖只读属性 → 删除会永远失败」。
+**这个论断是错的**，而且错了两层，两层都值得记下来：
 
-| 位置 | 用途 |
-|---|---|
-| `src/envManager.ts` 的删除环境 | 删 `<profiles>/<name>` |
-| `src/envManager.ts` 的清浅快照残留 | 删测试环境里上一次物化留下的目录 |
-| `src/envManager.ts` 的删除测试环境 | 删 `<profiles>/<name>-dpmc` |
+**第一层：那句话并不在 Node 文档里。** 复核时拉了 Node 的 `doc/api/fs.md`（v16 / v18 / v20 / v22 / v24）
+逐版 grep `read-only attribute`，**五个版本全部零命中**。`fs.rm` 文档对 `force` 的定义是
+「When `true`, exceptions will be ignored if `path` does not exist」——与只读属性无关。
+所以当时不是「读错了文档」，而是**把一句文档没说过的话安到了文档头上**。
 
-环境目录里 `node_modules` 可能有只读文件（pnpm 装的包、`.bin` shim、或用户手工设过只读）→
-**Windows 上删除会永远失败**，而用户不知道为什么。
-（原有的 `retryFs` 重试**同一个操作没有用**：只读位不会因为等待而消失。）
+**第二层：底层实现（libuv）根本不经过只读属性这道坎。** 拉 libuv `src/win/fs.c` 的
+`fs__unlink_rmdir`（`uv_fs_unlink` / `uv_fs_rmdir` 的共同实现，`:1137`）复核：
 
-### 14.3 做法：`removeTreeWithReadonlyFallback`
+```c
+  /* Try posix delete first */
+  disposition_ex.Flags = FILE_DISPOSITION_DELETE | FILE_DISPOSITION_POSIX_SEMANTICS |
+                          FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE;   /* ← 主动忽略只读 */
+
+  status = pNtSetInformationFile(handle, &iosb, &disposition_ex,
+                                 sizeof disposition_ex, FileDispositionInformationEx);
+```
+
+**Windows 10 1607+ 上 libuv 删文件主动带 `FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE`**，
+只读属性根本挡不住它。老系统（不支持 posix delete，报 `ERROR_INVALID_FUNCTION` 等）走的 fallback
+**也是自己先清只读再删**：
+
+```c
+      if (info.FileAttributes & FILE_ATTRIBUTE_READONLY) {
+        /* Remove read-only attribute */
+        basic.FileAttributes = (info.FileAttributes & ~FILE_ATTRIBUTE_READONLY) |
+                              FILE_ATTRIBUTE_ARCHIVE;
+        ...
+        status = pNtSetInformationFile(write_attributes_handle, &iosb, &basic,
+                                       sizeof basic, FileBasicInformation);
+      }
+      /* Try to set the delete flag. */
+      disposition.DeleteFile = TRUE;
+```
+
+**⇒ 「Windows 只读导致 `rmSync` 失败」这个形态在 libuv 这一层已经被处理掉了。**
+
+**这是一次「读文档推断」而不是「读实现」的失误**（本仓库一路在防的正是这个形态）：
+Lead 与实现者都在这个前提上做过判断，双方都没往下翻一层。教训是——
+**涉及平台行为的论断，要么读到实现层，要么明确标成未核实**。
+
+### 14.3 做法：`removeTreeWithReadonlyFallback`（**实现保留，理由已修正**）
 
 三步：先按现状删 → **失败且平台是 win32** 时递归清只读属性 → **重试一次** → 仍失败则如实报错。
 三处调用点全部改走这一个函数（不复制三份）。
+
+**这条兜底真正守的是什么（用户裁决保留它的理由）**——与只读**无关**：
+
+1. **失败后重试一次**——对**瞬时**失败有效：文件被别的进程短暂占用、索引/杀毒尚未释放、
+   `EBUSY`/`EPERM` 那一类会自己消失的原因。这是真实世界里最常见的删除失败形态。
+2. **三层如实报错**——原始错误 + 我们做了什么 + 仍然失败。**这一条才是真正的交付**：
+   删除失败时用户能看到「为什么」而不是一个裸 `EPERM`。
+   （变异验证里 M7/M8 钉的正是这两行：把它们删掉，测试当场红。）
+
+**清只读那一步降级为「冗余保险」**：不指望它救场（§14.2 已说明 libuv 自己会处理只读），
+保留它只因为成本极低、且与 Node 自己的做法一致。
+
+顺带一个佐证：**Node 自己的 `rimraf` 也是这个形状**（`lib/internal/fs/rimraf.js`）——
+`unlink` 失败且 `err.code === 'EPERM'` 时，Windows 上走 `fixWinEPERM`：
+
+```js
+function fixWinEPERM(path, options, originalErr, callback) {
+  chmod(path, 0o666, (err) => {
+    if (err) return callback(err.code === 'ENOENT' ? null : originalErr);
+    stat(path, (err, stats) => {
+      if (err) return callback(err.code === 'ENOENT' ? null : originalErr);
+      if (stats.isDirectory()) _rmdir(path, options, originalErr, callback);
+      else unlink(path, callback);
+    });
+  });
+}
+```
+
+注意它把 `chmod` 失败**当作可接受**（回落到原始错误继续处理）——这与我们的
+「清属性失败不中断，判据是重试结果」是同一种取舍。
 
 **纪律（三条，缺一不可）**：
 
@@ -884,21 +944,43 @@ Node 文档明确：`rmSync` 的 `force` 选项**在 Windows 上不覆盖只读�
 3. **仍失败就如实报错**——带原始错误（`EPERM`/`EBUSY` 原文）、说清我们做了什么、以及它仍然失败。
    不许静默降级，不许假装删成功。
 
-清只读用 `chmodSync(path, 0o666)`（Windows 上 Node 用它清只读位），且必须**递归**——
+清只读用 `chmodSync(path, 0o666)`（与 Node 的 `fixWinEPERM` 同一个值），且必须**递归**——
 只读的可能是 `node_modules` 里某个深层文件，只清顶层目录没有用。
 单个路径清属性失败**不中断**（继续清其余的）：真正的判据是**重试删除**的结果。
 
+### 14.3.1 真机证据：**没有**（如实说明）
+
+**这条兜底没有真机证据，两边都取不到**：
+
+- **POSIX 上无法复现**：Linux/macOS 的 `force` 本来就删得掉只读文件，造不出这个形态；
+- **Windows 上已被 libuv 处理**：§14.2 的源码说明只读根本挡不住删除。
+
+所以交付里**不能声称「Windows 上验证过」**。判据落在**行为**上（§14.4 的注入式测试）：
+「失败后有没有重试一次」「仍失败时有没有把三件事都说出来」——这两条与平台无关，是可测的。
+
+**若将来真在 Windows 上遇到删除失败**：报错文案会直接给出「原始错误是什么 + 兜底做了什么 + 仍然失败」，
+可以据此定位；那才是这条兜底第一次被真正用上。
+
 ### 14.4 测试怎么钉住它
 
-真机上没法稳定造出「Windows 只读属性导致 rmSync 失败」这个形态（Linux 上 force 会直接删掉只读文件），
-所以判据落在**行为**上，用注入的假 fs（与 `runTrialInstall` 的 `runCommand` 同一套注入手法）：
+因为**两边都取不到真机证据**（§14.3.1），判据只能落在**行为**上，
+用注入的假 fs（与 `runTrialInstall` 的 `runCommand` 同一套注入手法）：
 
 - 第一次失败 → 断言**清了只读**（含递归到子路径）且**重试了一次**、结果成功；
-- 两次都失败 → 断言**如实报错**（带原始码 + 说明做过什么 + 仍然失败）；
-- **非 win32** → 断言不重试、**不清只读**（两个平台值各跑一遍）；
+- 两次都失败 → 断言**如实报错**：结论 / 原始错误（带码 + 原文）/ 我们做了什么 / 仍然失败**四要素齐全**，
+  且是**树状多行**、每行最多一个冒号（§12.9 R2）；
+- **非 win32** → 断言不重试、**不清只读**（`linux` 与 `darwin` 各跑一遍）；
 - 第一次就成功 → 断言**不清只读**（钉住「不是无差别预清」）；
 - 清只读本身失败 → 断言继续清子路径、最终仍以重试结果为准；
 - `EBUSY`（杀毒/索引占用）→ 同样走兜底路径。
+
+**变异验证 11 处全部报红**，其中两条值得记：
+
+- **M7/M8 最初是漏网的**：原来只断言 `/EPERM/` 与 `/只读/`，于是把「原始错误」或「我们做了什么」
+  那两行**删掉**仍然全绿——而用户排查时最需要的恰恰是这两条。已把断言收紧到**具体那一行**
+  （`/原始错误 EPERM/`、`/已递归清除只读属性，并重试了一次/`），复跑全部报红。
+  这与 M14/M4 是同一类教训：断言写「文案里出现过这些词」而不是「具体那一行在不在」，就拦不住删改。
+- **M3（把「仍失败」改成报成功）**：钉住「不许静默降级、不许假装删成功」。
 
 **文案**按 §12.9 的 R2 规则写成**树状**（一层一个因果、每行最多一个冒号）——
 这条是护栏当场抓出来的：我第一版写成「删除失败（…）：原始错误 …；…仍然失败：…」，同一行两个冒号。
