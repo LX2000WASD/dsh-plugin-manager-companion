@@ -32,7 +32,8 @@
   "files": [
     "dist",
     "cordis.patch.yml",
-    "README.en.md"
+    "README.en.md",
+    "docs/images/readme"
   ],
   "bin": {
     "dshpmc": "./dist/cli.js"
