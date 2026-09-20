@@ -72,9 +72,23 @@ function normalize(raw) {
   return parsed.repos[0]
 }
 
+/**
+ * 夹具时钟：**测试不许依赖墙上时钟**。
+ *
+ * 为什么需要它（真缺陷，2026-09-20 暴露）：`isRegistryCacheFresh` 有两条判据——文件年龄（savedAt）
+ * **与内容年龄（generatedAt）都要在 TTL 内**。早先这里硬编码了一个固定 `generatedAt`、又调
+ * `loadRegistryIndex` 不注入 `now`（默认 Date.now()），于是夹具带了**时间炸弹**：
+ * 写它的当天是绿的，跨过 24 小时 TTL 后**永久变红**——不是偶发，是必然。
+ *
+ * 现在把"当前时刻"钉在夹具常量上，与 `generatedAt` 保持固定间隔，永不过期。
+ */
+const FIXTURE_GENERATED_AT = '2026-09-19T00:04:47Z'
+/** 夹具当前时刻：比 generatedAt 晚 1 分钟（稳在 TTL 内，且与真实时钟无关）。 */
+const FIXTURE_NOW = Date.parse(FIXTURE_GENERATED_AT) + 60_000
+
 /** 落盘一份缓存（用与生产相同的写入函数），返回读回结果。 */
-function roundTrip(repos, generatedAt = '2026-09-19T00:04:47Z') {
-  assert.equal(registry.writeRegistryCacheFile({ savedAt: Date.now(), generatedAt, repos }), true, '落盘必须成功')
+function roundTrip(repos, generatedAt = FIXTURE_GENERATED_AT) {
+  assert.equal(registry.writeRegistryCacheFile({ savedAt: FIXTURE_NOW, generatedAt, repos }), true, '落盘必须成功')
   return registry.readRegistryCacheFile()
 }
 
@@ -115,7 +129,7 @@ test('缓存路径与冷抓取路径给出同一份事实（这是缺陷的用�
   roundTrip([repo])
   // 网络全失败 → 走"新鲜磁盘缓存"分支；结果里的条目必须与冷抓取逐字段一致
   const dead = async () => ({ ok: false, status: 503, arrayBuffer: async () => new ArrayBuffer(0), text: async () => '' })
-  const index = await registry.loadRegistryIndex({ fetcher: dead })
+  const index = await registry.loadRegistryIndex({ fetcher: dead, now: FIXTURE_NOW })
   assert.equal(index.source, 'cache')
   assert.equal(index.cached, true)
   const item = index.repos[0]
@@ -137,21 +151,21 @@ test('格式版本不符的缓存按「无缓存」处理（旧文件不许被�
   mkdirSync(dirname(path), { recursive: true })
   // 模拟旧格式：没有 formatVersion（或版本更老），记录形仍是我们的记录形
   writeFileSync(path, JSON.stringify({
-    savedAt: Date.now(),
-    generatedAt: '2026-09-19T00:04:47Z',
+    savedAt: FIXTURE_NOW,
+    generatedAt: FIXTURE_GENERATED_AT,
     repos: [normalize(upstreamRecord())],
   }) + '\n')
   assert.equal(registry.readRegistryCacheFile(), null, '缺 formatVersion 一律视为无缓存')
   writeFileSync(path, JSON.stringify({
     formatVersion: 1,
-    savedAt: Date.now(),
-    generatedAt: '2026-09-19T00:04:47Z',
+    savedAt: FIXTURE_NOW,
+    generatedAt: FIXTURE_GENERATED_AT,
     repos: [normalize(upstreamRecord())],
   }) + '\n')
   assert.equal(registry.readRegistryCacheFile(), null, '旧版本号同样视为无缓存')
   // 于是整条链会去重新抓取，而不是端出一份缺字段的索引
   const dead = async () => ({ ok: false, status: 503, arrayBuffer: async () => new ArrayBuffer(0), text: async () => '' })
-  const index = await registry.loadRegistryIndex({ fetcher: dead })
+  const index = await registry.loadRegistryIndex({ fetcher: dead, now: FIXTURE_NOW })
   assert.equal(index.source, 'empty', '没有可用缓存时如实说"空了"，不能假装有缓存')
   assert.equal(home.length > 0, true)
 })
@@ -189,7 +203,7 @@ test('被丢弃的记录在加载结果里如实记账（notes）', async () => 
   const repo = normalize(upstreamRecord())
   roundTrip([repo, { repo: 'bad-entry' }])
   const dead = async () => ({ ok: false, status: 503, arrayBuffer: async () => new ArrayBuffer(0), text: async () => '' })
-  const index = await registry.loadRegistryIndex({ fetcher: dead })
+  const index = await registry.loadRegistryIndex({ fetcher: dead, now: FIXTURE_NOW })
   assert.equal(index.source, 'cache')
   assert.ok(index.notes.some((note) => note.includes('形状不符')), '丢弃必须出现在 notes 里：' + JSON.stringify(index.notes))
 })
