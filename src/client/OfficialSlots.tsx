@@ -47,6 +47,9 @@ export function CompanionOfficialItem(props: CompanionOfficialProps & ViewProps)
     <div className={css.page}>
       <ConfigPanel
         t={props.t}
+        // 这里是官方插件页：容器语法与设置页子页**不同**（官方自己的配置表单靠分隔线分组、
+        // 一个边框都没有）。同一份组件、同一份字段与校验，只切分组容器的画法（task-105）。
+        variant="plugin-page"
         useConfig={props.useConfig}
         useTrial={props.useTrial}
         actions={{

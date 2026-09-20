@@ -521,6 +521,24 @@
 
 /* 设置子页 */
 
+/*
+  分组容器的**两套语法**（task-105）。同一份字段、同一份校验，只有容器画法按页面切：
+
+    · .group       → 设置页子页：卡片（边框 + 圆角 + 底色）；
+    · .groupPlain  → 官方插件页：**官方自己的配置表单语法**。
+
+  为什么插件页必须换（真机几何实测，改前）：
+  官方插件页的详情页是"分节 + 行列表"语法——外层 detailSections{gap:32px} → detailSection{gap:12px}，
+  行列表 .row{padding:12px 2px; border-bottom:0.5px}，**没有卡片**；官方自己的配置页
+  （ui-settings-plugins/fields.module.css）是 .field{padding:12px 0} + .field + .field{border-top:0.5px}
+  ——**一个边框都没有**。我们在那个容器里再套四张 border+radius+background 的卡片，
+  就是设置页的语法跑到了插件页（用户看到的"违和感"）。
+
+  判据边界（承重）：**容器装饰归页面，内容排版归组件**。
+  所以这里只去分组容器的装饰，字段行的 gap、字号、控件样式一个字都不动；
+  .upgradeOutput 那种代码输出框的底色也保留（官方 TerminalBlock 自己也这么画）。
+*/
+
 .group {
   display: flex;
   flex-direction: column;
@@ -530,6 +548,59 @@
   border: 0.5px solid var(--dsw-alias-border-l1);
   border-radius: 10px;
   background: var(--dsw-alias-bg-layer-1);
+}
+
+/*
+  插件页的分组容器：无边框、无圆角、无底色，靠**分隔线**分组。
+
+  与官方 fields.module.css 同构：.field{padding:12px 0} + .field + .field{border-top:0.5px}。
+  border:0 不是"我们没画边框"——fieldset 有 UA 默认的 2px groove，必须显式去掉，
+  否则去掉卡片后反而多出一圈浏览器自带的框。
+*/
+.groupPlain {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 12px 0;
+  border: 0;
+}
+
+.groupPlain + .groupPlain {
+  border-top: 0.5px solid var(--dsw-alias-border-l2);
+}
+
+/* 无边框时 legend 不再"骑"在边框上，那 4px 缩进是卡片语法的残留。 */
+.groupPlain > .groupTitle {
+  padding: 0;
+}
+
+/*
+  插件页的整节：不吃 gap（官方 PluginConfigForm.module.css 的 .form 就是无 gap 的列），
+  行距全部由 .groupPlain 的 padding 给——与官方 fields.module.css 同构。
+  节首的标题与说明自己给下边距（官方是 .readOnly{margin:0 0 12px} 那一类）。
+*/
+.sectionPlain {
+  gap: 0;
+}
+
+/* 卡片时这些说明行靠 gap 与下一块拉开；无 gap 之后要自己给下边距，否则会贴上去。 */
+.sectionPlain > .sectionTitle,
+.sectionPlain > .hint,
+.sectionPlain > .warn,
+.sectionPlain > .error,
+.sectionPlain > .readOnlyLine {
+  margin-bottom: 12px;
+}
+
+/* 标题与它下面那句作用域说明是一对，贴紧一点（与 .section 的 gap:10px 同量级）。 */
+.sectionPlain > .sectionTitle {
+  margin-bottom: 4px;
+}
+
+/* 保存/放弃那一行是整节的收尾，与最后一个分组拉开。 */
+.sectionPlain > .configFooter {
+  margin-top: 12px;
 }
 
 .groupTitle {

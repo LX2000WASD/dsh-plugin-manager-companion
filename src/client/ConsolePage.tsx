@@ -211,6 +211,7 @@ export function ConsolePage({
               : (
                 <ConfigPanel
                   t={t}
+                  variant="settings"
                   useConfig={useConfig}
                   useTrial={useTrial}
                   actions={configActions}
@@ -1251,9 +1252,25 @@ function EnvironmentsPanel({ t, useEnvironments, actions }: EnvironmentsPanelPro
   )
 }
 
+/**
+ * 分组容器的**容器语法**——同一份字段与校验，两处页面各按自己的页面语法画。
+ *
+ * `settings`：设置页子页，卡片（边框 + 圆角 + 底色）。
+ * `plugin-page`：官方插件页，**官方自己的配置表单语法**
+ *   （`ui-settings-plugins/fields.module.css`：`.field { padding: 12px 0 }` +
+ *   `.field + .field { border-top: 0.5px }`）——**一个边框都没有**。
+ *
+ * 为什么做成参数而不是复制一份组件（task-105 的裁决）：四组字段与校验逻辑只有一份，
+ * 两份必然漂移。边界是「容器装饰归页面，内容排版归组件」——
+ * 所以两种语法只差**分组容器**那一个类，字段、校验、控件一个字都不分叉。
+ */
+type ConfigContainerVariant = 'settings' | 'plugin-page'
+
 /** 设置子页的 props。 */
 interface ConfigPanelProps {
   readonly t: T
+  /** 这次渲染落在哪个页面上——决定分组容器用哪套语法。 */
+  readonly variant: ConfigContainerVariant
   readonly useConfig: SnapshotSelectorHook<ConfigState>
   readonly useTrial: SnapshotSelectorHook<TrialState>
   readonly actions: ConfigActions
@@ -1264,12 +1281,13 @@ interface ConfigPanelProps {
  * 渲染「设置」子页：本插件配置表单（质量门、诊断分层、市场）。
  *
  * 与官方插件配置页同一交互模型：改的是本地草稿，保存时才写；离开页面即放弃。
- * 这个组件同时被官方插件页的 `plugins.item` / `plugins.bundle.config` 注册项复用。
+ * 这个组件同时被官方插件页的 `plugins.item` / `plugins.bundle.config` 注册项复用——
+ * 字段与校验是同一份，**分组容器的画法按页面切**（见 ConfigContainerVariant）。
  *
- * @param props - 字典座位、配置状态选择器与配置动作。
+ * @param props - 字典座位、这次渲染的页面语法、配置状态选择器与配置动作。
  * @returns 配置表单。
  */
-export function ConfigPanel({ t, useConfig, useTrial, actions, trialActions }: ConfigPanelProps) {
+export function ConfigPanel({ t, variant, useConfig, useTrial, actions, trialActions }: ConfigPanelProps) {
   const status = useConfig(state => state.status)
   const writable = useConfig(state => state.writable)
   const value = useConfig(state => state.value)
@@ -1299,12 +1317,23 @@ export function ConfigPanel({ t, useConfig, useTrial, actions, trialActions }: C
     trialActions.loadTrial()
   }, [trialActions])
 
+  // 两种容器语法只差这两个类（其余字段、校验、控件一个字都不分叉）：
+  //   设置页 → 卡片（.group，容器自带边框/圆角/底色）；
+  //   插件页 → 官方表单语法（.groupPlain：靠 padding + 分隔线分组，无装饰）。
+  //
+  // sectionClass 跟着切是因为两者间距算法不同：卡片各自有 padding，节 gap 补空隙；
+  // 官方 .form 是 gap:0、全靠 .field{padding:12px 0} 撑行距——留着 gap:10px 会让
+  // 分隔线上下不对称（上 10px / 下 12px），那是没对齐官方，不是"差不多"。
+  const plain = variant === 'plugin-page'
+  const groupClass = plain ? css.groupPlain : css.group
+  const sectionClass = plain ? css.section + ' ' + css.sectionPlain : css.section
+
   // 三种状态都必须是"能读的界面"：官方宿主的 settings 快照可能尚在加载、可能没有这个
   // 命名空间、也可能只给出残缺文档。draft 是归一后的值（见 shared.ts 的 ConfigController），
   // 所以下面表单里的每个字段都一定有确定值——这一页永远不会渲染成空白。
   if (status === 'unavailable') {
     return (
-      <section className={css.section}>
+      <section className={sectionClass}>
         <h3 className={css.sectionTitle}>{t('config.title')}</h3>
         <p className={css.hint} role="status">{t('config.unavailable')}</p>
       </section>
@@ -1312,7 +1341,7 @@ export function ConfigPanel({ t, useConfig, useTrial, actions, trialActions }: C
   }
   if (draft === undefined) {
     return (
-      <section className={css.section}>
+      <section className={sectionClass}>
         <h3 className={css.sectionTitle}>{t('config.title')}</h3>
         <p className={css.hint} role="status">{t('config.loading')}</p>
       </section>
@@ -1320,7 +1349,7 @@ export function ConfigPanel({ t, useConfig, useTrial, actions, trialActions }: C
   }
 
   return (
-    <section className={css.section}>
+    <section className={sectionClass}>
       <h3 className={css.sectionTitle}>{t('config.title')}</h3>
       <p className={css.hint}>{t('config.scope')}</p>
       {incomplete ? <p className={css.warn} role="status">{t('config.incomplete')}</p> : null}
@@ -1333,7 +1362,7 @@ export function ConfigPanel({ t, useConfig, useTrial, actions, trialActions }: C
       )}
       {failed ? <p className={css.error} role="status">{t('config.saveFailed')}</p> : null}
 
-      <fieldset className={css.group} disabled={!writable}>
+      <fieldset className={groupClass} disabled={!writable}>
         <legend className={css.groupTitle}>{t('config.qualityGate')}</legend>
         {/* 官方 Switch 只画开关本体，可见标签由调用方给（ui-primitives/Switch.tsx 的契约），
             所以每一行都要自带 label——否则用户看到一排无法分辨的拨杆。 */}
@@ -1361,7 +1390,7 @@ export function ConfigPanel({ t, useConfig, useTrial, actions, trialActions }: C
         </div>
       </fieldset>
 
-      <fieldset className={css.group} disabled={!writable}>
+      <fieldset className={groupClass} disabled={!writable}>
         <legend className={css.groupTitle}>{t('config.diagnostics')}</legend>
         <p className={css.hint}>{t('config.diagnostics.hint')}</p>
         {LAYER_ORDER.map((layer) => (
@@ -1389,7 +1418,7 @@ export function ConfigPanel({ t, useConfig, useTrial, actions, trialActions }: C
         </div>
       </fieldset>
 
-      <fieldset className={css.group} disabled={!writable}>
+      <fieldset className={groupClass} disabled={!writable}>
         <legend className={css.groupTitle}>{t('config.marketplace')}</legend>
         <div className={css.fieldRow}>
           <span className={css.metaLabel}>{t('config.marketplace.enabled')}</span>
@@ -1445,7 +1474,7 @@ export function ConfigPanel({ t, useConfig, useTrial, actions, trialActions }: C
         </div>
       </fieldset>
 
-      <fieldset className={css.group} disabled={!writable}>
+      <fieldset className={groupClass} disabled={!writable}>
         <legend className={css.groupTitle}>{t('config.trial')}</legend>
         <div className={css.fieldRow}>
           <span className={css.metaLabel}>{t('config.trial.enabled')}</span>
@@ -1575,6 +1604,7 @@ export function ConfigPanel({ t, useConfig, useTrial, actions, trialActions }: C
 
       <TrialEnvironments
         t={t}
+        variant={variant}
         report={report}
         loading={trialLoading}
         busy={trialBusy}
@@ -1615,6 +1645,8 @@ export function ConfigPanel({ t, useConfig, useTrial, actions, trialActions }: C
 /** 试装环境管理那一节的 props：全是值 + 两个回调（订阅只在 ConfigPanel 一处）。 */
 interface TrialEnvironmentsProps {
   readonly t: T
+  /** 与 ConfigPanel 同一套容器语法：这一节也在插件页里画，同样不能套设置页的卡片。 */
+  readonly variant: ConfigContainerVariant
   readonly report: TrialEnvironmentsView | undefined
   readonly loading: boolean
   readonly busy: string | undefined
@@ -1759,7 +1791,7 @@ function TrialEnvironmentRow({ t, entry, busy, onRemove }: {
  * @returns 测试环境列表、清理入口与操作结果。
  */
 function TrialEnvironments({
-  t, report, loading, busy, action, error, errorKey, onRemove, onCleanup,
+  t, variant, report, loading, busy, action, error, errorKey, onRemove, onCleanup,
 }: TrialEnvironmentsProps) {
   // 两件不同的确认：删**一个**环境（confirming = 那个名字）与清理**一批**（confirmingCleanup）。
   // 分成两个 state 而不是一个联合类型：它们的确认框文案与动作都不同，
@@ -1806,7 +1838,7 @@ function TrialEnvironments({
         : t('trial.cleanupDone', { count: action.removed.length })
       : action.output
   return (
-    <fieldset className={css.group}>
+    <fieldset className={variant === 'plugin-page' ? css.groupPlain : css.group}>
       <legend className={css.groupTitle}>{t('trial.title')}</legend>
       {busy === undefined ? null : <p className={css.hint} role="status">{t('env.busy', { name: busy })}</p>}
       {failed ? (
