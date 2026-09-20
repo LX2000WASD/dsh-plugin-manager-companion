@@ -34,7 +34,7 @@
  * 传 realpath 才有完整的 463 条。这是本模块最容易静默错的地方，所以单独有测试钉住。
  */
 
-import { existsSync, lstatSync, readdirSync, readlinkSync, realpathSync } from 'node:fs'
+import { existsSync, lstatSync, readdirSync, readlinkSync, realpathSync, rmdirSync } from 'node:fs'
 import { join } from 'node:path'
 
 /** 一条兜底链接的分类。 */
@@ -277,6 +277,10 @@ export interface ModuleFallbackCleanup {
   readonly failed: number
   /** 失败原因（逐条）。 */
   readonly failures: readonly string[]
+  /** 删掉的空 scope 目录名（如 `@aws-sdk`）。 */
+  readonly removedScopes: readonly string[]
+  /** 跳过的 scope 目录（非空 / 失败），逐条带原因。 */
+  readonly scopeSkipReasons: readonly string[]
 }
 
 /**
@@ -299,6 +303,7 @@ export function cleanupDanglingLinks(
   dir: string,
   scan: ModuleFallbackScan,
   remove: (path: string) => void,
+  removeDir: (path: string) => void = rmdirSync,
 ): ModuleFallbackCleanup {
   const removedLinks: ModuleFallbackLink[] = []
   const skipReasons: string[] = []
@@ -330,6 +335,9 @@ export function cleanupDanglingLinks(
       failures.push(link.name + '：删除失败（' + messageOf(error) + '）')
     }
   }
+  // 链接删完之后，顺带清掉因此变空的 scope 目录。
+  // 用户裁决：与「断链默认自动删」同一理由——都是旧时代的废弃产物，管理器该清干净。
+  const scopes = cleanupEmptyScopes(dir, removeDir)
   return {
     removed: removedLinks.length,
     removedLinks,
@@ -337,7 +345,79 @@ export function cleanupDanglingLinks(
     skipReasons,
     failed: failures.length,
     failures,
+    removedScopes: scopes.removed,
+    scopeSkipReasons: scopes.skipped,
   }
+}
+
+/**
+ * 删掉**变空的** scope 目录（`<dir>/@scope`）。
+ *
+ * ## 为什么需要它
+ *
+ * 真机实测（2026-09-20）：断链清理后 516 条链接归零，**但留下 29 个空的 `@scope/` 目录**
+ * （`@deepseek-ai/`、`@anthropic-ai/`、`@aws/` 等）——链接删了，装链接的目录还在。
+ * 用户裁决与「断链默认自动删」同一理由：这是旧时代的废弃产物，管理器该清干净。
+ *
+ * ## 纪律（三条，与删链接同一套）
+ *
+ * 1. **只删空目录**：先 `readdirSync` 确认里面**一个条目都没有**，再用 `rmdirSync`。
+ *    两层保险——`rmdir` 本身对非空目录就会失败，但**显式确认**让「非空一律不碰」成为实现里的意图，
+ *    而不是依赖系统调用的副作用。
+ * 2. **绝不用 `rm -r` / `rmSync({recursive:true})`**：那会递归删掉目录里的东西。
+ *    本函数只调用 `rmdirSync`（POSIX rmdir 语义：目录非空即失败，**没有递归能力**）。
+ * 3. **只删这一层**：只处理 `<dir>/@scope` 形态的一级目录，不递归下探（scope 里不会有嵌套 scope）。
+ *
+ * ## 幂等
+ *
+ * 目录已经不在了 → 不算失败、不算跳过（本来就没东西可删）；非空 → 记跳过并说明。
+ * 所以再跑一次既不报错也不重复删。
+ *
+ * @param dir - 兜底目录。
+ * @param removeDir - 删除目录的函数（注入以便测试；生产路径用 `rmdirSync`，**只对空目录成功**）。
+ * @returns 删掉的名字与跳过原因。
+ */
+export function cleanupEmptyScopes(
+  dir: string,
+  removeDir: (path: string) => void = rmdirSync,
+): { readonly removed: readonly string[]; readonly skipped: readonly string[] } {
+  const removed: string[] = []
+  const skipped: string[] = []
+  let entries
+  try {
+    entries = readdirSync(dir, { withFileTypes: true })
+  } catch {
+    // 目录不存在（第一次就没什么可清）：不是错误。
+    return { removed, skipped }
+  }
+  for (const entry of entries) {
+    // 只认 `@scope` 形态的一级**真目录**。符号链接不碰（链接由 cleanupDanglingLinks 管），
+    // 普通目录不碰（那不是 scope）。
+    if (!entry.name.startsWith('@') || !entry.isDirectory()) continue
+    const path = join(dir, entry.name)
+    // 判据 1：显式确认它是空的。这是「只删空目录」的实现本体——
+    // 不依赖 rmdir 的失败来兜底（那样「非空不碰」就只是副作用，不是意图）。
+    let inside: readonly string[]
+    try {
+      inside = readdirSync(path)
+    } catch (error) {
+      skipped.push(entry.name + '：读不到内容（' + messageOf(error) + '），不删')
+      continue
+    }
+    if (inside.length > 0) {
+      skipped.push(entry.name + '：里面还有 ' + String(inside.length) + ' 项，非空，不删')
+      continue
+    }
+    // 判据 2：用 rmdir 语义删除（**没有递归能力**）。
+    // 删除前那一刻目录可能被别的进程填了内容——rmdir 会失败，我们如实记下来。
+    try {
+      removeDir(path)
+      removed.push(entry.name)
+    } catch (error) {
+      skipped.push(entry.name + '：删除失败（' + messageOf(error) + '）')
+    }
+  }
+  return { removed, skipped }
 }
 
 /** 错误信息取文本。 */

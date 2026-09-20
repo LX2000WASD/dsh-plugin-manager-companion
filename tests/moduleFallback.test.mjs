@@ -20,8 +20,8 @@ const originalHome = process.env.DSH_HOME
 process.env.DSH_HOME = home
 
 const {
-  cleanupDanglingLinks, listModuleFallbackLinks, moduleFallbackDir, readModuleFallbackClosure,
-  scanModuleFallback, scanProfileModuleFallback,
+  cleanupDanglingLinks, cleanupEmptyScopes, listModuleFallbackLinks, moduleFallbackDir,
+  readModuleFallbackClosure, scanModuleFallback, scanProfileModuleFallback,
 } = await import('../dist/moduleFallback.js')
 
 after(() => {
@@ -548,4 +548,183 @@ test('幂等：删完断链后再扫，断链归零且不再报该 issue，而�
   assert.equal(again.removed, 0, '再修一次不该删任何东西')
   assert.equal(again.failed, 0)
   assert.equal(existsSync(join(dir, 'keep-pkg')), true, '过时的必须仍在')
+})
+
+// ── 10. 变空的 scope 目录清理（task-101）─────────────────────────────────────
+
+test('删完断链后，变空的 @scope 目录一并删掉；非空的一律不碰', () => {
+  const dir = makeDir(home, 'scope-clean', 'node_modules')
+  const src = makeDir(home, 'scope-clean-src')
+  // 空 scope：里面的链接删完就空了
+  makeDir(dir, '@aws-sdk')
+  // 非空 scope：里面还有一条完好链接
+  makeDir(dir, '@keep')
+  makeLiveLink(join(dir, '@keep'), 'pkg', makePackage(src, 'pkg'))
+  // 顶层普通目录（不是 scope）：不许碰
+  const notScope = makeDir(dir, 'notascope')
+
+  const scan = scanModuleFallback(dir, closureOf('@keep/pkg'))
+  const result = cleanupDanglingLinks(dir, scan, path => { rmSync(path, { force: true }) })
+
+  assert.deepEqual([...result.removedScopes], ['@aws-sdk'], '只删空的那个 scope')
+  assert.equal(existsSync(join(dir, '@aws-sdk')), false, '空的必须真的没了')
+  assert.equal(existsSync(join(dir, '@keep')), true, '非空的必须还在')
+  assert.equal(existsSync(notScope), true, '非 scope 的目录不许碰')
+  assert.ok(result.scopeSkipReasons.some(r => r.includes('@keep') && r.includes('非空')),
+    '非空的要如实记跳过原因：' + JSON.stringify(result.scopeSkipReasons))
+})
+
+test('scope 清理只删空目录：里面有任何一项（哪怕是一个文件）都跳过', () => {
+  const dir = makeDir(home, 'scope-nonempty', 'node_modules')
+  const scope = makeDir(dir, '@has-file')
+  writeFileSync(join(scope, 'stray.txt'), 'something\n')
+
+  const result = cleanupEmptyScopes(dir)
+  assert.deepEqual([...result.removed], [], '有内容的目录不许删')
+  assert.ok(result.skipped.some(r => r.includes('@has-file') && r.includes('1 项')),
+    '要说清里面还有几项：' + JSON.stringify(result.skipped))
+  assert.equal(existsSync(join(scope, 'stray.txt')), true, '内容必须完好')
+})
+
+test('scope 清理只认 @scope 形态的一级真目录：符号链接与普通目录都不碰', () => {
+  const dir = makeDir(home, 'scope-shape', 'node_modules')
+  const src = makeDir(home, 'scope-shape-src')
+  // 普通目录（不以 @ 开头）：不碰
+  makeDir(dir, 'plain-dir')
+  // 以 @ 开头的**符号链接**：不碰（链接归 cleanupDanglingLinks 管）
+  symlinkSync(makePackage(src, 'target'), join(dir, '@alink'))
+  // 真正的空 scope：删
+  makeDir(dir, '@real-scope')
+
+  const result = cleanupEmptyScopes(dir)
+  assert.deepEqual([...result.removed], ['@real-scope'])
+  assert.equal(existsSync(join(dir, 'plain-dir')), true, '普通目录不许碰')
+  assert.equal(lstatSync(join(dir, '@alink')).isSymbolicLink(), true, '符号链接不许碰（它不是目录）')
+})
+
+test('scope 清理幂等：再跑一次不报错、不重复删', () => {
+  const dir = makeDir(home, 'scope-idem', 'node_modules')
+  makeDir(dir, '@empty-one')
+  makeDir(dir, '@empty-two')
+  const first = cleanupEmptyScopes(dir)
+  assert.deepEqual([...first.removed].sort(), ['@empty-one', '@empty-two'])
+  const second = cleanupEmptyScopes(dir)
+  assert.deepEqual([...second.removed], [], '第二次不该再删任何东西')
+  assert.deepEqual([...second.skipped], [], '也不该报跳过（本来就没东西）')
+})
+
+test('scope 清理：目录不存在时不报错（第一次就没什么可清）', () => {
+  const result = cleanupEmptyScopes(join(home, 'never-here', 'node_modules'))
+  assert.deepEqual([...result.removed], [])
+  assert.deepEqual([...result.skipped], [])
+})
+
+test('scope 清理：删除失败如实记下来，不吞错', () => {
+  const dir = makeDir(home, 'scope-fail', 'node_modules')
+  makeDir(dir, '@will-fail')
+  const result = cleanupEmptyScopes(dir, () => { throw new Error('EPERM: 权限不足') })
+  assert.deepEqual([...result.removed], [])
+  assert.ok(result.skipped.some(r => r.includes('@will-fail') && r.includes('EPERM')),
+    '失败原因要带出来：' + JSON.stringify(result.skipped))
+})
+
+test('真机状态复现：**没有断链**但有空的 scope 目录，照样要清掉', () => {
+  // Lead 真机执行过一次清理：516 条断链归零，剩 29 个空 @scope 目录。
+  // 早退（"没有断链就不做事"）会让那些空目录永远清不掉——这条钉住那个形态。
+  const dir = makeDir(home, 'no-dangling', 'node_modules')
+  makeDir(dir, '@deepseek-ai')
+  makeDir(dir, '@anthropic-ai')
+  const scan = scanModuleFallback(dir, closureOf())
+  assert.equal(scan.dangling.length, 0, '前提：没有断链')
+
+  const result = cleanupDanglingLinks(dir, scan, path => { rmSync(path, { force: true }) })
+  assert.equal(result.removed, 0, '没有链接可删')
+  assert.deepEqual([...result.removedScopes].sort(), ['@anthropic-ai', '@deepseek-ai'],
+    '没有断链时也要清空 scope 目录')
+})
+
+// ── 11. fix 动作层的 scope 结果（M8/M9 变异暴露的洞）────────────────────────
+
+/** 跑一次 fix op（走 op 分派，与用户点修复按钮同一条路）。 */
+async function runFixOp(homeDir) {
+  const { handleOp } = await import('../dist/index.js')
+  const jobs = new Map()
+  let seq = 0
+  const deps = {
+    ctx: { get: () => undefined, logger: { info() {}, warn() {}, error() {}, debug() {} }, effect(fn) { const d = fn(); return typeof d === 'function' ? d : () => {} } },
+    config: () => ({ diagnostics: { dependency: true }, qualityGate: { enabled: true, mode: 'block', allowlist: [] }, marketplace: { enabled: false, cacheTtlMinutes: 1440, timeoutMs: 15000, indexUrl: '' } }),
+    configUpdate: async (p) => p,
+    capabilities: () => ({ profileBacked: true, manager: true, inventory: false, environmentName: 'x', missing: [] }),
+    jobs: {
+      start(task) { seq += 1; const id = 'job-' + String(seq); const rec = { done: false }; jobs.set(id, rec); void Promise.resolve().then(task).then((v) => { rec.result = v; rec.done = true }, (e) => { rec.error = String(e); rec.done = true }); return id },
+      status(id) { const r = jobs.get(id); return r === undefined ? { done: true, missing: true } : { done: r.done, result: r.result, error: r.error } },
+    },
+  }
+  const started = await handleOp('fix', { action: 'remove-dangling-module-fallback-links' }, deps)
+  assert.equal(started.ok, true)
+  for (let i = 0; i < 200; i += 1) {
+    const st = await handleOp('job', { id: started.value.jobId }, deps)
+    if (st.value.done === true) return st.value.result
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 5))
+  }
+  throw new Error('fix job 未落定')
+}
+
+test('fix 动作：没有断链但有空的 scope 目录时，也要真的清掉并在输出里说明（M8 变异）', async () => {
+  // M8 变异（在"没有断链"时早退）原本全绿——说明动作层这条路径没有被测到。
+  // 真机正是这个形态：Lead 执行过一次清理，516 条链接归零，剩 29 个空 scope 目录。
+  const home2 = mkdtempSync(join(tmpdir(), 'pmc-fix-scope-'))
+  const previous = process.env.DSH_HOME
+  process.env.DSH_HOME = home2
+  try {
+    const dir = join(home2, 'profiles', 'node_modules')
+    mkdirSync(join(dir, '@deepseek-ai'), { recursive: true })
+    mkdirSync(join(dir, '@anthropic-ai'), { recursive: true })
+    mkdirSync(join(dir, '@keep'), { recursive: true })
+    mkdirSync(join(home2, 't'), { recursive: true })
+    writeFileSync(join(home2, 't', 'package.json'), '{}')
+    symlinkSync(join(home2, 't'), join(dir, '@keep', 'pkg'))
+
+    const result = await runFixOp(home2)
+    assert.equal(result.ok, true, 'fix 应当成功：' + String(result.output))
+    assert.equal(existsSync(join(dir, '@deepseek-ai')), false, '空的必须真的被清掉（早退会让它留下）')
+    assert.equal(existsSync(join(dir, '@anthropic-ai')), false, '两个空的都要清掉')
+    assert.equal(existsSync(join(dir, '@keep')), true, '非空的必须还在')
+    // M9 变异（不报 scope 结果）也要被拦住：用户必须看得到发生了什么
+    assert.match(String(result.output), /变空的 scope 目录 → 已删 2 个/,
+      '输出必须说明删了几个空 scope 目录：' + String(result.output))
+    assert.match(String(result.output), /@deepseek-ai/, '输出要点名删了哪些')
+    assert.match(String(result.output), /@keep：里面还有 1 项，非空，不删/, '非空的要如实说明')
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previous
+    rmSync(home2, { recursive: true, force: true })
+  }
+})
+
+test('fix 动作幂等：连跑两次，第二次不报错也不重复删', async () => {
+  const home2 = mkdtempSync(join(tmpdir(), 'pmc-fix-idem-'))
+  const previous = process.env.DSH_HOME
+  process.env.DSH_HOME = home2
+  try {
+    const dir = join(home2, 'profiles', 'node_modules')
+    mkdirSync(join(dir, '@empty-one'), { recursive: true })
+    symlinkSync(join(home2, 'gone'), join(dir, 'dangling'))
+
+    const first = await runFixOp(home2)
+    assert.equal(first.ok, true)
+    assert.match(String(first.output), /已删 1 条/, '第一次删掉那条断链')
+    assert.match(String(first.output), /已删 1 个/, '第一次也清掉空 scope')
+    assert.equal(existsSync(join(dir, '@empty-one')), false)
+
+    const second = await runFixOp(home2)
+    assert.equal(second.ok, true, '第二次不该报错：' + String(second.output))
+    assert.match(String(second.output), /断链 0 条 → 已删 0 条/, '第二次没有链接可删')
+    assert.match(String(second.output), /没有变空的 scope 目录/, '第二次也没有 scope 可清')
+    assert.doesNotMatch(String(second.output), /失败：/, '第二次不该有失败项')
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previous
+    rmSync(home2, { recursive: true, force: true })
+  }
 })

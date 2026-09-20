@@ -201,19 +201,24 @@ async function removeDanglingModuleFallbackLinks(deps: FixDependencies): Promise
           + (scan.exists ? "当前安装的依赖闭包算不出来（" + String(scan.closureReason ?? "原因未知") + "）" : "目录不存在"),
       }
     }
-    if (scan.dangling.length === 0) {
-      return {
-        ok: true, action, status: "executed",
-        output: "依赖兜底目录里没有断链，未做任何改动"
-          + (scan.stale.length > 0 ? "（另有 " + String(scan.stale.length) + " 条完好但过时的链接，按约定不自动删）" : ""),
-      }
-    }
+    // 注意：**没有断链也要往下走**——上一轮可能已经删完链接，但留下了空的 scope 目录。
+    // 真机就是这个状态（Lead 执行过一次清理：516 条链接归零，剩 29 个空 @scope 目录）。
+    // 早退会让那些空目录永远清不掉。
     const result = cleanupDanglingLinks(dir, scan, path => { unlinkSync(path) })
     const lines = [
       "依赖兜底目录：" + dir,
       "断链 " + String(scan.dangling.length) + " 条 → 已删 " + String(result.removed)
         + " 条，跳过 " + String(result.skipped) + " 条，失败 " + String(result.failed) + " 条",
     ]
+    if (result.removedScopes.length > 0) {
+      lines.push("变空的 scope 目录 → 已删 " + String(result.removedScopes.length) + " 个："
+        + result.removedScopes.join("、"))
+    } else if (result.scopeSkipReasons.length === 0) {
+      lines.push("没有变空的 scope 目录")
+    }
+    if (result.scopeSkipReasons.length > 0) {
+      lines.push("", "scope 目录未删：", ...result.scopeSkipReasons.map(r => "  - " + r))
+    }
     if (result.skipReasons.length > 0) lines.push("", "跳过原因：", ...result.skipReasons.map(r => "  - " + r))
     if (result.failures.length > 0) lines.push("", "失败：", ...result.failures.map(r => "  - " + r))
     if (scan.stale.length > 0) {
