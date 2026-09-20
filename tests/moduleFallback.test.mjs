@@ -467,3 +467,85 @@ test('客户端默认值与 host 默认值逐字段一致（开关默认必须�
   assert.deepEqual(CLIENT_DEFAULTS.diagnostics, DEFAULT_CONFIG.diagnostics,
     '客户端 diagnostics 默认值必须与 host 逐字段一致')
 })
+
+// ── 8. 计数口径（Lead 复核 task-100：171 与 516 都对，含义不同）───────────────
+
+test('计数口径：total 数的是「顶层链接 + @scope 下一层」，不是 maxdepth 1', () => {
+  const dir = makeDir(home, 'caliber', 'node_modules')
+  const src = makeDir(home, 'caliber-src')
+  // 顶层 3 条
+  makeDanglingLink(dir, 'top-1')
+  makeDanglingLink(dir, 'top-2')
+  makeLiveLink(dir, 'top-3', makePackage(src, 'top-3'))
+  // @scope 下一层 2 条
+  const scope = makeDir(dir, '@sc')
+  symlinkSync(join(home, 'gone-a'), join(scope, 'a'))
+  symlinkSync(join(home, 'gone-b'), join(scope, 'b'))
+  // 更深一层 1 条：**不该被数进去**（不递归）
+  const deeper = makeDir(scope, 'nested')
+  symlinkSync(join(home, 'gone-c'), join(deeper, 'c'))
+
+  const scan = scanModuleFallback(dir, closureOf())
+  assert.equal(scan.total, 5,
+    '口径 = 顶层 3 + scope 下一层 2 = 5（不含更深那层）。'
+    + '如果这里变成 3，说明口径退化成 maxdepth 1；变成 6 说明递归了')
+  // 逐类相加也必须等于 total（本用例里闭包可用，所以三类齐全）
+  assert.equal(scan.dangling.length + scan.stale.length + scan.current.length, scan.total,
+    '闭包可用时三类之和应等于 total')
+})
+
+test('计数口径：闭包不可用时 total 仍数「扫到的条数」，与三类之和可以不相等', () => {
+  const dir = makeDir(home, 'caliber2', 'node_modules')
+  const src = makeDir(home, 'caliber2-src')
+  makeDanglingLink(dir, 'broken')
+  makeLiveLink(dir, 'healthy', makePackage(src, 'healthy'))
+  const scan = scanModuleFallback(dir, { ok: false, reason: 'x' })
+  assert.equal(scan.total, 2, '两条都在目录里，total 必须是 2')
+  assert.equal(scan.dangling.length, 1)
+  assert.equal(scan.stale.length + scan.current.length, 0, '归不了类的那条不进任何一类')
+  assert.notEqual(scan.dangling.length + scan.stale.length + scan.current.length, scan.total,
+    '这个形态下三类之和 < total 是**正确**的（用求和会让 total 报成 1）')
+})
+
+test('文档口径与实现一致：DESIGN 里的数字必须带口径说明', () => {
+  // 为什么钉这条：Lead 复核时用 maxdepth 1 核出 171，与文档的 516 对不上——
+  // 两个数都对但含义不同。文档必须把口径写出来，否则后来人会以为写错了。
+  const design = readFileSync(join(process.cwd(), 'docs/DESIGN.md'), 'utf8')
+  assert.match(design, /171/, 'DESIGN 要写出「只顶层」那个数')
+  assert.match(design, /345/, 'DESIGN 要写出 scope 下一层那个数')
+  assert.match(design, /口径/, 'DESIGN 要明说这是口径问题')
+  // 模块注释里也要有（改代码的人先看那里）
+  const source = readFileSync(join(process.cwd(), 'src/moduleFallback.ts'), 'utf8')
+  assert.match(source, /计数口径/, '模块注释里要写清扫的是哪一层')
+  assert.match(source, /maxdepth 1/, '注释里要给出对照命令，否则没法自查')
+})
+
+// ── 9. 幂等（Lead 复核 task-100 ②：修完再跑不该重复报）───────────────────────
+
+test('幂等：删完断链后再扫，断链归零且不再报该 issue，而「过时」仍在', () => {
+  const dir = makeDir(home, 'idem', 'node_modules')
+  const src = makeDir(home, 'idem-src')
+  makeDanglingLink(dir, 'd1')
+  makeDanglingLink(dir, 'd2')
+  makeLiveLink(dir, 'keep-pkg', makePackage(src, 'keep-pkg'))
+
+  const before = scanModuleFallback(dir, closureOf('nothing'))
+  assert.equal(before.dangling.length, 2, '前提：两条断链')
+  assert.equal(before.stale.length, 1, '前提：一条完好但过时')
+
+  const cleanup = cleanupDanglingLinks(dir, before, path => { rmSync(path, { force: true }) })
+  assert.equal(cleanup.removed, 2)
+  assert.equal(cleanup.failed, 0)
+
+  // 第二次扫：断链必须归零（幂等），过时的仍在（它不自动删）
+  const after = scanModuleFallback(dir, closureOf('nothing'))
+  assert.equal(after.dangling.length, 0, '修完再扫，断链必须归零（否则会重复报）')
+  assert.deepEqual(after.stale.map(l => l.name), ['keep-pkg'], '「过时」不自动删，必须仍在')
+  assert.equal(after.total, 1, '目录里只剩那一条过时链接')
+
+  // 第二次清理：不该再删任何东西（幂等）
+  const again = cleanupDanglingLinks(dir, after, path => { rmSync(path, { force: true }) })
+  assert.equal(again.removed, 0, '再修一次不该删任何东西')
+  assert.equal(again.failed, 0)
+  assert.equal(existsSync(join(dir, 'keep-pkg')), true, '过时的必须仍在')
+})

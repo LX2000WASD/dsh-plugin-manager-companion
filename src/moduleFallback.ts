@@ -85,10 +85,30 @@ export function moduleFallbackDir(home: string): string {
 }
 
 /**
- * 列出目录里的符号链接（含 scope 一层）。
+ * 列出目录里的符号链接。
+ *
+ * ## 扫的是哪一层（计数口径，必须与文档一致）
+ *
+ * **两层，且只有两层**：
+ *   1. **顶层链接**（`<dir>/<name>` 本身是符号链接）；
+ *   2. **`@scope/` 目录里那一层**（`<dir>/@scope/<name>`）。
+ *
+ * 不再往下递归。所以本函数返回的条数 = 顶层链接数 + `@scope/` 下一层链接数，
+ * **不等于** `find <dir> -maxdepth 1 -type l` 的结果。
+ *
+ * 真机实测（2026-09-20，`$DSH_HOME/profiles/node_modules`）：
+ *
+ * | 口径 | 条数 |
+ * |---|---|
+ * | `-maxdepth 1 -type l`（只顶层） | 171 |
+ * | `-mindepth 2 -maxdepth 2 -type l`（scope 下一层） | 345 |
+ * | **本函数返回（两层之和）** | **516** |
+ *
+ * 两个数都对、含义不同——**任何引用这个数字的地方都必须带口径**，
+ * 否则后来人用 `maxdepth 1` 去核会得到 171，然后以为文档写错了。
  *
  * 只认符号链接：scope 目录本身是**真目录**（官方 `mkdirSync(dirname(link))` 建的），
- * 不是链接。**绝不递归**——这里只列一层，扫不到任何需要删目录的东西。
+ * 不是链接。**绝不递归**——扫不到任何需要删目录的东西。
  *
  * @param dir - 被扫目录。
  * @returns 链接名（scope 包为 `@scope/name`）。
